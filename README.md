@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.03-111827" alt="Version v0.03" />
+  <img src="https://img.shields.io/badge/version-v0.04-111827" alt="Version v0.04" />
   <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue 3" />
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18" />
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.03">v0.03 Release</a>
+  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.04">v0.04 Release</a>
   · <a href="./CHANGELOG.md">更新说明</a>
   · <a href="./docs/README.md">维护文档</a>
 </p>
@@ -38,10 +38,10 @@
 ### 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | sudo bash
 ```
 
-安装固定使用 `main` 分支和本机 PostgreSQL 18，不需要填写数据库地址。数据库名是 `chatgpt_2api_app`。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，两者只接入 `chatgpt-2api-net`，时区是 `Asia/Shanghai`。安装时会询问 Web/API 端口，默认 `2080`，也会询问图片访问地址；图片访问地址可留空，填写后写入 `CHATGPT2API_BASE_URL`。
+安装固定使用 `main` 分支、Docker 和本机 PostgreSQL 18，不需要填写数据库地址。默认安装目录是 `/opt/chatgpt-2api`。数据库名是 `chatgpt_2api_app`。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，两者只接入 `chatgpt-2api-net`，时区是 `Asia/Shanghai`。安装向导会询问 Web/API 端口，默认 `2080`，也会询问图片访问地址。图片访问地址可留空；只填域名或 IP 会自动写成 `https://` 地址，再写入 `CHATGPT2API_BASE_URL`。
 
 ### Docker Compose
 

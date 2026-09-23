@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.03-111827" alt="Version v0.03" />
+  <img src="https://img.shields.io/badge/version-v0.04-111827" alt="Version v0.04" />
   <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue 3" />
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18" />
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.03">v0.03 Release</a>
+  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.04">v0.04 Release</a>
   · <a href="./CHANGELOG.md">Changelog</a>
   · <a href="./docs/README.md">Documentation</a>
 </p>
@@ -38,10 +38,10 @@
 ### One-click installer
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | sudo bash
 ```
 
-The installer always uses the `main` branch, Docker, and local PostgreSQL 18. It does not ask for a database address. The database name is `chatgpt_2api_app`. Containers are `chatgpt-2api-app` and `chatgpt-2api-postgres` on the isolated network `chatgpt-2api-net`, with timezone `Asia/Shanghai`. The admin key must be entered twice. It also asks for the Web/API port, defaulting to `2080`, and for the image access URL. Leave the image access URL empty to derive links from the current request, or enter one to store it as `CHATGPT2API_BASE_URL`.
+The installer always uses the `main` branch, Docker, and local PostgreSQL 18. It does not ask for a database address. The default install directory is `/opt/chatgpt-2api`. The database name is `chatgpt_2api_app`. Containers are `chatgpt-2api-app` and `chatgpt-2api-postgres` on the isolated network `chatgpt-2api-net`, with timezone `Asia/Shanghai`. The admin key is entered twice and hidden. It also asks for the Web/API port, defaulting to `2080`, and for the image access URL. Leave the image access URL empty to derive links from the current request. A bare domain or IP is stored as `https://` in `CHATGPT2API_BASE_URL`.
 
 ### Docker Compose
 

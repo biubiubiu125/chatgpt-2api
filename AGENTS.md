@@ -29,8 +29,8 @@
 
 ## 当前版本
 
-- 当前版本是 `0.03`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
-- 默认 Web/API 端口是 `2080`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时按当前请求地址生成链接，填写后写入 `CHATGPT2API_BASE_URL`。
+- 当前版本是 `0.04`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
+- 默认 Web/API 端口是 `2080`，默认安装目录是 `/opt/chatgpt-2api`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时按当前请求地址生成链接，只填域名或 IP 会写成 `https://` 地址后写入 `CHATGPT2API_BASE_URL`。
 - 版本检查用 `scripts/check_release_version.py`，发布占用检查用 `scripts/check_unpublished_release.sh`。执行要求见 `.codex/rules/git-and-release.md`。
 
 ## 永久约束

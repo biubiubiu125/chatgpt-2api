@@ -53,10 +53,10 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml logs -f post
 也可以使用仓库安装脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | sudo bash
 ```
 
-安装脚本固定使用 `main` 分支、Docker 和本机 PostgreSQL 18，安装时不需要填写数据库地址。数据库名是 `chatgpt_2api_app`，不使用 SQLite。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，只接入隔离网络 `chatgpt-2api-net`，时区固定为 `Asia/Shanghai`。管理员登录密钥需要输入两次。安装时会询问 Web/API 端口，默认是 `2080`，也会询问图片访问地址。图片访问地址可以直接回车留空；填写后写入 `CHATGPT2API_BASE_URL`，用于生成对外图片查看链接。
+安装脚本固定使用 `main` 分支、Docker 和本机 PostgreSQL 18，安装时不需要填写数据库地址。默认安装目录是 `/opt/chatgpt-2api`。数据库名是 `chatgpt_2api_app`，不使用 SQLite。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，只接入隔离网络 `chatgpt-2api-net`，时区固定为 `Asia/Shanghai`。管理员登录密钥需要隐藏输入两次。安装向导会询问 Web/API 端口，默认是 `2080`，也会询问图片访问地址。图片访问地址可以直接回车留空；只填域名或 IP 会自动补成 `https://` 地址，再写入 `CHATGPT2API_BASE_URL`，用于生成对外图片查看链接。
 
 脚本会生成并保存数据库密码，下载 `docker-compose.postgres.yml`，再与主 Compose 一起启动。重复运行会复用已有密码。`CHATGPT2API_THREAD_TOKENS` 默认是 `120`，表示后端同步工作线程的并发容量，只要求正整数且不设置人为最高值；账号、代理和上游服务仍分别执行自己的并发限制。
 
