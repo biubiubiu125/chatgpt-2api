@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.02-111827" alt="Version v0.02" />
+  <img src="https://img.shields.io/badge/version-v0.03-111827" alt="Version v0.03" />
   <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue 3" />
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18" />
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.02">v0.02 Release</a>
+  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.03">v0.03 Release</a>
   · <a href="./CHANGELOG.md">更新说明</a>
   · <a href="./docs/README.md">维护文档</a>
 </p>

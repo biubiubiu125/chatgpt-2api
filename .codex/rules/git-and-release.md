@@ -42,7 +42,7 @@
 
 ## 版本与文档
 
-- 当前发布版本是 `0.02`。权威值是仓库根目录 `VERSION`；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 的 `## <version> - ` 标题必须相同。改版本后运行 `python scripts/check_release_version.py`。
+- 当前发布版本是 `0.03`。权威值是仓库根目录 `VERSION`；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 的 `## <version> - ` 标题必须相同。改版本后运行 `python scripts/check_release_version.py`。
 - 默认 Web/API 端口是 `2080`。`deploy/install.sh` 询问端口和图片访问地址，分别写入 `CHATGPT2API_PORT` 与 `CHATGPT2API_BASE_URL`；图片地址留空时按当前请求地址生成链接。启动 Docker 前导出本次确认的这两个值，避免旧 shell 环境变量覆盖 `.env`。容器内监听 `80`。
 - `.github/workflows/docker-publish.yml` 在 `main` 推送时验证并发布。`scripts/check_unpublished_release.sh` 发现该版本已有完整 GitHub Release 时失败；再次发布前必须先升 `VERSION`。
 - 用户可感知的功能、Interface 或行为变化写入 `CHANGELOG.md` 当前版本标题下；纯内部重构无需逐条记录。
