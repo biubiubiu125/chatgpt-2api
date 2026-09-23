@@ -27,6 +27,12 @@
 
 跨多个范围的任务必须读取全部相关规则，不能只读其中一个。
 
+## 当前版本
+
+- 当前版本是 `0.02`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
+- 默认 Web/API 端口是 `2080`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时按当前请求地址生成链接，填写后写入 `CHATGPT2API_BASE_URL`。
+- 版本检查用 `scripts/check_release_version.py`，发布占用检查用 `scripts/check_unpublished_release.sh`。执行要求见 `.codex/rules/git-and-release.md`。
+
 ## 永久约束
 
 - 保留用户已有修改；不回滚、不覆盖、不顺手整理无关文件。
