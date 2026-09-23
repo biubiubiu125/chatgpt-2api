@@ -145,7 +145,7 @@ wheels = [
 
 [[package]]
 name = "chatgpt-2api"
-version = "0.01"
+version = "0.02"
 source = { virtual = "." }
 dependencies = [
     { name = "cryptography" },
