@@ -1,0 +1,30 @@
+[project]
+name = "chatgpt-2api"
+version = "0.01"
+description = "ChatGPT web relay with Chrome 146 identity, image account scheduling, and account registration."
+readme = "README.md"
+license = "AGPL-3.0-only"
+authors = [{ name = "biubiubiu125" }]
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography>=46.0.0",
+    "curl-cffi>=0.15.0",
+    "fastapi>=0.136.0",
+    "pillow>=12.2.0",
+    "pybase64>=1.4.3",
+    "python-multipart>=0.0.26",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.44.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.4.2,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

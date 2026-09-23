@@ -1,0 +1,28 @@
+name: chatgpt-2api
+
+services:
+  app:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt-2api:latest}
+    container_name: chatgpt-2api-app
+    restart: unless-stopped
+    ports:
+      - "${CHATGPT2API_PORT:-3000}:80"
+    volumes:
+      - chatgpt-2api-runtime:/app
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-120}
+      TZ: Asia/Shanghai
+    networks:
+      - chatgpt-2api-net
+
+networks:
+  chatgpt-2api-net:
+    name: chatgpt-2api-net
+
+volumes:
+  chatgpt-2api-runtime:

@@ -1,0 +1,220 @@
+name: Verify and Publish
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: chatgpt-2api
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check release version
+        run: |
+          python scripts/check_release_version.py
+          bash -n scripts/check_unpublished_release.sh
+
+      - name: Require unpublished VERSION
+        if: >-
+          (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+          || (github.event_name == 'pull_request' && github.base_ref == 'main')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_unpublished_release.sh
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Compile backend
+        run: |
+          uv sync --frozen
+          uv run python -m compileall -q api contracts services utils main.py
+
+      - name: Test backend
+        env:
+          CHATGPT2API_AUTH_KEY: test-auth-key
+          DATABASE_URL: sqlite:////tmp/chatgpt-2api-ci.db
+        run: |
+          if [ -d tests ] && find tests -name 'test_*.py' -print -quit | grep -q .; then
+            uv run python -m pytest -q -p no:cacheprovider
+          else
+            echo "No committed tests; skip pytest"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-vue/package-lock.json
+
+      - name: Build console
+        working-directory: web-vue
+        run: |
+          npm ci
+          npm run icons:check
+          npx tsc --noEmit
+          npm run build
+
+  release-bundle:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read VERSION
+        id: version
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Require unpublished VERSION
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_unpublished_release.sh --repair
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-vue/package-lock.json
+
+      - name: Build runtime bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix web-vue ci
+          npm --prefix web-vue run build
+
+          bundle="release/chatgpt-2api-app"
+          mkdir -p "${bundle}/scripts/image_upscale"
+          cp main.py VERSION pyproject.toml uv.lock "${bundle}/"
+          cp -R api contracts services utils "${bundle}/"
+          cp scripts/image_upscale/upscale.mjs "${bundle}/scripts/image_upscale/"
+          cp -R web-vue/dist "${bundle}/web_dist"
+
+          version="$(tr -d '\r\n' < VERSION)"
+          cat > "${bundle}/update-manifest.json" <<EOF
+          {
+            "format": 1,
+            "version": "${version}",
+            "paths": [
+              "main.py",
+              "VERSION",
+              "api",
+              "contracts",
+              "services",
+              "utils",
+              "scripts/image_upscale/upscale.mjs",
+              "pyproject.toml",
+              "uv.lock",
+              "web_dist"
+            ]
+          }
+          EOF
+
+          tar -C release -czf release/chatgpt-2api-app.tar.gz chatgpt-2api-app
+          (cd release && sha256sum chatgpt-2api-app.tar.gz > checksums.txt)
+          awk -v version="${version}" '
+            /^## / {
+              if (capture) exit
+              capture = index($0, "## " version " - ") == 1
+              next
+            }
+            capture { print }
+          ' CHANGELOG.md > release/release-notes.md
+          test -s release/release-notes.md
+
+      - name: Upload online update bundle
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: v${{ steps.version.outputs.value }}
+          target_commitish: ${{ github.sha }}
+          body_path: release/release-notes.md
+          files: |
+            release/chatgpt-2api-app.tar.gz
+            release/checksums.txt
+          fail_on_unmatched_files: true
+          make_latest: true
+
+  docker:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: release-bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Read VERSION
+        id: version
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.version.outputs.value }},enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+            type=ref,event=branch
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: app
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
