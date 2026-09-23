@@ -41,7 +41,7 @@
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | bash
 ```
 
-安装固定使用 `main` 分支和本机 PostgreSQL 18，不需要填写数据库地址。数据库名是 `chatgpt_2api_app`。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，两者只接入 `chatgpt-2api-net`，时区是 `Asia/Shanghai`。
+安装固定使用 `main` 分支和本机 PostgreSQL 18，不需要填写数据库地址。数据库名是 `chatgpt_2api_app`。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，两者只接入 `chatgpt-2api-net`，时区是 `Asia/Shanghai`。安装时会询问 Web/API 端口，默认 `2080`，也会询问图片访问地址；图片访问地址可留空，填写后写入 `CHATGPT2API_BASE_URL`。
 
 ### Docker Compose
 
@@ -56,8 +56,8 @@ docker compose up -d
 
 | 入口            | 地址                       |
 | :-------------- | :------------------------- |
-| 管理控制台      | `http://localhost:3000`    |
-| OpenAI 兼容 API | `http://localhost:3000/v1` |
+| 管理控制台      | `http://localhost:2080`    |
+| OpenAI 兼容 API | `http://localhost:2080/v1` |
 | 数据目录        | `./data`                   |
 
 `.env` 中的 `CHATGPT2API_AUTH_KEY` 优先于 `config.json` 的 `auth-key`。Compose 使用独立运行时卷支持控制台在线更新；控制台设置、账号、用户密钥、调用日志和指标写入 Application Database。不要提交本地 `.env`、`config.json` 或 `data/`。
@@ -144,7 +144,7 @@ Authorization: Bearer <auth-key>
 <summary>Chat Completions 示例</summary>
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:2080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{"model":"gpt-5","messages":[{"role":"user","content":"介绍一下这个项目"}],"stream":true}'
@@ -156,7 +156,7 @@ curl http://localhost:3000/v1/chat/completions \
 <summary>图片生成示例</summary>
 
 ```bash
-curl http://localhost:3000/v1/images/generations \
+curl http://localhost:2080/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{"model":"gpt-image-2","prompt":"一只漂浮在太空里的猫，电影感光影","n":1,"response_format":"b64_json"}'

@@ -5,7 +5,8 @@ REPO_OWNER="${REPO_OWNER:-biubiubiu125}"
 REPO_NAME="${REPO_NAME:-chatgpt-2api}"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/chatgpt-2api}"
-PORT="${CHATGPT2API_PORT:-${PORT:-3000}}"
+PORT="${CHATGPT2API_PORT:-${PORT:-2080}}"
+BASE_URL="${CHATGPT2API_BASE_URL:-}"
 THREAD_TOKENS="${CHATGPT2API_THREAD_TOKENS:-${THREAD_TOKENS:-120}}"
 MODE="${MODE:-}"
 AUTH_KEY="${CHATGPT2API_AUTH_KEY:-${AUTH_KEY:-}}"
@@ -36,7 +37,8 @@ EOF
   cat <<'EOF'
   BRANCH=main
   INSTALL_DIR=/opt/chatgpt-2api
-  PORT=3000
+  PORT=2080
+  CHATGPT2API_BASE_URL=
   CHATGPT2API_THREAD_TOKENS=120
   MODE=docker
   AUTH_KEY=your-auth-key
@@ -51,7 +53,8 @@ EOF
   printf '\n%s\n' "$(text usage_flags)"
   cat <<'EOF'
   --mode docker|python
-  --port 3000
+  --port 2080
+  --base-url https://your-domain.com
   --thread-tokens 120
   --install-dir /opt/chatgpt-2api
   --branch main
@@ -117,6 +120,7 @@ text() {
       err_unknown_arg) printf 'Unknown argument' ;;
       err_mode) printf 'MODE must be docker or python.' ;;
       err_port) printf 'PORT must be a number.' ;;
+      err_base_url) printf 'Image access URL must be an http or https URL, or left empty.' ;;
       err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive number.' ;;
       err_database_mode) printf 'Invalid database mode.' ;;
       err_postgres_password) printf 'POSTGRES_PASSWORD may only contain letters, numbers, underscores, and hyphens.' ;;
@@ -132,11 +136,14 @@ text() {
       info_start_app) printf 'Starting ChatGPT2API on' ;;
       prompt_mode) printf 'Run mode: docker or python' ;;
       prompt_port) printf 'Web/API port' ;;
+      prompt_base_url) printf 'Image access URL, press Enter to leave empty' ;;
       prompt_thread_tokens) printf 'Backend sync concurrency (thread tokens, no fixed maximum)' ;;
       prompt_dir) printf 'Install directory' ;;
       prompt_branch) printf 'Git branch or tag' ;;
       prompt_auth) printf 'Admin auth key' ;;
       done_ready) printf 'ChatGPT2API is ready' ;;
+      done_base_url) printf 'Image access URL' ;;
+      done_base_url_empty) printf 'not set; image links follow the current request address' ;;
       done_auth) printf 'Admin auth key' ;;
       *) printf '%s' "${key}" ;;
     esac
@@ -160,6 +167,7 @@ text() {
     err_unknown_arg) printf '未知参数' ;;
     err_mode) printf '运行模式只能是 docker 或 python。' ;;
     err_port) printf '端口必须是数字。' ;;
+    err_base_url) printf '图片访问地址必须是 http 或 https 链接，也可以留空。' ;;
     err_not_git) printf '已存在，但不是 Git 仓库。' ;;
     err_compose) printf '未找到 docker compose 插件，请先安装 Docker Compose v2。' ;;
     info_update) printf '正在更新' ;;
@@ -172,10 +180,13 @@ text() {
     info_start_app) printf '正在启动 ChatGPT2API' ;;
     prompt_mode) printf '运行模式：docker 或 python' ;;
     prompt_port) printf 'Web/API 端口' ;;
+    prompt_base_url) printf '图片访问地址，直接回车留空' ;;
     prompt_dir) printf '安装目录' ;;
     prompt_branch) printf 'Git 分支或标签' ;;
     prompt_auth) printf '管理员登录密钥' ;;
     done_ready) printf 'ChatGPT2API 已就绪' ;;
+    done_base_url) printf '图片访问地址' ;;
+    done_base_url_empty) printf '未设置，按当前请求地址生成图片链接' ;;
     done_auth) printf '管理员登录密钥' ;;
     *) printf '%s' "${key}" ;;
   esac
@@ -352,6 +363,10 @@ parse_args() {
         PORT="${2:-}"
         shift 2
         ;;
+      --base-url)
+        BASE_URL="${2:-}"
+        shift 2
+        ;;
       --thread-tokens)
         THREAD_TOKENS="${2:-}"
         shift 2
@@ -397,6 +412,21 @@ parse_args() {
   done
 }
 
+normalize_base_url() {
+  local value="${1-}"
+  while [[ "${value}" == */ ]]; do
+    value="${value%/}"
+  done
+  if [[ -z "${value}" ]]; then
+    printf ''
+    return 0
+  fi
+  if [[ ! "${value}" =~ ^https?://[A-Za-z0-9._:-]+(/[A-Za-z0-9._~:/?#&=%+-]*)?$ ]]; then
+    return 1
+  fi
+  printf '%s' "${value}"
+}
+
 validate_inputs() {
   local normalized=""
 
@@ -407,6 +437,12 @@ validate_inputs() {
     echo "[$(text prefix_error)] $(text err_port)" >&2
     exit 1
   fi
+
+  if ! normalized="$(normalize_base_url "${BASE_URL}")"; then
+    echo "[$(text prefix_error)] $(text err_base_url)" >&2
+    exit 1
+  fi
+  BASE_URL="${normalized}"
 
   if [[ -z "${THREAD_TOKENS}" || ! "${THREAD_TOKENS}" =~ ^[0-9]+$ || "${THREAD_TOKENS}" -lt 1 ]]; then
     echo "[$(text prefix_error)] $(text err_thread_tokens)" >&2
@@ -530,7 +566,7 @@ CHATGPT2API_AUTH_KEY=${AUTH_KEY}
 CHATGPT2API_PORT=${PORT}
 CHATGPT2API_THREAD_TOKENS=${THREAD_TOKENS}
 CHATGPT2API_IMAGE=$(default_image)
-CHATGPT2API_BASE_URL=
+CHATGPT2API_BASE_URL="${BASE_URL}"
 
 DATABASE_MODE=${DATABASE_MODE}
 # 本地 PostgreSQL 由安装脚本创建，不要填写数据库地址。
@@ -546,6 +582,18 @@ EOF
   chmod 600 "${env_file}" || true
 }
 
+export_compose_env() {
+  # Compose 优先使用当前 shell 环境变量，不会用刚写入 .env 的新值覆盖旧值。
+  export CHATGPT2API_AUTH_KEY="${AUTH_KEY}"
+  export CHATGPT2API_PORT="${PORT}"
+  export CHATGPT2API_THREAD_TOKENS="${THREAD_TOKENS}"
+  export CHATGPT2API_IMAGE="$(default_image)"
+  export CHATGPT2API_BASE_URL="${BASE_URL}"
+  export POSTGRES_DB="${POSTGRES_DB}"
+  export POSTGRES_USER="${POSTGRES_USER}"
+  export POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
+}
+
 run_docker() {
   need_cmd docker
   if ! docker compose version >/dev/null 2>&1; then
@@ -558,9 +606,13 @@ run_docker() {
     compose_args+=(-f docker-compose.postgres.yml)
   fi
 
+  export_compose_env
   ui_println "[$(text prefix_info)] $(text info_start_docker)"
-  (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" pull)
-  (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" up -d)
+  (
+    cd "${INSTALL_DIR}"
+    docker compose "${compose_args[@]}" pull
+    docker compose "${compose_args[@]}" up -d
+  )
 }
 
 ensure_uv() {
@@ -596,6 +648,7 @@ run_python() {
   ui_println "[$(text prefix_info)] $(text info_start_app) http://0.0.0.0:${PORT}"
   cd "${INSTALL_DIR}"
   export CHATGPT2API_AUTH_KEY="${AUTH_KEY}"
+  export CHATGPT2API_BASE_URL="${BASE_URL}"
   export CHATGPT2API_THREAD_TOKENS="${THREAD_TOKENS}"
   export DATABASE_URL="${DATABASE_URL}"
   exec uv run uvicorn main:app --host 0.0.0.0 --port "${PORT}"
@@ -618,6 +671,7 @@ main() {
     exit 1
   fi
   PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
+  BASE_URL="$(prompt_input "$(text prompt_base_url)" "${BASE_URL}")"
   THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
   INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
   configure_database
@@ -649,6 +703,11 @@ main() {
 
   ui_println ""
   ui_println "[$(text prefix_done)] $(text done_ready): http://localhost:${PORT}"
+  if [[ -n "${BASE_URL}" ]]; then
+    ui_println "[$(text prefix_done)] $(text done_base_url): ${BASE_URL}"
+  else
+    ui_println "[$(text prefix_done)] $(text done_base_url): $(text done_base_url_empty)"
+  fi
   ui_println "[$(text prefix_done)] $(text done_auth): ${AUTH_KEY}"
   ui_println "[$(text prefix_done)] 应用容器: chatgpt-2api-app"
   ui_println "[$(text prefix_done)] 数据库容器: chatgpt-2api-postgres"

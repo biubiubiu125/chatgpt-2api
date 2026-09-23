@@ -41,7 +41,7 @@
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/deploy/install.sh | bash
 ```
 
-The installer always uses the `main` branch, Docker, and local PostgreSQL 18. It does not ask for a database address. The database name is `chatgpt_2api_app`. Containers are `chatgpt-2api-app` and `chatgpt-2api-postgres` on the isolated network `chatgpt-2api-net`, with timezone `Asia/Shanghai`. The admin key must be entered twice.
+The installer always uses the `main` branch, Docker, and local PostgreSQL 18. It does not ask for a database address. The database name is `chatgpt_2api_app`. Containers are `chatgpt-2api-app` and `chatgpt-2api-postgres` on the isolated network `chatgpt-2api-net`, with timezone `Asia/Shanghai`. The admin key must be entered twice. It also asks for the Web/API port, defaulting to `2080`, and for the image access URL. Leave the image access URL empty to derive links from the current request, or enter one to store it as `CHATGPT2API_BASE_URL`.
 
 ### Docker Compose
 
@@ -56,8 +56,8 @@ docker compose up -d
 
 | Endpoint | Address |
 | :--- | :--- |
-| Admin console | `http://localhost:3000` |
-| OpenAI-compatible API | `http://localhost:3000/v1` |
+| Admin console | `http://localhost:2080` |
+| OpenAI-compatible API | `http://localhost:2080/v1` |
 | Data directory | `./data` |
 
 `CHATGPT2API_AUTH_KEY` in `.env` takes precedence over `auth-key` in `config.json`. Compose uses a dedicated runtime volume for console-managed online updates. Console settings, upstream accounts, user keys, call records, and metrics are stored in the Application Database. Do not commit local `.env`, `config.json`, or `data/` files.
@@ -148,7 +148,7 @@ Creating, querying, and deleting file tasks is isolated by API key. The `/files/
 <summary>Chat Completions example</summary>
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:2080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{"model":"gpt-5","messages":[{"role":"user","content":"Introduce this project"}],"stream":true}'
@@ -160,7 +160,7 @@ curl http://localhost:3000/v1/chat/completions \
 <summary>Image generation example</summary>
 
 ```bash
-curl http://localhost:3000/v1/images/generations \
+curl http://localhost:2080/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{"model":"gpt-image-2","prompt":"A cat floating in space, cinematic lighting","n":1,"response_format":"b64_json"}'

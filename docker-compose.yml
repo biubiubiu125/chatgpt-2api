@@ -6,7 +6,7 @@ services:
     container_name: chatgpt-2api-app
     restart: unless-stopped
     ports:
-      - "${CHATGPT2API_PORT:-3000}:80"
+      - "${CHATGPT2API_PORT:-2080}:80"
     volumes:
       - chatgpt-2api-runtime:/app
       - ./data:/app/data
