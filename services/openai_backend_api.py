@@ -45,6 +45,7 @@ from services.image_failure import (
     terminal_assistant_text,
 )
 from services.protocol.reasoning import normalize_thinking_effort
+from services.provider_asset_url import ProviderAssetUrlError, resolve_provider_asset_url
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -298,6 +299,7 @@ class OpenAIBackendAPI:
             proxy_url: str | None = None,
             deadline_monotonic: float | None = None,
             account: dict[str, Any] | None = None,
+            use_global_proxy: bool = False,
     ) -> None:
         """初始化后端客户端。
 
@@ -327,9 +329,16 @@ class OpenAIBackendAPI:
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
-        explicit_proxy = resolve_backend_explicit_proxy(self.account, proxy, proxy_url)
+        if use_global_proxy:
+            # Account refresh and image calls ignore a stored account proxy.
+            # That value is registration-only.
+            explicit_proxy = str(proxy or proxy_url or "").strip()
+            profile_account = None
+        else:
+            explicit_proxy = resolve_backend_explicit_proxy(self.account, proxy, proxy_url)
+            profile_account = self.account
         self.proxy_profile = proxy_profile or proxy_settings.get_profile(
-            account=self.account,
+            account=profile_account,
             proxy=explicit_proxy,
             upstream=True,
             reserve_image_egress=reserve_image_egress,
@@ -2099,10 +2108,23 @@ class OpenAIBackendAPI:
                 image_failure("image_download_failed"),
                 "editable_download_url_missing",
             )
+        try:
+            download_url = resolve_provider_asset_url(download_url, self.base_url)
+        except ProviderAssetUrlError:
+            self._raise_editable_failure(
+                image_failure("image_download_failed"),
+                "editable_download_url_rejected",
+            )
         response = self.session.get(
             download_url,
             timeout=self._editable_request_timeout(deadline, 300),
+            allow_redirects=False,
         )
+        if 300 <= int(getattr(response, "status_code", 0) or 0) < 400:
+            self._raise_editable_failure(
+                image_failure("image_download_failed"),
+                "editable_download_redirect_rejected",
+            )
         try:
             ensure_ok(response, "artifact_download", credential_scope="signed_asset")
         except UpstreamHTTPError as exc:
@@ -3586,11 +3608,12 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
         for url in urls:
-            parsed_url = urlparse(url)
-            same_origin = (
-                not parsed_url.netloc
-                or urls_share_browser_origin(url, self.base_url)
-            )
+            try:
+                request_url = resolve_provider_asset_url(url, self.base_url)
+            except ProviderAssetUrlError as exc:
+                raise ImageDownloadError("image download URL host is not allowed") from exc
+            parsed_url = urlparse(request_url)
+            same_origin = urls_share_browser_origin(request_url, self.base_url)
             download_headers = (
                 self._headers(parsed_url.path or "/", {"Sec-Fetch-Site": "same-origin"})
                 if same_origin
@@ -3599,10 +3622,13 @@ class OpenAIBackendAPI:
             for attempt in range(2):
                 try:
                     response = self.session.get(
-                        url,
+                        request_url,
                         headers=download_headers,
                         timeout=120,
+                        allow_redirects=False,
                     )
+                    if 300 <= int(getattr(response, "status_code", 0) or 0) < 400:
+                        raise ImageDownloadError("image download redirect is not allowed")
                     ensure_ok(
                         response,
                         "image_download",

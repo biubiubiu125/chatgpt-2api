@@ -224,7 +224,7 @@ def navigation_sec_fetch_site(referer: str, target: str) -> str:
     source = browser_origin(referer)
     destination = browser_origin(target)
     if source is None or destination is None:
-        return "same-origin"
+        return "none"
     if source[:3] == destination[:3]:
         return "same-origin"
     if source[3] == destination[3]:
@@ -232,18 +232,21 @@ def navigation_sec_fetch_site(referer: str, target: str) -> str:
     return "cross-site"
 
 
-def chrome146_remote_image_headers() -> dict[str, str]:
+def chrome146_remote_image_headers(url: str = "", referer: str = "") -> dict[str, str]:
     """Headers for downloading a user-supplied image URL as Chrome 146."""
 
+    site = navigation_sec_fetch_site(referer, url) if str(url or "").strip() else "none"
     headers = chrome146_headers(
         {
             "Accept": "image/*,*/*;q=0.8",
             "Sec-Fetch-Dest": "image",
             "Sec-Fetch-Mode": "no-cors",
-            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Site": site,
         },
         include_defaults=False,
     )
+    if str(referer or "").strip():
+        headers["Referer"] = referer
     return {
         str(key): str(value)
         for key, value in headers.items()

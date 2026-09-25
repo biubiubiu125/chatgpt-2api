@@ -119,9 +119,13 @@ def _elapsed_seconds(task: dict[str, Any]) -> int:
 
 
 def _file_url(path: Path, base_url: str) -> str:
+    from services.media_access import with_media_access
+
     rel = path.resolve().relative_to(EDITABLE_FILE_ROOT.resolve()).as_posix()
     prefix = str(base_url or "").strip().rstrip("/")
-    return f"{prefix}/files/{quote(rel, safe='/')}" if prefix else f"/files/{quote(rel, safe='/')}"
+    quoted = quote(rel, safe="/")
+    url = f"{prefix}/files/{quoted}" if prefix else f"/files/{quoted}"
+    return with_media_access(url, rel)
 
 
 def _editable_access_token() -> str:

@@ -153,8 +153,9 @@ def _reconcile_core_result_unlocked(
         },
     }
     if proxy:
-        normalized["proxy"] = proxy
         normalized["register_proxy"] = proxy
+        if str(normalized.get("proxy") or "").strip() == proxy:
+            normalized.pop("proxy", None)
     if verify_failed:
         normalized["last_remote_check_result"] = "error"
         normalized["last_remote_check_event"] = "register_verify"

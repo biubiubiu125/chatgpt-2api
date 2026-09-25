@@ -9,9 +9,12 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+import anyio
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from services import image_generation_gate as image_gate
 
 from services.call_record_service import CallRecordService
 from services.storage.call_record_repository import CallRecordCursorMismatch
@@ -20,6 +23,7 @@ from services.image_failure import (
     ImageFailure,
     ImageGenerationError,
     classify_image_exception,
+    image_failure,
     is_text_review_failure_code,
     public_image_error_message,
 )
@@ -495,131 +499,229 @@ class LoggedCall:
                 role=str(self.identity.get("role") or ""),
                 key_name=str(self.identity.get("name") or ""),
             )
-        handler_submitted = time.perf_counter()
-
-        def _call_handler():
-            handler_started = time.perf_counter()
-            queue_ms = int((handler_started - handler_submitted) * 1000)
-            if trace_perf:
-                self.perf_timings["handler_queue_ms"] = queue_ms
-                realtime_monitor_service.stage(
-                    self.call_id,
-                    "handler_started",
-                    handler_queue_ms=queue_ms,
-                    endpoint=self.endpoint,
-                    model=self.model,
-                )
-            if trace_perf and queue_ms >= PERF_WAIT_WARN_MS:
-                logger.warning({
-                    "event": "api_handler_threadpool_wait_slow",
-                    "call_id": self.call_id,
-                    "endpoint": self.endpoint,
-                    "model": self.model,
-                    "queue_ms": queue_ms,
-                })
-            try:
-                return handler(*args)
-            finally:
-                if trace_perf:
-                    self.perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
-
+        admission = None
+        admission_token = None
+        image_limiter = None
         try:
-            result = await run_in_threadpool(_call_handler)
-        except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""),
-                     extra=_exception_log_fields(exc, image=image_request))
-            return _image_error_response(exc)
-        except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
-            raise
-        except Exception as exc:
-            self.log("调用失败", status="failed", error=(
-                _public_image_exception_message(exc) if image_request else str(exc)
-            ), account_email=getattr(exc, "account_email", ""),
-                     extra=_exception_log_fields(exc, image=image_request))
             if image_request:
+                try:
+                    admission = await self._reserve_image_admission(args)
+                except ImageGenerationError as exc:
+                    self.log(
+                        "调用失败",
+                        status="failed",
+                        error=_public_image_exception_message(exc),
+                        account_email=getattr(exc, "account_email", ""),
+                        conversation_id=getattr(exc, "conversation_id", ""),
+                        extra=_exception_log_fields(exc, image=image_request),
+                    )
+                    return _image_error_response(exc)
+                admission_token = image_gate.image_generation_gate.bind(admission)
+                image_limiter = image_gate.image_generation_gate.handler_limiter()
+            handler_submitted = time.perf_counter()
+
+            def _call_handler():
+                handler_started = time.perf_counter()
+                queue_ms = int((handler_started - handler_submitted) * 1000)
+                if trace_perf:
+                    self.perf_timings["handler_queue_ms"] = queue_ms
+                    realtime_monitor_service.stage(
+                        self.call_id,
+                        "handler_started",
+                        handler_queue_ms=queue_ms,
+                        endpoint=self.endpoint,
+                        model=self.model,
+                    )
+                if trace_perf and queue_ms >= PERF_WAIT_WARN_MS:
+                    logger.warning({
+                        "event": "api_handler_threadpool_wait_slow",
+                        "call_id": self.call_id,
+                        "endpoint": self.endpoint,
+                        "model": self.model,
+                        "queue_ms": queue_ms,
+                    })
+                try:
+                    return handler(*args)
+                finally:
+                    if trace_perf:
+                        self.perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
+
+            try:
+                result = await self._run_on_limiter(_call_handler, image_limiter)
+            except ImageGenerationError as exc:
+                self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
+                         conversation_id=getattr(exc, "conversation_id", ""),
+                         extra=_exception_log_fields(exc, image=image_request))
                 return _image_error_response(exc)
-            return _protocol_error_response(exc, 502, sse)
+            except HTTPException as exc:
+                self.log("调用失败", status="failed", error=str(exc.detail))
+                raise
+            except Exception as exc:
+                self.log("调用失败", status="failed", error=(
+                    _public_image_exception_message(exc) if image_request else str(exc)
+                ), account_email=getattr(exc, "account_email", ""),
+                         extra=_exception_log_fields(exc, image=image_request))
+                if image_request:
+                    return _image_error_response(exc)
+                return _protocol_error_response(exc, 502, sse)
 
-        if isinstance(result, dict):
-            projected_status = str(result.get("_call_status") or "success").strip().lower()
-            if projected_status not in {"success", "failed", "text_review"}:
-                projected_status = "success"
-            projected_error = str(result.get("_call_error") or "").strip()
-            projected_extra: dict[str, object] = {}
-            if projected_status != "success" and result.get("error_code"):
-                projected_extra["error_code"] = result["error_code"]
-            self.log(
-                "调用失败" if projected_status == "failed" else "调用完成",
-                result,
-                status=projected_status,
-                error=projected_error,
-                account_email=str(result.get("_account_email") or ""),
-                conversation_id=str(result.get("_conversation_id") or ""),
-                extra=projected_extra or None,
-            )
-            return _strip_internal_response_fields(result)
+            if isinstance(result, dict):
+                projected_status = str(result.get("_call_status") or "success").strip().lower()
+                if projected_status not in {"success", "failed", "text_review"}:
+                    projected_status = "success"
+                projected_error = str(result.get("_call_error") or "").strip()
+                projected_extra: dict[str, object] = {}
+                if projected_status != "success" and result.get("error_code"):
+                    projected_extra["error_code"] = result["error_code"]
+                self.log(
+                    "调用失败" if projected_status == "failed" else "调用完成",
+                    result,
+                    status=projected_status,
+                    error=projected_error,
+                    account_email=str(result.get("_account_email") or ""),
+                    conversation_id=str(result.get("_conversation_id") or ""),
+                    extra=projected_extra or None,
+                )
+                return _strip_internal_response_fields(result)
 
-        if self.endpoint.startswith("/v1/images"):
-            sender = lambda items: image_sse_stream(items, error_builder=_image_error_payload)
-        else:
-            if sse == "anthropic":
-                sender = anthropic_sse_stream
-            elif image_request:
-                sender = lambda items: sse_json_stream(items, error_builder=_image_error_payload)
+            if self.endpoint.startswith("/v1/images"):
+                sender = lambda items: image_sse_stream(items, error_builder=_image_error_payload)
             else:
-                sender = sse_json_stream
-        first_item_submitted = time.perf_counter()
+                if sse == "anthropic":
+                    sender = anthropic_sse_stream
+                elif image_request:
+                    sender = lambda items: sse_json_stream(items, error_builder=_image_error_payload)
+                else:
+                    sender = sse_json_stream
+            first_item_submitted = time.perf_counter()
 
-        def _next_item_with_timing():
-            first_item_started = time.perf_counter()
-            queue_ms = int((first_item_started - first_item_submitted) * 1000)
-            if trace_perf:
-                self.perf_timings["stream_first_queue_ms"] = queue_ms
-                realtime_monitor_service.stage(
-                    self.call_id,
-                    "stream_first_item",
-                    stream_first_queue_ms=queue_ms,
-                    endpoint=self.endpoint,
-                    model=self.model,
-                )
-            if trace_perf and queue_ms >= PERF_WAIT_WARN_MS:
-                logger.warning({
-                    "event": "api_stream_first_item_threadpool_wait_slow",
-                    "call_id": self.call_id,
-                    "endpoint": self.endpoint,
-                    "model": self.model,
-                    "queue_ms": queue_ms,
-                })
-            try:
-                return _next_item(result)
-            finally:
+            def _next_item_with_timing():
+                first_item_started = time.perf_counter()
+                queue_ms = int((first_item_started - first_item_submitted) * 1000)
                 if trace_perf:
-                    self.perf_timings["stream_first_exec_ms"] = int((time.perf_counter() - first_item_started) * 1000)
+                    self.perf_timings["stream_first_queue_ms"] = queue_ms
+                    realtime_monitor_service.stage(
+                        self.call_id,
+                        "stream_first_item",
+                        stream_first_queue_ms=queue_ms,
+                        endpoint=self.endpoint,
+                        model=self.model,
+                    )
+                if trace_perf and queue_ms >= PERF_WAIT_WARN_MS:
+                    logger.warning({
+                        "event": "api_stream_first_item_threadpool_wait_slow",
+                        "call_id": self.call_id,
+                        "endpoint": self.endpoint,
+                        "model": self.model,
+                        "queue_ms": queue_ms,
+                    })
+                try:
+                    return _next_item(result)
+                finally:
+                    if trace_perf:
+                        self.perf_timings["stream_first_exec_ms"] = int((time.perf_counter() - first_item_started) * 1000)
 
-        try:
-            has_first, first = await run_in_threadpool(_next_item_with_timing)
-        except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""),
-                     extra=_exception_log_fields(exc, image=image_request))
-            return _image_error_response(exc)
-        except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
-            raise
-        except Exception as exc:
-            self.log("调用失败", status="failed", error=(
-                _public_image_exception_message(exc) if image_request else str(exc)
-            ), account_email=getattr(exc, "account_email", ""),
-                     extra=_exception_log_fields(exc, image=image_request))
-            if image_request:
+            try:
+                has_first, first = await self._run_on_limiter(_next_item_with_timing, image_limiter)
+            except ImageGenerationError as exc:
+                self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
+                         conversation_id=getattr(exc, "conversation_id", ""),
+                         extra=_exception_log_fields(exc, image=image_request))
                 return _image_error_response(exc)
-            return _protocol_error_response(exc, 502, sse)
-        if not has_first:
-            self.log("流式调用结束")
-            return StreamingResponse(sender(()), media_type="text/event-stream")
-        return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+            except HTTPException as exc:
+                self.log("调用失败", status="failed", error=str(exc.detail))
+                raise
+            except Exception as exc:
+                self.log("调用失败", status="failed", error=(
+                    _public_image_exception_message(exc) if image_request else str(exc)
+                ), account_email=getattr(exc, "account_email", ""),
+                         extra=_exception_log_fields(exc, image=image_request))
+                if image_request:
+                    return _image_error_response(exc)
+                return _protocol_error_response(exc, 502, sse)
+            if not has_first:
+                self.log("流式调用结束")
+                body = sender(())
+                if image_request:
+                    body = self._iterate_image_stream(body, result)
+                return StreamingResponse(body, media_type="text/event-stream")
+            body = sender(self.stream(itertools.chain([first], result)))
+            if image_request:
+                body = self._iterate_image_stream(body, result)
+            return StreamingResponse(body, media_type="text/event-stream")
+        finally:
+            if admission_token is not None:
+                image_gate.image_generation_gate.unbind(admission_token)
+            if admission is not None and not admission.handed_off:
+                image_gate.image_generation_gate.release(admission)
+
+    async def _reserve_image_admission(self, args):
+        gate = image_gate.image_generation_gate
+        from services.config import config
+
+        deadline = time.monotonic() + max(0.001, float(config.image_request_timeout_secs))
+        admission = None
+        try:
+            admission = gate.admit(
+                self._image_slot_count(args),
+                deadline_monotonic=deadline,
+            )
+            await gate.acquire_running_async(admission, deadline)
+            return admission
+        except image_gate.ImageGenerationQueueFullError as exc:
+            if admission is not None:
+                gate.release(admission)
+            raise ImageGenerationError(
+                "Image generation is busy. Please try again later.",
+                failure=image_failure("image_generation_busy"),
+            ) from exc
+        except BaseException:
+            if admission is not None:
+                gate.release(admission)
+            raise
+
+    @staticmethod
+    def _image_slot_count(args) -> int:
+        if not args or not isinstance(args[0], dict):
+            return 1
+        raw = args[0].get("n", 1)
+        try:
+            count = int(raw or 1)
+        except (TypeError, ValueError):
+            count = 1
+        return min(4, max(1, count))
+
+    @staticmethod
+    async def _run_on_limiter(func, limiter):
+        if limiter is None:
+            return await run_in_threadpool(func)
+        return await anyio.to_thread.run_sync(func, limiter=limiter)
+
+    async def _iterate_image_stream(self, items, image_generator=None):
+        iterator = iter(items)
+        limiter = image_gate.image_generation_gate.handler_limiter()
+        try:
+            while True:
+                has_item, item = await anyio.to_thread.run_sync(_next_item, iterator, limiter=limiter)
+                if not has_item:
+                    break
+                yield item
+        finally:
+            def _close_streams() -> None:
+                first_error: Exception | None = None
+                for candidate in (iterator, image_generator):
+                    close = getattr(candidate, "close", None)
+                    if close is None:
+                        continue
+                    try:
+                        close()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+                if first_error is not None:
+                    raise first_error
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(_close_streams, limiter=limiter)
 
     def _is_image_request(self) -> bool:
         if self.image_request or self.endpoint.startswith("/v1/images"):

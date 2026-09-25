@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future
 from typing import Any, Literal
 
 
@@ -32,6 +33,10 @@ _Task = tuple[
 
 class TaskCancelledError(RuntimeError):
     """Raised through ``on_cancel`` when committed work never starts."""
+
+
+class TaskRunnerCapacityError(RuntimeError):
+    """Raised when a bounded runner cannot admit another task."""
 
 
 class _RunState:
@@ -205,6 +210,49 @@ class BoundedTaskRunner:
         if not committed:
             reservation.rollback()
         return committed
+
+    def submit_future(
+        self,
+        callback: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        """Submit work and return a Future the caller can wait on.
+
+        Admission stays bounded. The future only reports the result; it does
+        not add another executor or extra worker.
+        """
+        future: Future[Any] = Future()
+        reservation = self.reserve()
+        if reservation is None:
+            future.set_exception(
+                TaskRunnerCapacityError(f"{self.name} task capacity is full")
+            )
+            return future
+
+        def run() -> None:
+            if future.cancelled():
+                return
+            try:
+                result = callback(*args, **kwargs)
+            except BaseException as exc:
+                if not future.cancelled():
+                    future.set_exception(exc)
+            else:
+                if not future.cancelled():
+                    future.set_result(result)
+
+        def on_cancel(exc: BaseException) -> None:
+            if not future.done():
+                future.set_exception(exc)
+
+        if not reservation.commit(run, on_cancel=on_cancel):
+            if not future.done():
+                future.set_exception(
+                    TaskCancelledError(f"{self.name} task was not admitted")
+                )
+        return future
 
     def status(self) -> dict[str, int | bool]:
         with self._lock:

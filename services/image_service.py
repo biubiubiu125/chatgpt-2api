@@ -14,6 +14,7 @@ from services.gallery_view import gallery_page
 from services.image_storage_service import (
     ImageBatchDeleteError,
     image_local_path,
+    image_media_mount_url,
     image_storage_service,
     normalize_image_relative_path,
 )
@@ -50,8 +51,13 @@ def _thumbnail_path(relative_path: str) -> Path:
 
 
 def thumbnail_url(base_url: str, relative_path: str) -> str:
+    from services.media_access import with_media_access
+
     rel = normalize_image_relative_path(relative_path)
-    return f"{base_url.rstrip('/')}/image-thumbnails/{rel}"
+    return with_media_access(
+        image_media_mount_url(rel, "image-thumbnails", base_url=base_url),
+        rel,
+    )
 
 
 def _image_dimensions(path: Path) -> tuple[int, int] | None:

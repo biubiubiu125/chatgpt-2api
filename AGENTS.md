@@ -29,8 +29,10 @@
 
 ## 当前版本
 
-- 当前版本是 `0.04`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
+- 当前版本是 `0.05`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
 - 默认 Web/API 端口是 `2080`，默认安装目录是 `/opt/chatgpt-2api`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时按当前请求地址生成链接，只填域名或 IP 会写成 `https://` 地址后写入 `CHATGPT2API_BASE_URL`。
+- 图片同时出图默认 `16`，排队默认 `256`，分别是 `CHATGPT2API_IMAGE_TASK_WORKERS` 和 `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE`。面板任务、OpenAI 出图、聊天生图和超时后续查共用；一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝。`CHATGPT2API_THREAD_TOKENS` 只是接口入口线程容量，不是同时出图数。
+- 对外图片和文件地址带签名，并保持在 `/images/`、`/image-thumbnails/` 或 `/files/`。`public_base_url` 只改主机，不改挂载路径。聊天和 Responses 的用户图片只接受公网地址；上游结果下载只允许 ChatGPT 资产域名，且不跟随跳转。一次多张图时，有图片成功就返回成功的图片。
 - 版本检查用 `scripts/check_release_version.py`，发布占用检查用 `scripts/check_unpublished_release.sh`。执行要求见 `.codex/rules/git-and-release.md`。
 
 ## 永久约束

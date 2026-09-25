@@ -19,6 +19,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.genbox_push_service import auto_push_gallery_urls
 from services.image_failure import (
+    ImageDownloadError,
     ImageFailureError,
     ImageGenerationError,
     ImagePollTimeoutError,
@@ -26,8 +27,10 @@ from services.image_failure import (
     image_failure,
     public_image_error_message,
 )
+from services import image_generation_gate as image_gate
 from services.image_task_view import image_task_page, image_task_row
-from services.json_file import read_json_file, write_json_file
+from services.json_file import read_json_file
+from services.storage.image_task_repository import ImageTaskRepository
 from services.log_service import (
     LOG_TYPE_CALL,
     collect_image_attempts,
@@ -36,6 +39,7 @@ from services.log_service import (
     log_service,
 )
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.log import logger
 from services.realtime_monitor_service import realtime_monitor_service
 from services.storage.file_lock import interprocess_lock
 from utils.diagnostics import exception_diagnostic_fields
@@ -60,6 +64,7 @@ TASK_DETAIL_KEYS = (
     "status_code",
     "error_type",
     "can_resume_poll",
+    "quota_consumed",
     "poll_attempts",
     "poll_timeout_secs",
     "stream_timeout_secs",
@@ -162,6 +167,12 @@ def _account_token_fingerprint(value: object) -> str:
     return ""
 
 
+def _quota_already_consumed(task: Mapping[str, object]) -> bool:
+    if task.get("quota_consumed") is True:
+        return True
+    return image_failure(_clean(task.get("error_code"))).code == "image_download_failed"
+
+
 def _resume_access_token(task: Mapping[str, object]) -> str:
     from services.account_service import account_service
 
@@ -172,6 +183,9 @@ def _resume_access_token(task: Mapping[str, object]) -> str:
     if not token:
         raise ValueError("task account session is no longer available")
     return token
+
+
+_RESUMABLE_IMAGE_CODES = frozenset({"image_poll_timeout", "image_download_failed"})
 
 
 def _normalize_task_failure(
@@ -188,8 +202,10 @@ def _normalize_task_failure(
     details["error_message_version"] = TASK_ERROR_MESSAGE_VERSION
     public_error = public_image_error_message(failure, exc)
     details["public_error"] = public_error
-    if failure.code == "image_poll_timeout" and _clean(getattr(exc, "conversation_id", "")):
+    if failure.code in _RESUMABLE_IMAGE_CODES and _clean(getattr(exc, "conversation_id", "")):
         details["can_resume_poll"] = True
+    if failure.code == "image_download_failed":
+        details["quota_consumed"] = True
     return public_error, raw_error, details
 
 
@@ -275,6 +291,7 @@ class ImageTaskService:
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_hours_getter: Callable[[], int] | None = None,
         task_runner: BoundedTaskRunner | None = None,
+        repository: ImageTaskRepository | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -299,13 +316,17 @@ class ImageTaskService:
         self._spool_owner_lease: _SpoolOwnerLease | None = None
         self._spool_exit_cleanup: Callable[[], None] | None = None
         self._spool_root = self._initialize_spool_root()
+        self._import_legacy_tasks = False
         try:
+            self._repository = repository or ImageTaskRepository()
             with self._lock:
                 self._tasks = self._load_locked()
                 changed = self._loaded_private_task_details or self._recover_unfinished_locked()
                 changed = self._cleanup_locked() or changed
-                if changed:
+                if changed or self._import_legacy_tasks:
                     self._save_locked()
+                if self._import_legacy_tasks:
+                    self._retire_legacy_task_file()
         except BaseException:
             self._release_spool_root()
             raise
@@ -546,6 +567,8 @@ class ImageTaskService:
                 _clean(payload.get("model"), "gpt-image-2"),
                 submitted_wall,
                 submitted_perf,
+                image_slots=_image_count(task.get("n")),
+                hold_running=False,
             )
             with self._lock:
                 return image_task_row(self._tasks.get(key, task))
@@ -614,11 +637,31 @@ class ImageTaskService:
         previous_task: dict[str, Any] | None,
         callback: Callable[..., None],
         *args: Any,
+        image_slots: int | None = None,
+        hold_running: bool = False,
     ) -> None:
+        slots = _image_count(task.get("n") if image_slots is None else image_slots)
+        try:
+            admission = image_gate.image_generation_gate.admit(slots)
+        except image_gate.ImageGenerationQueueFullError as exc:
+            raise ImageTaskQueueFullError() from exc
+
         def run_when_ready() -> None:
-            self._run_callback_safely(key, queued_payload, callback, *args)
+            gate = image_gate.image_generation_gate
+            if hold_running:
+                with gate.slot(admission=admission):
+                    self._run_callback_safely(key, queued_payload, callback, *args)
+                return
+            token = gate.bind(admission)
+            try:
+                self._run_callback_safely(key, queued_payload, callback, *args)
+            finally:
+                gate.unbind(token)
+                if not admission.handed_off:
+                    gate.release(admission)
 
         def cancel_before_start(_: BaseException) -> None:
+            image_gate.image_generation_gate.release(admission)
             self._mark_task_interrupted_safely(key)
             self._cleanup_queued_payload(queued_payload)
 
@@ -627,6 +670,7 @@ class ImageTaskService:
             try:
                 self._save_locked()
             except Exception:
+                image_gate.image_generation_gate.release(admission)
                 if previous_task is None:
                     self._tasks.pop(key, None)
                 else:
@@ -636,6 +680,7 @@ class ImageTaskService:
             if reservation.commit(run_when_ready, on_cancel=cancel_before_start):
                 return
 
+            image_gate.image_generation_gate.release(admission)
             if previous_task is None:
                 self._tasks.pop(key, None)
             else:
@@ -763,6 +808,16 @@ class ImageTaskService:
                 updates["started_ts"] = time.time()
             self._update_task(key, persist=False, **updates)
 
+        def session_checkpoint(conversation_id: str, fingerprint: str) -> None:
+            updates: dict[str, Any] = {}
+            cleaned_conversation_id = _clean(conversation_id)
+            if cleaned_conversation_id:
+                updates["conversation_id"] = cleaned_conversation_id
+            if _account_token_fingerprint(fingerprint):
+                updates["account_token_fingerprint"] = fingerprint
+            if updates:
+                self._update_task(key, persist=True, **updates)
+
         def image_result_callback(data: list[dict[str, Any]]) -> None:
             partial_data = [dict(item) for item in data if isinstance(item, dict)]
             if partial_data:
@@ -771,6 +826,7 @@ class ImageTaskService:
         payload_with_progress = {
             **payload,
             "progress_callback": progress_callback,
+            "session_checkpoint": session_checkpoint,
             "_image_result_callback": image_result_callback,
             "_call_id": call_id,
             "_trace_image_perf": True,
@@ -845,11 +901,19 @@ class ImageTaskService:
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=public_error, data=[],
-                              duration_ms=duration_ms,
-                              account_token_fingerprint=getattr(exc, "account_token_fingerprint", ""),
-                              **({"conversation_id": conversation_id} if conversation_id else {}),
-                              **_task_detail_fields(error_details))
+            failure_fields: dict[str, Any] = {
+                "status": TASK_STATUS_ERROR,
+                "error": public_error,
+                "data": [],
+                "duration_ms": duration_ms,
+            }
+            fingerprint = _account_token_fingerprint(getattr(exc, "account_token_fingerprint", ""))
+            if fingerprint:
+                failure_fields["account_token_fingerprint"] = fingerprint
+            if conversation_id:
+                failure_fields["conversation_id"] = conversation_id
+            failure_fields.update(_task_detail_fields(error_details))
+            self._update_task(key, **failure_fields)
             self._log_call(
                 identity,
                 mode,
@@ -951,7 +1015,24 @@ class ImageTaskService:
             if persist:
                 self._save_locked()
 
-    def _load_locked(self) -> dict[str, dict[str, Any]]:
+    def _retire_legacy_task_file(self) -> None:
+        if not self.path.is_file():
+            return
+        target = self.path.with_name(self.path.name + ".imported")
+        if target.exists():
+            target = self.path.with_name(f"{self.path.name}.{time.time_ns()}.imported")
+        try:
+            self.path.replace(target)
+        except OSError as exc:
+            logger.warning({
+                "event": "image_task_legacy_retire_failed",
+                "path": str(self.path),
+                "error": str(exc),
+            })
+
+    def _legacy_task_items(self) -> list:
+        if not self.path.is_file():
+            return []
         raw = read_json_file(
             self.path,
             name=self.path.name,
@@ -959,6 +1040,16 @@ class ImageTaskService:
             expected_types=(dict, list),
         )
         raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
+        return raw_items if isinstance(raw_items, list) else []
+
+    def _load_locked(self) -> dict[str, dict[str, Any]]:
+        self._import_legacy_tasks = False
+        raw_items = self._repository.load_payloads()
+        if raw_items:
+            self._retire_legacy_task_file()
+        else:
+            raw_items = self._legacy_task_items()
+            self._import_legacy_tasks = bool(raw_items)
         if not isinstance(raw_items, list):
             return {}
         tasks: dict[str, dict[str, Any]] = {}
@@ -1029,20 +1120,26 @@ class ImageTaskService:
 
     def _save_locked(self) -> None:
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        write_json_file(self.path, {"tasks": items})
+        self._repository.replace_all(items)
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
                 raw_error = "image task interrupted by service restart"
-                public_error, _, details = _normalize_task_failure(
-                    ImageFailureError(
+                conversation_id = _clean(task.get("conversation_id"))
+                if conversation_id:
+                    interrupted = ImageGenerationError(
+                        raw_error,
+                        failure=image_failure("image_poll_timeout", raw_detail=raw_error),
+                        conversation_id=conversation_id,
+                    )
+                else:
+                    interrupted = ImageFailureError(
                         raw_error,
                         failure=image_failure("task_interrupted", raw_detail=raw_error),
-                    ),
-                    raw_error,
-                )
+                    )
+                public_error, _, details = _normalize_task_failure(interrupted, raw_error)
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = public_error
                 _copy_task_details(details, task)
@@ -1080,12 +1177,13 @@ class ImageTaskService:
                 raise ValueError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
-            if image_failure(_clean(task.get("error_code"))).code != "image_poll_timeout":
+            if image_failure(_clean(task.get("error_code"))).code not in _RESUMABLE_IMAGE_CODES:
                 raise ValueError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
             access_token = _resume_access_token(task)
+            quota_already_consumed = _quota_already_consumed(task)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             base_url = _clean(task.get("base_url"))
@@ -1118,6 +1216,9 @@ class ImageTaskService:
                     base_url,
                     submitted_wall,
                     submitted_perf,
+                    quota_already_consumed,
+                    image_slots=1,
+                    hold_running=False,
                 )
             finally:
                 reservation.rollback()
@@ -1136,6 +1237,7 @@ class ImageTaskService:
         base_url: str,
         submitted_wall: float,
         submitted_perf: float,
+        quota_already_consumed: bool = False,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         from services.account_service import account_service
@@ -1144,12 +1246,13 @@ class ImageTaskService:
         handler_queue_ms = max(0, int((time.perf_counter() - submitted_perf) * 1000))
         self._update_task(key, status=TASK_STATUS_RUNNING)
         backend = None
+        egress_reserved = False
         held_token = ""
+        resume_admission = None
         outcome: bool | None = None
         failure = None
         with self._lock:
             request_payload = dict(self._tasks.get(key) or {})
-        request_payload["response_format"] = "b64_json"
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
@@ -1160,15 +1263,16 @@ class ImageTaskService:
                     deadline_monotonic=time.monotonic() + max(float(extra_timeout_secs or 0), 1.0),
                 )
             except TimeoutError:
-                message = "图片账号并发已满，稍后再继续等待"
+                failure = image_failure("image_generation_busy")
+                message = public_image_error_message(failure)
                 self._update_task(
                     key,
                     status=TASK_STATUS_ERROR,
                     error=message,
                     data=[],
                     duration_ms=int((time.time() - started) * 1000),
-                    error_code="image_poll_timeout",
-                    can_resume_poll=True,
+                    error_code=failure.code,
+                    can_resume_poll=False,
                     conversation_id=conversation_id,
                 )
                 self._log_call(
@@ -1184,7 +1288,47 @@ class ImageTaskService:
                 )
                 return
             access_token = held_token
-            backend = OpenAIBackendAPI(access_token=access_token)
+            try:
+                access_token = account_service._refresh_image_access_token(access_token)
+            except Exception as exc:
+                account_service._log_image_preflight_refresh_failure(exc)
+                failure = image_failure("auth_invalid")
+                message = "Image access token refresh failed."
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_ERROR,
+                    error=message,
+                    data=[],
+                    duration_ms=int((time.time() - started) * 1000),
+                    error_code=failure.code,
+                    can_resume_poll=False,
+                    conversation_id=conversation_id,
+                )
+                self._log_call(
+                    identity,
+                    mode,
+                    model,
+                    started,
+                    "调用失败（续轮询）",
+                    status="failed",
+                    error=message,
+                    perf={"handler_queue_ms": handler_queue_ms},
+                    request_payload=request_payload,
+                )
+                account_service.release_image_slot(held_token)
+                held_token = ""
+                return
+            held_token = access_token
+            resume_admission = image_gate.image_generation_gate.current()
+            if resume_admission is not None:
+                image_gate.image_generation_gate.acquire_running(resume_admission)
+            backend = OpenAIBackendAPI(
+                access_token=access_token,
+                use_global_proxy=True,
+                reserve_image_egress=True,
+                deadline_monotonic=time.monotonic() + max(float(extra_timeout_secs or 0), 1.0),
+            )
+            egress_reserved = bool(getattr(getattr(backend, "proxy_profile", None), "image_egress_reserved", False))
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -1198,7 +1342,7 @@ class ImageTaskService:
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
             if not image_urls:
-                raise RuntimeError("图片 URL 解析失败")
+                raise ImageDownloadError("图片 URL 解析失败")
 
             image_items = [
                 {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
@@ -1210,8 +1354,8 @@ class ImageTaskService:
                 size = _clean(task.get("size")) if task else None
             formatted = format_image_result(
                 image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
+                "",
+                "url",
                 base_url,
                 int(time.time()),
                 requested_size=size,
@@ -1248,8 +1392,12 @@ class ImageTaskService:
             failure = classify_image_exception(exc)
             outcome = False
             public_error, raw_error, error_details = _normalize_task_failure(exc, "resume poll failed")
-            if error_details.get("error_code") == "image_poll_timeout" and conversation_id:
+            if error_details.get("error_code") in _RESUMABLE_IMAGE_CODES and conversation_id:
                 error_details["can_resume_poll"] = True
+            if quota_already_consumed or (
+                failure is not None and failure.code == "image_download_failed"
+            ):
+                error_details["quota_consumed"] = True
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(
                 key,
@@ -1275,9 +1423,22 @@ class ImageTaskService:
             if held_token:
                 try:
                     if outcome is True:
-                        account_service.mark_image_result(held_token, True)
+                        account_service.mark_image_result(
+                            held_token,
+                            True,
+                            quota_consumed=not quota_already_consumed,
+                        )
                     elif outcome is False:
-                        account_service.mark_image_result(held_token, False, failure=failure)
+                        account_service.mark_image_result(
+                            held_token,
+                            False,
+                            failure=failure,
+                            quota_consumed=(
+                                not quota_already_consumed
+                                and failure is not None
+                                and failure.code == "image_download_failed"
+                            ),
+                        )
                     else:
                         account_service.release_image_slot(held_token)
                 except Exception:
@@ -1285,6 +1446,13 @@ class ImageTaskService:
                         account_service.release_image_slot(held_token)
                     except Exception:
                         pass
+            if resume_admission is not None:
+                image_gate.image_generation_gate.release_running(resume_admission)
+            if egress_reserved and backend is not None:
+                profile = getattr(backend, "proxy_profile", None)
+                if profile is not None:
+                    from services.proxy_service import proxy_settings
+                    proxy_settings.release_image_egress(profile)
             if backend is not None:
                 backend.close()
 

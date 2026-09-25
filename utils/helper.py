@@ -9,14 +9,14 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterator
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
 from curl_cffi.requests.exceptions import RequestException
 from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.browser_fingerprint import CHROME146_IMPERSONATE, chrome146_remote_image_headers
-from services.proxy_service import proxy_settings
+from services.public_image_url import public_image_curl_options, validate_public_image_url
 from utils.log import logger
 
 WEB_IMAGE_MODELS = (
@@ -41,6 +41,7 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+REMOTE_IMAGE_REDIRECTS = 3
 
 
 def _image_extension(mime_type: str) -> str:
@@ -525,6 +526,34 @@ def _message_image_url(value: object) -> str:
     return str(value or "").strip()
 
 
+def _read_limited_image(response: object) -> bytes:
+    data = bytearray()
+    iterator = getattr(response, "iter_content", None)
+    try:
+        if callable(iterator):
+            try:
+                for chunk in iterator(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    piece = bytes(chunk)
+                    if len(data) + len(piece) > MAX_JSON_IMAGE_BYTES:
+                        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+                    data.extend(piece)
+            except TypeError:
+                data = bytearray(bytes(getattr(response, "content", b"") or b""))
+            if not data:
+                data = bytearray(bytes(getattr(response, "content", b"") or b""))
+        else:
+            data = bytearray(bytes(getattr(response, "content", b"") or b""))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+    if len(data) > MAX_JSON_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+    return bytes(data)
+
+
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
     if source.startswith("data:"):
@@ -533,41 +562,56 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
         return base64.b64decode(data), mime
     if not source.startswith(("http://", "https://")):
         return None
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
 
-    try:
-        session_kwargs = proxy_settings.build_session_kwargs()
-        session_kwargs["impersonate"] = CHROME146_IMPERSONATE
-        response = requests.get(
-            source,
-            headers=chrome146_remote_image_headers(),
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            **session_kwargs,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
-    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
-        mime = guessed_mime
-    if not mime.startswith("image/"):
-        mime = "image/png"
-    return image_data, mime
+    current = source
+    for redirect_count in range(REMOTE_IMAGE_REDIRECTS + 1):
+        parsed, addresses = validate_public_image_url(current)
+        try:
+            response = requests.get(
+                current,
+                headers=chrome146_remote_image_headers(current),
+                timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+                allow_redirects=False,
+                stream=True,
+                impersonate=CHROME146_IMPERSONATE,
+                curl_options=public_image_curl_options(parsed, addresses),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+        try:
+            status = int(getattr(response, "status_code", 0) or 0)
+            if 300 <= status < 400:
+                if redirect_count >= REMOTE_IMAGE_REDIRECTS:
+                    raise HTTPException(status_code=400, detail={"error": "image_url has too many redirects"})
+                location = str(response.headers.get("location") or "").strip()
+                if not location:
+                    raise HTTPException(status_code=400, detail={"error": "image_url redirect is missing a location"})
+                current = urljoin(current, location)
+                continue
+            if not 200 <= status < 300:
+                raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {status}"})
+            content_length = str(response.headers.get("content-length") or "").strip()
+            if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+            image_data = _read_limited_image(response)
+            if not image_data:
+                raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+            mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
+            guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
+            if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
+                raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+            if not mime.startswith("image/") and guessed_mime.startswith("image/"):
+                mime = guessed_mime
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            return image_data, mime
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+    raise HTTPException(status_code=400, detail={"error": "image_url has too many redirects"})
 
 
 def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:

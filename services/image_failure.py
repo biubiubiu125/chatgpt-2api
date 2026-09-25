@@ -143,6 +143,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
     "no_available_account": FailurePolicy(
         "transient", None, False, 503, "server_error",
     ),
+    "image_generation_busy": FailurePolicy(
+        "transient", "image_generation", True, 503, "server_error",
+    ),
     "insufficient_quota": FailurePolicy(
         "account", "image_generation", False, 429, "insufficient_quota",
     ),
@@ -238,6 +241,7 @@ def image_failure(
 IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
 IMAGE_TOOL_ERROR_PUBLIC_MESSAGE = "The image generation tool encountered an error. Please try again."
 IMAGE_QUOTA_PUBLIC_MESSAGE = "No image generation quota is currently available."
+IMAGE_BUSY_PUBLIC_MESSAGE = "Image generation is busy. Please try again later."
 
 _PUBLIC_RAW_DETAIL_CODES = frozenset({
     "content_policy_violation",
@@ -330,6 +334,8 @@ def public_image_error_message(
     failure: ImageFailure,
     error: BaseException | None = None,
 ) -> str:
+    if failure.code == "image_generation_busy":
+        return IMAGE_BUSY_PUBLIC_MESSAGE
     if failure.code == "image_poll_timeout":
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
     if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:

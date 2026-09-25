@@ -288,7 +288,15 @@ def create_router() -> APIRouter:
             ) from exc
 
     @router.get("/files/{file_path:path}")
-    async def download_editable_file(file_path: str):
+    async def download_editable_file(
+        file_path: str,
+        exp: str | None = None,
+        sig: str | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        from services.media_access import require_media_access
+
+        require_media_access(file_path, exp=exp, sig=sig, authorization=authorization)
         try:
             path = await run_in_threadpool(
                 editable_file_task_service.public_file_path,

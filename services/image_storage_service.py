@@ -89,6 +89,39 @@ def _mtime_datetime(path: Path) -> str:
     return beijing_datetime_from_timestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def image_media_mount_url(
+    resource_path: str,
+    mount: str,
+    *,
+    base_url: str = "",
+    public_base_url: str | None = None,
+) -> str:
+    """Build an app media URL. ``public_base_url`` only changes the public host.
+
+    The path always stays on ``/images/`` or ``/image-thumbnails/`` so the
+    signature check on this service still runs. A prefix that already ends in
+    ``/images`` is not doubled.
+    """
+
+    resource_path = str(resource_path or "").strip().lstrip("/")
+    mount_name = str(mount or "").strip().strip("/")
+    if public_base_url is None:
+        public_base_url = str(config.get_image_storage_settings().get("public_base_url") or "")
+    prefix = str(public_base_url or "").strip().rstrip("/")
+    if prefix:
+        parsed = urlparse(prefix)
+        path = (parsed.path or "").rstrip("/")
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else prefix
+        if path == "/images" or path.endswith("/images"):
+            parent = path[: -len("/images")]
+            root = f"{origin}{parent}/{mount_name}"
+        else:
+            root = f"{prefix}/{mount_name}"
+    else:
+        root = f"{str(base_url or config.base_url).strip().rstrip('/')}/{mount_name}"
+    return f"{root}/{resource_path}" if resource_path else root
+
+
 def normalize_image_relative_path(path: str) -> str:
     raw = str(path or "").strip()
     value = raw.replace("\\", "/")
@@ -396,14 +429,17 @@ class ImageStorageService:
         }
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
+        from services.media_access import with_media_access
+
+        resource_path = normalize_image_relative_path(rel)
         settings = self.settings()
-        public_base_url = _clean(settings.get("public_base_url"))
-        if public_base_url:
-            return f"{public_base_url.rstrip('/')}/{normalize_image_relative_path(rel)}"
-        return (
-            f"{(base_url or config.base_url).rstrip('/')}/images/"
-            f"{normalize_image_relative_path(rel)}"
+        url = image_media_mount_url(
+            resource_path,
+            "images",
+            base_url=base_url or config.base_url,
+            public_base_url=_clean(settings.get("public_base_url")),
         )
+        return with_media_access(url, resource_path)
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()

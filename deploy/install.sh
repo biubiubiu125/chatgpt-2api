@@ -6,7 +6,21 @@ REPO_NAME="${REPO_NAME:-chatgpt-2api}"
 BRANCH="main"
 INSTALL_DIR="${INSTALL_DIR:-/opt/chatgpt-2api}"
 PORT="${CHATGPT2API_PORT:-${PORT:-2080}}"
+THREAD_TOKENS_EXPLICIT=0
+if [[ -n "${CHATGPT2API_THREAD_TOKENS+x}" || -n "${THREAD_TOKENS+x}" ]]; then
+  THREAD_TOKENS_EXPLICIT=1
+fi
 THREAD_TOKENS="${CHATGPT2API_THREAD_TOKENS:-${THREAD_TOKENS:-120}}"
+IMAGE_WORKERS_EXPLICIT=0
+if [[ -n "${CHATGPT2API_IMAGE_TASK_WORKERS+x}" || -n "${IMAGE_WORKERS+x}" ]]; then
+  IMAGE_WORKERS_EXPLICIT=1
+fi
+IMAGE_WORKERS="${CHATGPT2API_IMAGE_TASK_WORKERS:-${IMAGE_WORKERS:-16}}"
+IMAGE_QUEUE_SIZE_EXPLICIT=0
+if [[ -n "${CHATGPT2API_IMAGE_TASK_QUEUE_SIZE+x}" || -n "${IMAGE_QUEUE_SIZE+x}" ]]; then
+  IMAGE_QUEUE_SIZE_EXPLICIT=1
+fi
+IMAGE_QUEUE_SIZE="${CHATGPT2API_IMAGE_TASK_QUEUE_SIZE:-${IMAGE_QUEUE_SIZE:-256}}"
 BASE_URL_EXPLICIT=0
 if [[ -n "${CHATGPT2API_BASE_URL+x}" || -n "${BASE_URL+x}" ]]; then
   BASE_URL_EXPLICIT=1
@@ -48,6 +62,8 @@ EOF
   PORT=2080
   CHATGPT2API_BASE_URL=https://your-domain.com
   CHATGPT2API_THREAD_TOKENS=120
+  CHATGPT2API_IMAGE_TASK_WORKERS=16
+  CHATGPT2API_IMAGE_TASK_QUEUE_SIZE=256
   MODE=docker
   AUTH_KEY=your-auth-key
   POSTGRES_PASSWORD=generated-automatically
@@ -61,6 +77,8 @@ EOF
   --port 2080
   --base-url https://your-domain.com
   --thread-tokens 120
+  --image-workers 16
+  --image-queue-size 256
   --install-dir /opt/chatgpt-2api
   --auth-key your-auth-key
   --postgres-password your-postgres-password
@@ -108,7 +126,7 @@ print_step() {
   local title="$2"
   local hint="$3"
   ui_println ""
-  ui_println "----- $(text step_prefix) ${index}/5：${title} -----"
+  ui_println "----- $(text step_prefix) ${index}/6：${title} -----"
   ui_println "${hint}"
 }
 
@@ -172,6 +190,17 @@ text() {
       err_port) printf 'PORT must be a number from 1 to 65535.' ;;
       err_base_url) printf 'Image access URL must be empty, an http(s) URL, or a domain/IP. A domain or IP is saved as https. Query strings and fragments are not allowed.' ;;
       err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive integer.' ;;
+      err_image_workers) printf 'CHATGPT2API_IMAGE_TASK_WORKERS must be a positive integer.' ;;
+      err_image_queue_size) printf 'CHATGPT2API_IMAGE_TASK_QUEUE_SIZE must be a positive integer.' ;;
+      err_concurrency) printf 'Thread capacity, image workers, and image queue size must all be positive integers.' ;;
+      step_concurrency) printf 'Concurrency' ;;
+      hint_concurrency) printf 'Thread capacity is the synchronous API entry limit, not the number of images drawn at once. Image workers cap simultaneous upstream images, one slot per image. The image queue holds images that have not started upstream; a request for n images reserves n slots, and both sync and task APIs reject immediately when it is full.' ;;
+      prompt_thread_tokens) printf 'Thread capacity' ;;
+      prompt_image_workers) printf 'Image workers' ;;
+      prompt_image_queue) printf 'Image queue size' ;;
+      summary_thread_tokens) printf 'Thread capacity' ;;
+      summary_image_workers) printf 'Image workers' ;;
+      summary_image_queue) printf 'Image queue' ;;
       err_install_dir) printf 'Install directory must be an absolute path, for example /opt/chatgpt-2api.' ;;
       err_branch) printf 'The install branch is fixed to main.' ;;
       err_database_url) printf 'The installer creates local PostgreSQL 18 and does not accept a database URL.' ;;
@@ -249,6 +278,17 @@ text() {
     err_port) printf '端口必须是 1 到 65535 的数字。' ;;
     err_base_url) printf '图片访问地址可以留空，也可以填写 http/https 地址、域名或 IP。只填域名或 IP 会保存为 https。不能带查询参数或片段。' ;;
     err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS 必须是正整数。' ;;
+    err_image_workers) printf 'CHATGPT2API_IMAGE_TASK_WORKERS 必须是正整数。' ;;
+    err_image_queue_size) printf 'CHATGPT2API_IMAGE_TASK_QUEUE_SIZE 必须是正整数。' ;;
+    err_concurrency) printf '线程容量、出图线程和出图队列都必须是正整数。' ;;
+    step_concurrency) printf '并发容量' ;;
+    hint_concurrency) printf '线程容量是接口入口能同时占用的同步线程，不是同时出图的数量。出图线程是同时打上游的图片数，一张图占一个名额。出图队列是还没打上游的图片还能排多少张；一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝。' ;;
+    prompt_thread_tokens) printf '线程容量' ;;
+    prompt_image_workers) printf '出图线程' ;;
+    prompt_image_queue) printf '出图队列' ;;
+    summary_thread_tokens) printf '线程容量' ;;
+    summary_image_workers) printf '出图线程' ;;
+    summary_image_queue) printf '出图队列' ;;
     err_install_dir) printf '安装目录必须是绝对路径，例如 /opt/chatgpt-2api。' ;;
     err_branch) printf '安装分支固定为 main。' ;;
     err_database_url) printf '安装不需要填写 PostgreSQL 地址，会在本机创建数据库。' ;;
@@ -447,6 +487,17 @@ parse_args() {
         ;;
       --thread-tokens)
         THREAD_TOKENS="${2:-}"
+        THREAD_TOKENS_EXPLICIT=1
+        shift 2
+        ;;
+      --image-workers)
+        IMAGE_WORKERS="${2:-}"
+        IMAGE_WORKERS_EXPLICIT=1
+        shift 2
+        ;;
+      --image-queue-size)
+        IMAGE_QUEUE_SIZE="${2:-}"
+        IMAGE_QUEUE_SIZE_EXPLICIT=1
         shift 2
         ;;
       --install-dir)
@@ -547,6 +598,33 @@ is_valid_install_dir() {
   [[ -n "${value}" && "${value}" == /* && "${value}" != *"//"* && "${value}" != *[[:space:]]* ]]
 }
 
+is_positive_int() {
+  local value="${1-}"
+  [[ "${value}" =~ ^[0-9]+$ && "${value}" -ge 1 ]]
+}
+
+load_saved_concurrency() {
+  local saved=""
+  if [[ "${THREAD_TOKENS_EXPLICIT}" != "1" ]]; then
+    saved="$(read_existing_env_value CHATGPT2API_THREAD_TOKENS)"
+    if is_positive_int "${saved}"; then
+      THREAD_TOKENS="${saved}"
+    fi
+  fi
+  if [[ "${IMAGE_WORKERS_EXPLICIT}" != "1" ]]; then
+    saved="$(read_existing_env_value CHATGPT2API_IMAGE_TASK_WORKERS)"
+    if is_positive_int "${saved}"; then
+      IMAGE_WORKERS="${saved}"
+    fi
+  fi
+  if [[ "${IMAGE_QUEUE_SIZE_EXPLICIT}" != "1" ]]; then
+    saved="$(read_existing_env_value CHATGPT2API_IMAGE_TASK_QUEUE_SIZE)"
+    if is_positive_int "${saved}"; then
+      IMAGE_QUEUE_SIZE="${saved}"
+    fi
+  fi
+}
+
 validate_inputs() {
   local normalized=""
 
@@ -571,8 +649,16 @@ validate_inputs() {
     exit 1
   fi
   BASE_URL="${normalized}"
-  if [[ -z "${THREAD_TOKENS}" || ! "${THREAD_TOKENS}" =~ ^[0-9]+$ || "${THREAD_TOKENS}" -lt 1 ]]; then
+  if ! is_positive_int "${THREAD_TOKENS}"; then
     echo "[$(text prefix_error)] $(text err_thread_tokens)" >&2
+    exit 1
+  fi
+  if ! is_positive_int "${IMAGE_WORKERS}"; then
+    echo "[$(text prefix_error)] $(text err_image_workers)" >&2
+    exit 1
+  fi
+  if ! is_positive_int "${IMAGE_QUEUE_SIZE}"; then
+    echo "[$(text prefix_error)] $(text err_image_queue_size)" >&2
     exit 1
   fi
   if [[ -z "${AUTH_KEY//[[:space:]]/}" ]]; then
@@ -591,6 +677,9 @@ print_summary() {
   ui_println "  $(text summary_language): $(language_label)"
   ui_println "  $(text summary_mode): $(text label_mode_docker)"
   ui_println "  $(text summary_port): ${PORT}"
+  ui_println "  $(text summary_thread_tokens): ${THREAD_TOKENS}"
+  ui_println "  $(text summary_image_workers): ${IMAGE_WORKERS}"
+  ui_println "  $(text summary_image_queue): ${IMAGE_QUEUE_SIZE}"
   ui_println "  $(text summary_base_url): $(base_url_label)"
   ui_println "  $(text summary_dir): ${INSTALL_DIR}"
   ui_println "  $(text summary_database): $(text label_database)"
@@ -683,6 +772,8 @@ write_env_file() {
 CHATGPT2API_AUTH_KEY=$(dotenv_quote "${AUTH_KEY}")
 CHATGPT2API_PORT=$(dotenv_quote "${PORT}")
 CHATGPT2API_THREAD_TOKENS=$(dotenv_quote "${THREAD_TOKENS}")
+CHATGPT2API_IMAGE_TASK_WORKERS=$(dotenv_quote "${IMAGE_WORKERS}")
+CHATGPT2API_IMAGE_TASK_QUEUE_SIZE=$(dotenv_quote "${IMAGE_QUEUE_SIZE}")
 CHATGPT2API_IMAGE=$(dotenv_quote "$(default_image)")
 CHATGPT2API_BASE_URL=$(dotenv_quote "${BASE_URL}")
 
@@ -705,6 +796,8 @@ export_compose_env() {
   export CHATGPT2API_AUTH_KEY="${AUTH_KEY}"
   export CHATGPT2API_PORT="${PORT}"
   export CHATGPT2API_THREAD_TOKENS="${THREAD_TOKENS}"
+  export CHATGPT2API_IMAGE_TASK_WORKERS="${IMAGE_WORKERS}"
+  export CHATGPT2API_IMAGE_TASK_QUEUE_SIZE="${IMAGE_QUEUE_SIZE}"
   export CHATGPT2API_IMAGE="$(default_image)"
   export CHATGPT2API_BASE_URL="${BASE_URL}"
   export POSTGRES_DB="${POSTGRES_DB}"
@@ -808,7 +901,21 @@ main() {
     ui_println "[$(text prefix_error)] $(text err_base_url)"
   done
 
-  print_step "5" "$(text step_auth)" "$(text hint_auth)"
+  load_saved_concurrency
+
+  print_step "5" "$(text step_concurrency)" "$(text hint_concurrency)"
+  while true; do
+    THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}" "0")"
+    IMAGE_WORKERS="$(prompt_input "$(text prompt_image_workers)" "${IMAGE_WORKERS}" "0")"
+    IMAGE_QUEUE_SIZE="$(prompt_input "$(text prompt_image_queue)" "${IMAGE_QUEUE_SIZE}" "0")"
+    if is_positive_int "${THREAD_TOKENS}" && is_positive_int "${IMAGE_WORKERS}" && is_positive_int "${IMAGE_QUEUE_SIZE}"; then
+      echo_selected "${THREAD_TOKENS} / ${IMAGE_WORKERS} / ${IMAGE_QUEUE_SIZE}"
+      break
+    fi
+    ui_println "[$(text prefix_error)] $(text err_concurrency)"
+  done
+
+  print_step "6" "$(text step_auth)" "$(text hint_auth)"
   if [[ -z "${AUTH_KEY}" || "${AUTH_KEY}" == "your_secret_key_here" ]]; then
     AUTH_KEY="$(prompt_secret_confirmed)"
   else

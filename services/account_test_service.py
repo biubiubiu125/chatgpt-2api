@@ -186,7 +186,7 @@ class AccountTestService:
         backend: OpenAIBackendAPI | None = None
         with account_processing_slot():
             try:
-                backend = OpenAIBackendAPI(access_token=active_token)
+                backend = OpenAIBackendAPI(access_token=active_token, use_global_proxy=True)
                 request = ConversationRequest(
                     model=model,
                     prompt=prompt,

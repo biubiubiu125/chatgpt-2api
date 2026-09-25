@@ -1,6 +1,6 @@
 [project]
 name = "chatgpt-2api"
-version = "0.04"
+version = "0.05"
 description = "ChatGPT web relay with Chrome 146 identity, image account scheduling, and account registration."
 readme = "README.md"
 license = "AGPL-3.0-only"

@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt-2api/main/depl
 
 安装脚本固定使用 `main` 分支、Docker 和本机 PostgreSQL 18，安装时不需要填写数据库地址。默认安装目录是 `/opt/chatgpt-2api`。数据库名是 `chatgpt_2api_app`，不使用 SQLite。应用容器是 `chatgpt-2api-app`，数据库容器是 `chatgpt-2api-postgres`，只接入隔离网络 `chatgpt-2api-net`，时区固定为 `Asia/Shanghai`。管理员登录密钥需要隐藏输入两次。安装向导会询问 Web/API 端口，默认是 `2080`，也会询问图片访问地址。图片访问地址可以直接回车留空；只填域名或 IP 会自动补成 `https://` 地址，再写入 `CHATGPT2API_BASE_URL`，用于生成对外图片查看链接。
 
-脚本会生成并保存数据库密码，下载 `docker-compose.postgres.yml`，再与主 Compose 一起启动。重复运行会复用已有密码。`CHATGPT2API_THREAD_TOKENS` 默认是 `120`，表示后端同步工作线程的并发容量，只要求正整数且不设置人为最高值；账号、代理和上游服务仍分别执行自己的并发限制。
+脚本会生成并保存数据库密码，下载 `docker-compose.postgres.yml`，再与主 Compose 一起启动。重复运行会复用已有密码。安装时会询问三个正整数，重复安装会先沿用已有 `.env`，也可以用参数直接指定：`--thread-tokens` 默认 `120`，是接口入口同步线程容量，不是同时出图数；`--image-workers` 默认 `16`，是同时打上游的图片数，一张图占一个名额，面板任务、OpenAI 出图、聊天生图和超时后续查共用；`--image-queue-size` 默认 `256`，是还没打上游的图片还能排多少张，一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝。这三个值会写入 `.env` 并传进容器。账号、代理和上游服务仍分别执行自己的并发限制。
 
 ## 本地开发
 
@@ -83,9 +83,9 @@ npm run dev
 
 ## 存储边界
 
-`DATABASE_URL` 选择 Application Database；未设置时使用
-`data/chatgpt2api.db`。支持 SQLite 与 PostgreSQL 18，不再通过
-`STORAGE_BACKEND` 选择 JSON、Git 或账号专用数据库。
+`DATABASE_URL` 选择 Application Database。本地进程未设置时使用
+`data/chatgpt2api.db`。容器启动必须提供 PostgreSQL URL，空值不会再回退 SQLite。
+支持 SQLite 与 PostgreSQL 18，不再通过 `STORAGE_BACKEND` 选择 JSON、Git 或账号专用数据库。
 
 选择数据库不是旧数据迁移操作，不会自动导入 JSON、JSONL、Git 或旧账号
 SQLite 文件。图片文件及其相关索引仍按图片存储边界管理。完整边界见

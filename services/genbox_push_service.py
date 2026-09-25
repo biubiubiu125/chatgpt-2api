@@ -114,6 +114,7 @@ def _rel_from_stored_url(url: str, *, base_url: str | None = None) -> str | None
                 break
         if not rel:
             return None
+    rel = rel.split("?", 1)[0].split("#", 1)[0]
     try:
         return normalize_image_relative_path(rel)
     except HTTPException:

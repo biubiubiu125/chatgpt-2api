@@ -294,11 +294,27 @@ def create_router(app_version: str) -> APIRouter:
         return gallery_cleanup_result(result)
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
-    async def get_image(image_path: str):
+    async def get_image(
+        image_path: str,
+        exp: str | None = None,
+        sig: str | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        from services.media_access import require_media_access
+
+        require_media_access(image_path, exp=exp, sig=sig, authorization=authorization)
         return get_image_response(image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
-    async def get_image_thumbnail(image_path: str):
+    async def get_image_thumbnail(
+        image_path: str,
+        exp: str | None = None,
+        sig: str | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        from services.media_access import require_media_access
+
+        require_media_access(image_path, exp=exp, sig=sig, authorization=authorization)
         return get_thumbnail_response(image_path)
 
     @router.post("/api/images/delete")

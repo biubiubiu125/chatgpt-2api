@@ -1017,6 +1017,15 @@ class AccountService:
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
+        register_proxy = str(normalized.get("register_proxy") or "").strip()
+        if register_proxy:
+            normalized["register_proxy"] = register_proxy
+            if normalized["proxy"] == register_proxy:
+                normalized["proxy"] = ""
+            normalized["register_runtime_proxy_separated"] = True
+        else:
+            normalized.pop("register_proxy", None)
+            normalized.pop("register_runtime_proxy_separated", None)
         source_type = normalized.get("source_type")
         if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
             source_type = "codex"
@@ -1319,7 +1328,9 @@ class AccountService:
         from services.openai_oauth import refresh_token_headers
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate=CHROME146_IMPERSONATE, verify=True))
+        # Refresh uses the global proxy. A stored account proxy is registration-only.
+        _ = account
+        session = requests.Session(**proxy_settings.build_session_kwargs(impersonate=CHROME146_IMPERSONATE, verify=True))
         try:
             with account_processing_slot():
                 response = session.post(
@@ -2098,6 +2109,39 @@ class AccountService:
             self._image_inflight[access_token] = current_inflight - 1
             self._pop_image_slot_start_locked(access_token)
 
+    def _refresh_image_access_token(self, access_token: str) -> str:
+        """Refresh an image AT only when it is missing or near expiry."""
+        account = self.get_account(access_token) or {}
+        active = str(account.get("access_token") or access_token).strip()
+        if not self._token_needs_refresh(active):
+            if not active:
+                raise RuntimeError("image account has no access token")
+            return active
+        if not str(account.get("refresh_token") or "").strip():
+            raise RuntimeError("image account has no refresh token")
+        refreshed = self.ensure_access_token(
+            access_token,
+            event="image_preflight_refresh",
+            raise_on_error=True,
+            image_scope=True,
+        )
+        refreshed = str(refreshed or "").strip()
+        if not refreshed:
+            raise RuntimeError("image access token refresh returned an empty token")
+        return refreshed
+
+    @staticmethod
+    def _log_image_preflight_refresh_failure(exc: BaseException) -> None:
+        try:
+            from utils.log import logger
+
+            logger.warning({
+                "event": "image_preflight_refresh_failed",
+                "error_type": type(exc).__name__,
+            })
+        except Exception:
+            return
+
     def get_available_access_token(
             self,
             plan_type: str | None = None,
@@ -2146,6 +2190,16 @@ class AccountService:
                     "deadline_exceeded",
                     "image request deadline exceeded before remote account validation",
                 )
+            try:
+                refreshed = self._refresh_image_access_token(access_token)
+            except Exception as exc:
+                saw_unavailable_failure = True
+                self.release_image_slot(access_token)
+                self._log_image_preflight_refresh_failure(exc)
+                continue
+            if refreshed != access_token:
+                attempted_tokens.add(refreshed)
+            access_token = refreshed
             try:
                 account = self.fetch_remote_info(
                     access_token,
@@ -3821,7 +3875,7 @@ class AccountService:
 
         def request_user_info(token: str) -> dict[str, Any]:
             with account_processing_slot():
-                with OpenAIBackendAPI(token) as backend:
+                with OpenAIBackendAPI(token, use_global_proxy=True) as backend:
                     return backend.get_user_info()
 
         def reschedule_pending(token: str) -> None:
@@ -4270,7 +4324,7 @@ class AccountService:
 
         def request_user_info(token: str) -> dict[str, Any]:
             with account_processing_slot():
-                with OpenAIBackendAPI(token) as backend:
+                with OpenAIBackendAPI(token, use_global_proxy=True) as backend:
                     return backend.get_user_info()
 
         request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)

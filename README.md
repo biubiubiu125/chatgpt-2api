@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.04-111827" alt="Version v0.04" />
+  <img src="https://img.shields.io/badge/version-v0.05-111827" alt="Version v0.05" />
   <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue 3" />
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18" />
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.04">v0.04 Release</a>
+  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.05">v0.05 Release</a>
   · <a href="./CHANGELOG.md">更新说明</a>
   · <a href="./docs/README.md">维护文档</a>
 </p>
@@ -171,9 +171,11 @@ curl http://localhost:2080/v1/images/generations \
 | 配置                             | 默认值       | 用途                                                                                     |
 | :------------------------------- | :----------- | :--------------------------------------------------------------------------------------- |
 | `CHATGPT2API_AUTH_KEY`           | 必填         | 管理员和默认 API Key，环境变量优先于 `config.json`                                       |
-| `DATABASE_URL`                   | SQLite       | Application Database 连接；未设置时使用 `data/chatgpt2api.db`                            |
+| `DATABASE_URL`                   | 本地 SQLite  | Application Database 连接；本地未设置时使用 `data/chatgpt2api.db`。容器必须提供 PostgreSQL URL |
 | `CHATGPT2API_BASE_URL`           | 当前服务地址 | 生成对外可访问的图片和文件 URL                                                           |
-| `CHATGPT2API_THREAD_TOKENS`      | `120`        | 后端同步工作线程并发容量，只要求正整数且不设固定最高值；账号、代理和上游仍有各自并发限制 |
+| `CHATGPT2API_THREAD_TOKENS`      | `120`        | 接口入口同步线程容量，只要求正整数且不设固定最高值；它不是同时出图数 |
+| `CHATGPT2API_IMAGE_TASK_WORKERS` | `16`         | 同时打上游的图片数，一张图占一个名额，面板任务、OpenAI 出图、聊天生图和超时后续查共用；只要求正整数 |
+| `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE` | `256`     | 还没打上游的图片还能排多少张。一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝；只要求正整数 |
 | `account_processing_concurrency` | `30`         | 账号导入、刷新、同步和批量处理容量                                                       |
 | `image_account_concurrency`      | `1`          | 单账号图片并发上限，可设置为 1–3                                                         |
 | `image_stream_timeout_secs`      | `80`         | 图片上游 SSE / HTTP 流最长等待时间                                                       |

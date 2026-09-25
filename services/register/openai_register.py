@@ -1789,8 +1789,6 @@ class PlatformRegistrar:
             session_id=self.session_id,
         )
         result["register_proxy"] = str(self.proxy or "").strip()
-        if result["register_proxy"]:
-            result["proxy"] = result["register_proxy"]
         cookies = _session_cookie_payload(self.session)
         if cookies:
             result["cookies"] = cookies

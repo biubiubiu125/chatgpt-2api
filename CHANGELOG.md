@@ -1,3 +1,11 @@
+## 0.05 - 2026-09-25
+
+- [新增] 安装向导增加并发容量步骤。线程容量、出图线程和出图队列默认分别是 `120`、`16`、`256`，写入 `CHATGPT2API_THREAD_TOKENS`、`CHATGPT2API_IMAGE_TASK_WORKERS` 和 `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE`。出图线程和队列由面板任务、OpenAI 出图、聊天生图和超时后续查共用；一次要 n 张占 n 个名额，排满后立刻拒绝。
+- [修复] 容器启动必须提供 PostgreSQL `DATABASE_URL`，空值不再回退 SQLite。本地未设置时仍使用 `data/chatgpt2api.db`。
+- [修复] 对外图片和文件地址带签名。设置 `public_base_url` 后仍走 `/images/` 或 `/image-thumbnails/`，图库不再复用已存的外部地址。
+- [修复] 聊天和 Responses 的用户图片链接只接受公网地址，拒绝内网、凭据和跳进内网；上游结果下载只允许 ChatGPT 资产域名，并且不跟随跳转。
+- [修复] 一次生成多张图片时，只要有图片成功就返回这些图片，不再因另一张失败丢掉已成功结果。
+
 ## 0.04 - 2026-09-23
 
 - [优化] 安装脚本改成分步向导，默认目录仍是 `/opt/chatgpt-2api`。图片访问地址留空时按当前请求地址生成链接；只填域名或 IP 会写成 `https://` 地址后写入 `CHATGPT2API_BASE_URL`。

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+from contextvars import ContextVar
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -17,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator
 import tiktoken
 from curl_cffi.requests import exceptions as curl_exceptions
 
+from services import image_generation_gate as image_gate
 from services.account_service import ImageAccountSelectionError, account_service
 from services.config import config
 from services.image_failure import (
@@ -538,6 +540,7 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    session_checkpoint: Any = None  # Callable[[str, str], None] | None
     call_id: str = ""
     trace_image_perf: bool = False
     monitor_attempt: int = 0
@@ -1357,7 +1360,7 @@ def _recover_after_image_stream_timeout(
         stream_started_at: float,
         *,
         failure_code: str = "image_stream_timeout",
-) -> ImageOutput:
+) -> ImageOutput | None:
     is_timeout = failure_code == "image_stream_timeout"
     recovery_reason = "stream_timeout" if is_timeout else "stream_interrupted"
     recovery_path = f"{recovery_reason}_followup"
@@ -1547,6 +1550,12 @@ def _recover_after_image_stream_timeout(
         "conversation_probe_error": conversation_probe_error,
         "task_probe_error": task_probe_error,
     })
+    if str(conversation_id or "").strip():
+        # The upstream conversation already exists. Continue into the normal
+        # result poll instead of abandoning it as a non-resumable stream error.
+        last["conversation_id"] = conversation_id
+        last["_continue_image_poll"] = True
+        return None
     timeout_upstream_text = latest_assistant_text
     if (
         not timeout_upstream_text
@@ -1615,15 +1624,20 @@ def _image_result_output_from_urls(
         {"b64_json": base64.b64encode(image_data).decode("ascii")}
         for image_data in downloaded_images
     ]
-    formatted = format_image_result(
-        image_items,
-        request.prompt,
-        request.response_format,
-        request.base_url,
-        int(time.time()),
-        requested_size=request.size,
-        deadline_monotonic=request.deadline_monotonic or None,
-    )
+    try:
+        formatted = format_image_result(
+            image_items,
+            request.prompt,
+            request.response_format,
+            request.base_url,
+            int(time.time()),
+            requested_size=request.size,
+            deadline_monotonic=request.deadline_monotonic or None,
+        )
+    except ImageDownloadError as exc:
+        if not str(getattr(exc, "conversation_id", "") or "").strip():
+            exc.conversation_id = conversation_id
+        raise
     data = formatted["data"]
     if not data:
         return None
@@ -1683,7 +1697,7 @@ def stream_image_outputs(
                     upstream_event_type=raw_type,
                 )
     except (TimeoutError, curl_exceptions.Timeout) as exc:
-        yield _recover_after_image_stream_timeout(
+        recovered = _recover_after_image_stream_timeout(
             backend,
             request,
             last,
@@ -1692,7 +1706,9 @@ def stream_image_outputs(
             total,
             conversation_wall_started,
         )
-        return
+        if recovered is not None:
+            yield recovered
+            return
     except curl_exceptions.RequestException as exc:
         if not any((
             last.get("conversation_id"),
@@ -1700,7 +1716,7 @@ def stream_image_outputs(
             last.get("sediment_ids"),
         )):
             raise
-        yield _recover_after_image_stream_timeout(
+        recovered = _recover_after_image_stream_timeout(
             backend,
             request,
             last,
@@ -1710,7 +1726,9 @@ def stream_image_outputs(
             conversation_wall_started,
             failure_code="image_stream_interrupted",
         )
-        return
+        if recovered is not None:
+            yield recovered
+            return
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
@@ -1737,6 +1755,7 @@ def stream_image_outputs(
             or async_task_type == "image_gen"
             or message_type in {"image_gen", "image_generation"}
             or has_image_arguments
+            or last.get("_continue_image_poll")
         )
         and stream_failure is None
     )
@@ -2028,6 +2047,32 @@ def stream_codex_image_outputs(
     )
 
 
+_IMAGE_WORKER_CONTROL: ContextVar[
+tuple[Callable[[], None] | None, Callable[[], None] | None]
+] = ContextVar("chatgpt2api_image_worker_control", default=(None, None))
+
+
+def _note_image_session(
+    request: ConversationRequest,
+    conversation_id: str,
+    access_token: str,
+    seen: set[str],
+) -> None:
+    """Persist a conversation id once, as soon as the upstream stream has it."""
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id or conversation_id in seen:
+        return
+    seen.add(conversation_id)
+    callback = request.session_checkpoint
+    if not callable(callback):
+        return
+    fingerprint = ""
+    token = str(access_token or "").strip()
+    if token:
+        fingerprint = account_service._access_token_fingerprint(token)
+    callback(conversation_id, fingerprint)
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -2054,6 +2099,7 @@ def _generate_single_image(
         else 1
     )
     single_started = time.perf_counter()
+    pause_worker, hold_worker = _IMAGE_WORKER_CONTROL.get()
 
     def attach_attempts(value: Any) -> Any:
         value.image_attempts = [dict(item) for item in image_attempts]
@@ -2069,8 +2115,18 @@ def _generate_single_image(
         error: ImageGenerationError | None = None,
     ) -> bool:
         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
+        conversation_id = str(getattr(error, "conversation_id", "") or "").strip()
         if (
             failure.code == "task_interrupted"
+            or (
+                conversation_id
+                and failure.code in {
+                    "image_poll_timeout",
+                    "image_stream_timeout",
+                    "image_stream_interrupted",
+                    "image_download_failed",
+                }
+            )
             or (
                 request.deadline_monotonic > 0
                 and time.monotonic() >= request.deadline_monotonic
@@ -2091,6 +2147,8 @@ def _generate_single_image(
         return True
 
     while True:
+        if pause_worker is not None:
+            pause_worker()
         request.monitor_attempt = len(image_attempts) + 1
         account_wait_started = time.perf_counter()
         stream_started = 0.0
@@ -2163,6 +2221,7 @@ def _generate_single_image(
         image_slot_finalized = False
         attempt_started = account_attempt_started or account_wait_started
         attempt_conversation_id = ""
+        checkpointed_conversations: set[str] = set()
         attempt_access_token = token
         attempt_refresh_token = ""
         attempt_last_token_refresh_at = None
@@ -2337,6 +2396,12 @@ def _generate_single_image(
             "account_wait_ms": account_wait_ms,
             "index": index,
         })
+        if hold_worker is not None:
+            try:
+                hold_worker()
+            except ImageGenerationError:
+                account_service.release_image_slot(token)
+                raise
         backend: OpenAIBackendAPI | None = None
         egress_acquired = False
         try:
@@ -2361,6 +2426,7 @@ def _generate_single_image(
                 proxy_profile=fallback_profile,
                 reserve_image_egress=fallback_profile is None,
                 deadline_monotonic=request.deadline_monotonic or None,
+                use_global_proxy=True,
             )
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
@@ -2433,6 +2499,12 @@ def _generate_single_image(
                     output.account_email = account_email
                 if output.conversation_id:
                     attempt_conversation_id = output.conversation_id
+                    _note_image_session(
+                        request,
+                        attempt_conversation_id,
+                        attempt_access_token,
+                        checkpointed_conversations,
+                    )
                 if output.kind == "message" and request.message_as_error:
                     failure = output.failure or image_failure(
                         "no_image_generated",
@@ -2661,7 +2733,7 @@ def _generate_single_image(
                         setattr(image_error, attr, getattr(exc, attr))
 
             if (
-                failure.code == "image_poll_timeout"
+                failure.code in {"image_poll_timeout", "image_download_failed"}
                 and attempt_access_token
                 and not str(getattr(image_error, "account_token_fingerprint", "") or "").strip()
             ):
@@ -2758,13 +2830,80 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         )
 
     if request.deadline_monotonic <= 0:
-        request.deadline_monotonic = (
-            time.monotonic() + max(0.001, float(config.image_request_timeout_secs))
-        )
+        bound = image_gate.image_generation_gate.current()
+        if bound is not None and bound.deadline_monotonic > 0:
+            request.deadline_monotonic = bound.deadline_monotonic
+        else:
+            request.deadline_monotonic = (
+                time.monotonic() + max(0.001, float(config.image_request_timeout_secs))
+            )
+    return _stream_image_outputs_with_slot(request)
 
+
+def _generate_limited_image(
+    request: ConversationRequest,
+    index: int,
+    total: int,
+    admission,
+) -> list[ImageOutput]:
+    gate = image_gate.image_generation_gate
+    worker_held = False
+
+    def pause_worker() -> None:
+        nonlocal worker_held
+        if not worker_held:
+            return
+        gate.release_worker_keep_reservation(admission)
+        worker_held = False
+
+    def hold_worker() -> None:
+        nonlocal worker_held
+        if worker_held:
+            return
+        try:
+            gate.acquire_running(admission, request.deadline_monotonic)
+        except image_gate.ImageGenerationQueueFullError as exc:
+            raise ImageGenerationError(
+                "Image generation is busy. Please try again later.",
+                failure=image_failure("image_generation_busy"),
+            ) from exc
+        worker_held = True
+
+    control = _IMAGE_WORKER_CONTROL.set((pause_worker, hold_worker))
+    try:
+        hold_worker()
+        return _generate_single_image(replace(request), index, total)
+    finally:
+        _IMAGE_WORKER_CONTROL.reset(control)
+        if worker_held:
+            gate.release_running(admission)
+
+
+def _stream_image_outputs_with_slot(request: ConversationRequest) -> Iterator[ImageOutput]:
+    gate = image_gate.image_generation_gate
+    release_this = None
+    try:
+        bound = gate.current()
+        if bound is not None and bound.state == "open":
+            release_this = bound
+        else:
+            release_this = gate.admit(max(1, int(request.n or 1)))
+        release_this.handed_off = True
+        yield from _stream_image_outputs_unlocked(request, release_this)
+    except image_gate.ImageGenerationQueueFullError as exc:
+        raise ImageGenerationError(
+            "Image generation is busy. Please try again later.",
+            failure=image_failure("image_generation_busy"),
+        ) from exc
+    finally:
+        if release_this is not None:
+            gate.release(release_this)
+
+
+def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> Iterator[ImageOutput]:
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
-        outputs = _generate_single_image(replace(request), 1, 1)
+        outputs = _generate_limited_image(request, 1, 1, admission)
         if not outputs:
             raise ImageGenerationError(
                 "image generation completed without output",
@@ -2785,7 +2924,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
             try:
-                outputs = _generate_single_image(replace(request), index, request.n)
+                outputs = _generate_limited_image(request, index, request.n, admission)
             except Exception as exc:
                 _capture_failed_image_attempts(request, exc)
                 errors[index] = exc
@@ -2855,7 +2994,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     try:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, replace(request), index, request.n)
+            future = executor.submit(_generate_limited_image, request, index, request.n, admission)
             futures[future] = index
 
         # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。
@@ -2984,7 +3123,7 @@ def collect_image_outputs(
             if callable(result_callback) and output.data:
                 result_callback([dict(item) for item in data])
 
-    if failed_output is not None:
+    if failed_output is not None and not data:
         failure = failed_output.failure or image_failure(
             "no_image_generated",
             raw_detail=failed_output.text,

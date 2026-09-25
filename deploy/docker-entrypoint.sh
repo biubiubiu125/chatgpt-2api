@@ -1,6 +1,16 @@
 #!/bin/sh
 set -eu
 
+db_url="${DATABASE_URL:-}"
+case "${db_url}" in
+  postgresql://*|postgres://*)
+    ;;
+  *)
+    echo "chatgpt-2api requires a PostgreSQL DATABASE_URL. An empty value must not fall back to SQLite." >&2
+    exit 1
+    ;;
+esac
+
 seed_root=/opt/chatgpt-2api
 runtime_root=/app
 marker_name=.chatgpt-2api-image-version

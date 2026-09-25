@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.04-111827" alt="Version v0.04" />
+  <img src="https://img.shields.io/badge/version-v0.05-111827" alt="Version v0.05" />
   <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue 3" />
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18" />
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.04">v0.04 Release</a>
+  <a href="https://github.com/biubiubiu125/chatgpt-2api/releases/tag/v0.05">v0.05 Release</a>
   · <a href="./CHANGELOG.md">Changelog</a>
   · <a href="./docs/README.md">Documentation</a>
 </p>
@@ -177,7 +177,9 @@ Available models depend on the upstream accounts and the current `/v1/models` re
 | `CHATGPT2API_AUTH_KEY` | Required | Administrator and default API key; the environment variable takes precedence over `config.json` |
 | `DATABASE_URL` | SQLite | Application Database connection; defaults to `data/chatgpt2api.db` when unset |
 | `CHATGPT2API_BASE_URL` | Current service URL | Public base URL used for generated image and file links |
-| `CHATGPT2API_THREAD_TOKENS` | `120` | Capacity for synchronous backend worker threads; accepts any positive integer, while accounts, proxies, and upstream services retain their own limits |
+| `CHATGPT2API_THREAD_TOKENS` | `120` | Synchronous API entry thread capacity; any positive integer. This is not the number of images generated at once |
+| `CHATGPT2API_IMAGE_TASK_WORKERS` | `16` | Maximum simultaneous upstream images, one slot per image, shared by panel tasks, OpenAI image APIs, chat image generation, and resume polling; any positive integer |
+| `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE` | `256` | How many images can wait before upstream starts. A request for n images reserves n slots. Sync and task APIs reject immediately when it is full; any positive integer |
 | `account_processing_concurrency` | `30` | Capacity for account imports, refreshes, synchronization, and batch processing |
 | `image_account_concurrency` | `1` | Per-account image concurrency, configurable from 1 to 3 |
 | `image_stream_timeout_secs` | `80` | Maximum wait for the upstream image SSE/HTTP stream |

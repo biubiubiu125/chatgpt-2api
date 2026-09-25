@@ -1473,8 +1473,9 @@ class RegisterService:
                 if not finished:
                     continue
                 collect_finished(finished)
-        except Exception:
+        except Exception as exc:
             run_failed = True
+            self._append_log(f"注册任务异常退出: {exc}", "error")
             raise
         finally:
             finish_runtime()

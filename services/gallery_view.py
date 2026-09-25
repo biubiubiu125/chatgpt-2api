@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from services.genbox_push_view import genbox_push_state
+from services.image_storage_service import image_media_mount_url
+from services.media_access import with_media_access
 from utils.timezone import beijing_now, parse_to_beijing_naive
 
 
@@ -65,7 +67,10 @@ def _expiry(item: Mapping[str, object], retention_hours: int) -> tuple[bool, str
 
 
 def _thumbnail_url(base_url: str, path: str) -> str:
-    return f"{base_url.rstrip('/')}/image-thumbnails/{path}"
+    return with_media_access(
+        image_media_mount_url(path, "image-thumbnails", base_url=base_url),
+        path,
+    )
 
 
 def gallery_row(
@@ -85,7 +90,10 @@ def gallery_row(
         "id": path,
         "path": path,
         "filename": filename,
-        "url": _text(item.get("url")) or f"{base_url.rstrip('/')}/images/{path}",
+        "url": with_media_access(
+            image_media_mount_url(path, "images", base_url=base_url),
+            path,
+        ),
         "thumbnail_url": _thumbnail_url(base_url, path),
         "size_bytes": _non_negative_int(item.get("size") or item.get("size_bytes")),
         "created_at": _text(item.get("created_at")),
