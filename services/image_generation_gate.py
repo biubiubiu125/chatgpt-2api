@@ -26,6 +26,7 @@ class _Admission:
         self.state = "open"
         self.handed_off = False
         self.deadline_monotonic = deadline_monotonic
+        self.abandoned = threading.Event()
 
 
 class _AsyncWaiter:
@@ -93,7 +94,12 @@ class ImageGenerationGate:
         return _CURRENT.set(admission)
 
     def unbind(self, token: Token) -> None:
-        _CURRENT.reset(token)
+        try:
+            _CURRENT.reset(token)
+        except ValueError:
+            # Python 3.13 closes the SSE generator from another context when
+            # the client write fails. The admission is released separately.
+            return
 
     def admit(self, slots: int = 1, *, deadline_monotonic: float = 0.0) -> _Admission:
         count = max(1, int(slots))
@@ -111,8 +117,11 @@ class ImageGenerationGate:
         deadline_monotonic: float | None = None,
     ) -> None:
         with self._condition:
+            abandoned = getattr(admission, "abandoned", None)
             while True:
                 self._ensure_open(admission)
+                if abandoned is not None and abandoned.is_set():
+                    raise ImageGenerationQueueFullError()
                 if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                     raise ImageGenerationQueueFullError()
                 if admission.prepaid > 0:
@@ -130,6 +139,8 @@ class ImageGenerationGate:
                 timeout = None
                 if deadline_monotonic is not None:
                     timeout = max(0.0, deadline_monotonic - time.monotonic())
+                if abandoned is not None:
+                    timeout = 0.05 if timeout is None else min(0.05, timeout)
                 self._condition.wait(timeout)
 
     async def acquire_running_async(

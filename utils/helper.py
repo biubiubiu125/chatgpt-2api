@@ -44,6 +44,228 @@ REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 REMOTE_IMAGE_REDIRECTS = 3
 
 
+class _ImageFetchStopped(TimeoutError):
+    """The image admission was abandoned while a remote image download was in flight."""
+
+    def __init__(self, message: str = "image request stopped", *, close_deferred: bool = False) -> None:
+        super().__init__(message)
+        self.close_deferred = close_deferred
+
+
+def _reraise_image_fetch_stopped(exc: BaseException) -> None:
+    """Raise an internal stop when curl aborted the download for the caller.
+
+    The perform thread reports that abort as a curl error. Callers must not turn
+    it into an HTTP 400 image URL failure.
+    """
+    if isinstance(exc, _ImageFetchStopped):
+        raise exc
+    message = str(exc).strip()
+    code = getattr(exc, "code", None)
+    try:
+        code_value = int(code)
+    except (TypeError, ValueError):
+        code_value = -1
+    if message == "image request stopped" or (
+        code_value == 42 and message.endswith("image request stopped")
+    ):
+        raise _ImageFetchStopped("image request stopped") from exc
+
+
+_image_http_stop_local = threading.local()
+_image_http_abort_installed = False
+_image_http_abort_lock = threading.Lock()
+_CURLMSG_DONE = 1
+
+
+def install_image_http_abort() -> None:
+    """Abort image curl transfers on the perform thread when the request stops.
+
+    Closing a curl handle from another thread does not unblock ``perform``.
+    Image requests stamp the handle and poll the stop signal on the same thread
+    that owns the transfer, then remove it from the multi handle.
+    """
+    global _image_http_abort_installed
+    if _image_http_abort_installed:
+        return
+    with _image_http_abort_lock:
+        if _image_http_abort_installed:
+            return
+        from curl_cffi import ffi, lib
+        from curl_cffi.curl import Curl, CurlError
+
+        original_init = Curl.__init__
+        original_perform = Curl.perform
+
+        def init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            check = getattr(_image_http_stop_local, "check", None)
+            if check is not None:
+                self._image_http_stop = check
+
+        def perform(self, *args, **kwargs):
+            check = getattr(self, "_image_http_stop", None)
+            if check is None:
+                return original_perform(self, *args, **kwargs)
+            _perform_until_image_http_stop(self, check, CurlError, ffi, lib)
+
+        Curl.__init__ = init
+        Curl.perform = perform
+        _image_http_abort_installed = True
+
+
+def push_image_http_stop(check: Callable[[], bool]):
+    install_image_http_abort()
+    previous = getattr(_image_http_stop_local, "check", None)
+    _image_http_stop_local.check = check
+    return previous
+
+
+def pop_image_http_stop(previous) -> None:
+    if previous is None:
+        if hasattr(_image_http_stop_local, "check"):
+            del _image_http_stop_local.check
+        return
+    _image_http_stop_local.check = previous
+
+
+def _perform_until_image_http_stop(curl, check: Callable[[], bool], curl_error, ffi, lib) -> None:
+    if curl._curl is None:
+        raise curl_error("Cannot perform request on closed handle.")
+    if check():
+        raise curl_error("image request stopped", 42)
+    curl._ensure_cacert()
+    multi = lib.curl_multi_init()
+    running = ffi.new("int *")
+    try:
+        err = lib.curl_multi_add_handle(multi, curl._curl)
+        if err:
+            raise curl_error(f"Failed to add curl handle, curl: ({err}).", err)
+        while True:
+            if check():
+                raise curl_error("image request stopped", 42)
+            err = lib.curl_multi_perform(multi, running)
+            if err:
+                curl._check_error(err, "perform")
+            if running[0] == 0:
+                break
+            lib.curl_multi_poll(multi, ffi.NULL, 0, 50, ffi.NULL)
+        remaining = ffi.new("int *")
+        while True:
+            message = lib.curl_multi_info_read(multi, remaining)
+            if message == ffi.NULL:
+                break
+            if message.msg == _CURLMSG_DONE and message.data.result != 0:
+                error = curl._get_error(message.data.result, "perform")
+                if error is not None:
+                    raise error
+    finally:
+        try:
+            lib.curl_multi_remove_handle(multi, curl._curl)
+        except Exception:
+            pass
+        try:
+            lib.curl_multi_cleanup(multi)
+        except Exception:
+            pass
+        curl.clean_handles_and_buffers()
+
+
+def run_until_image_stop(func: Callable[[], Any]) -> Any:
+    """Return when image work finishes, or when the admission is abandoned.
+
+    A single in-flight encode cannot be killed. The caller returns so the image
+    slot can be released; that CPU thread is a daemon and is not joined.
+    """
+    stop_event = _image_request_stop_event()
+    if stop_event is None:
+        return func()
+    if stop_event.is_set():
+        raise _ImageFetchStopped("image request stopped")
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="image-cpu", daemon=True).start()
+    while not done.wait(0.05):
+        if stop_event.is_set():
+            raise _ImageFetchStopped("image request stopped")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def _image_request_stop_event() -> threading.Event | None:
+    try:
+        from services.image_generation_gate import image_generation_gate
+    except Exception:
+        return None
+    current = image_generation_gate.current()
+    event = getattr(current, "abandoned", None)
+    return event if isinstance(event, threading.Event) else None
+
+
+def _close_remote_image_response(response: object) -> None:
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        pass
+
+
+def _run_remote_image_get(
+    func: Callable[[], Any],
+    stop_event: threading.Event | None,
+    close_on_stop: object | None = None,
+):
+    if stop_event is None:
+        return func()
+    if stop_event.is_set():
+        raise _ImageFetchStopped("image request stopped")
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        token = push_image_http_stop(stop_event.is_set)
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            pop_image_http_stop(token)
+            done.set()
+
+    threading.Thread(target=run, name="image-fetch", daemon=True).start()
+    while not done.wait(0.05):
+        if not stop_event.is_set():
+            continue
+
+        def cleanup() -> None:
+            done.wait()
+            for target in (outcome.get("value"), close_on_stop):
+                _close_remote_image_response(target)
+
+        threading.Thread(target=cleanup, name="image-fetch-cleanup", daemon=True).start()
+        raise _ImageFetchStopped(
+            "image request stopped",
+            close_deferred=close_on_stop is not None,
+        )
+    if "error" in outcome:
+        error = outcome["error"]
+        _reraise_image_fetch_stopped(error)
+        raise error
+    return outcome.get("value")
+
+
 def _image_extension(mime_type: str) -> str:
     image_type = mime_type.split("/", 1)[1].split(";", 1)[0].lower() if "/" in mime_type else "png"
     return "jpg" if image_type == "jpeg" else image_type or "png"
@@ -231,23 +453,33 @@ def _stream_error_payload(
     return {"error": {"message": str(exc), "type": exc.__class__.__name__}}
 
 
+def close_iterator(items: object) -> None:
+    close = getattr(items, "close", None)
+    if not callable(close):
+        return
+    close()
+
+
 def sse_json_stream(
     items,
     error_builder: Callable[[Exception], dict[str, Any]] | None = None,
 ) -> Iterator[str]:
-    yield ": stream-open\n\n"
     try:
-        for item in items:
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-    except Exception as exc:
-        logger.warning({
-            "event": "sse_stream_error",
-            "error_type": exc.__class__.__name__,
-            "error": str(exc),
-        })
-        error = _stream_error_payload(exc, error_builder)
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+        yield ": stream-open\n\n"
+        try:
+            for item in items:
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.warning({
+                "event": "sse_stream_error",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            })
+            error = _stream_error_payload(exc, error_builder)
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        close_iterator(items)
 
 
 def image_sse_stream(
@@ -255,19 +487,22 @@ def image_sse_stream(
     error_builder: Callable[[Exception], dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     try:
-        for item in items:
-            event = str(item.get("type") or "message") if isinstance(item, dict) else "message"
-            yield f"event: {event}\n"
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-    except Exception as exc:
-        logger.warning({
-            "event": "image_sse_stream_error",
-            "error_type": exc.__class__.__name__,
-            "error": str(exc),
-        })
-        error = _stream_error_payload(exc, error_builder)
-        yield "event: error\n"
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        try:
+            for item in items:
+                event = str(item.get("type") or "message") if isinstance(item, dict) else "message"
+                yield f"event: {event}\n"
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.warning({
+                "event": "image_sse_stream_error",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            })
+            error = _stream_error_payload(exc, error_builder)
+            yield "event: error\n"
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+    finally:
+        close_iterator(items)
 
 
 def anthropic_sse_stream(items) -> Iterator[str]:
@@ -298,6 +533,7 @@ def _format_timeout_secs(value: float) -> str:
 def iter_sse_payloads(
     response: requests.Response,
     max_duration_secs: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Iterator[str]:
     started_at = time.monotonic()
     timeout_secs = float(max_duration_secs or 0)
@@ -317,6 +553,18 @@ def iter_sse_payloads(
         if remaining is not None and remaining <= 0:
             _abort_stream_nonblocking()
             raise _timeout_error()
+
+    def _raise_if_stopped() -> None:
+        if should_stop is not None and should_stop():
+            _abort_stream_nonblocking()
+            raise TimeoutError("image request deadline exceeded")
+
+    def _wait_secs() -> float:
+        remaining = _remaining_secs()
+        cap = 0.05 if should_stop is not None else 1.0
+        if remaining is None:
+            return cap
+        return max(0.001, min(cap, remaining))
 
     def _abort_stream_nonblocking() -> None:
         """Cancel curl_cffi streaming without waiting for its stream task.
@@ -350,12 +598,13 @@ def iter_sse_payloads(
             return
         while True:
             _raise_if_timeout()
-            remaining = _remaining_secs()
-            wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
+            _raise_if_stopped()
+            wait_secs = _wait_secs()
             try:
                 chunk = stream_queue.get(timeout=wait_secs)
             except queue.Empty:
                 _raise_if_timeout()
+                _raise_if_stopped()
                 continue
             if isinstance(chunk, RequestException):
                 try:
@@ -390,12 +639,13 @@ def iter_sse_payloads(
         threading.Thread(target=_produce, name="sse-response-reader", daemon=True).start()
         while True:
             _raise_if_timeout()
-            remaining = _remaining_secs()
-            wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
+            _raise_if_stopped()
+            wait_secs = _wait_secs()
             try:
                 item = item_queue.get(timeout=wait_secs)
             except queue.Empty:
                 _raise_if_timeout()
+                _raise_if_stopped()
                 continue
             if item is done:
                 break
@@ -411,6 +661,7 @@ def iter_sse_payloads(
             pending = lines.pop() if lines and chunk and lines[-1] and lines[-1][-1] == chunk[-1] else None
             for raw_line in lines:
                 _raise_if_timeout()
+                _raise_if_stopped()
                 if not raw_line:
                     continue
                 line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
@@ -526,13 +777,21 @@ def _message_image_url(value: object) -> str:
     return str(value or "").strip()
 
 
-def _read_limited_image(response: object) -> bytes:
+def _image_fetch_stopped(stop_event: threading.Event | None) -> bool:
+    return stop_event is not None and stop_event.is_set()
+
+
+def _read_limited_image_body(response: object, stop_event: threading.Event | None) -> bytes:
+    if _image_fetch_stopped(stop_event):
+        raise _ImageFetchStopped("image request stopped")
     data = bytearray()
     iterator = getattr(response, "iter_content", None)
     try:
         if callable(iterator):
             try:
                 for chunk in iterator(chunk_size=64 * 1024):
+                    if _image_fetch_stopped(stop_event):
+                        raise _ImageFetchStopped("image request stopped")
                     if not chunk:
                         continue
                     piece = bytes(chunk)
@@ -540,18 +799,40 @@ def _read_limited_image(response: object) -> bytes:
                         raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
                     data.extend(piece)
             except TypeError:
+                if _image_fetch_stopped(stop_event):
+                    raise _ImageFetchStopped("image request stopped")
                 data = bytearray(bytes(getattr(response, "content", b"") or b""))
             if not data:
+                if _image_fetch_stopped(stop_event):
+                    raise _ImageFetchStopped("image request stopped")
                 data = bytearray(bytes(getattr(response, "content", b"") or b""))
         else:
+            if _image_fetch_stopped(stop_event):
+                raise _ImageFetchStopped("image request stopped")
             data = bytearray(bytes(getattr(response, "content", b"") or b""))
     except HTTPException:
         raise
+    except _ImageFetchStopped:
+        raise
     except Exception as exc:
+        _reraise_image_fetch_stopped(exc)
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+    if _image_fetch_stopped(stop_event):
+        raise _ImageFetchStopped("image request stopped")
     if len(data) > MAX_JSON_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
     return bytes(data)
+
+
+def _read_limited_image(response: object) -> bytes:
+    stop_event = _image_request_stop_event()
+    if stop_event is None:
+        return _read_limited_image_body(response, None)
+    return _run_remote_image_get(
+        lambda: _read_limited_image_body(response, stop_event),
+        stop_event,
+        close_on_stop=response,
+    )
 
 
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
@@ -566,20 +847,28 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     current = source
     for redirect_count in range(REMOTE_IMAGE_REDIRECTS + 1):
         parsed, addresses = validate_public_image_url(current)
+        stop_event = _image_request_stop_event()
         try:
-            response = requests.get(
-                current,
-                headers=chrome146_remote_image_headers(current),
-                timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-                allow_redirects=False,
-                stream=True,
-                impersonate=CHROME146_IMPERSONATE,
-                curl_options=public_image_curl_options(parsed, addresses),
+            response = _run_remote_image_get(
+                lambda: requests.get(
+                    current,
+                    headers=chrome146_remote_image_headers(current),
+                    timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+                    allow_redirects=False,
+                    stream=True,
+                    impersonate=CHROME146_IMPERSONATE,
+                    curl_options=public_image_curl_options(parsed, addresses),
+                ),
+                stop_event,
             )
+        except _ImageFetchStopped:
+            raise
         except HTTPException:
             raise
         except Exception as exc:
+            _reraise_image_fetch_stopped(exc)
             raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+        defer_close = False
         try:
             status = int(getattr(response, "status_code", 0) or 0)
             if 300 <= status < 400:
@@ -595,7 +884,11 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
             content_length = str(response.headers.get("content-length") or "").strip()
             if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
                 raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-            image_data = _read_limited_image(response)
+            try:
+                image_data = _read_limited_image(response)
+            except _ImageFetchStopped as exc:
+                defer_close = bool(getattr(exc, "close_deferred", False))
+                raise
             if not image_data:
                 raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
             mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
@@ -608,9 +901,8 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
                 mime = "image/png"
             return image_data, mime
         finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
+            if not defer_close:
+                _close_remote_image_response(response)
     raise HTTPException(status_code=400, detail={"error": "image_url has too many redirects"})
 
 
@@ -693,13 +985,36 @@ def extract_chat_prompt(body: dict[str, object]) -> str:
 
 
 def parse_image_count(raw_value: object) -> int:
+    if raw_value is None:
+        return 1
+    if isinstance(raw_value, str) and not raw_value.strip():
+        raise HTTPException(status_code=400, detail={"error": "n must be an integer"})
     try:
-        value = int(raw_value or 1)
+        value = int(raw_value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
     if value < 1 or value > 4:
         raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
     return value
+
+
+def image_request_count(body: object) -> int:
+    """Resolve how many images to generate before a slot is reserved.
+
+    An image tool n wins when it is present. Otherwise the top-level n is used.
+    Invalid values raise before admission instead of being clamped.
+    """
+    if not isinstance(body, dict):
+        return 1
+    raw = body.get("n", 1)
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict) or str(tool.get("type") or "") != "image_generation":
+            continue
+        if tool.get("n") is None:
+            continue
+        raw = tool.get("n")
+        break
+    return parse_image_count(raw)
 
 
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:

@@ -278,6 +278,88 @@ class _CurlResponseStream:
             close()
 
 
+class ImageRequestStopped(TimeoutError):
+    """The image request was abandoned or its deadline passed during HTTP."""
+
+
+def _reraise_image_http_stopped(exc: BaseException) -> None:
+    """Raise an internal stop when the transfer thread aborted for the caller.
+
+    The abort finishes as a curl error. If that thread wins the race, callers
+    must still see ImageRequestStopped instead of a connection failure.
+    """
+    if isinstance(exc, ImageRequestStopped):
+        raise exc
+    message = str(exc).strip()
+    code = getattr(exc, "code", None)
+    try:
+        code_value = int(code)
+    except (TypeError, ValueError):
+        code_value = -1
+    if message == "image request stopped" or (
+        code_value == 42 and message.endswith("image request stopped")
+    ):
+        raise ImageRequestStopped("image request stopped") from exc
+
+
+def call_until_image_stop(
+    func: Callable[[], Any],
+    *,
+    stop_event: threading.Event | None = None,
+    deadline_monotonic: float | None = None,
+    cleanup: Callable[[], None] | None = None,
+) -> Any:
+    """Run blocking HTTP until it finishes, or return when the image request stops.
+
+    Image HTTP installs a same-thread abort, so the transfer is removed when
+    this returns. A caller that does not install that abort still returns here
+    while its own request may finish on its timeout.
+    """
+
+    def stopped() -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        return bool(
+            deadline_monotonic
+            and float(deadline_monotonic) > 0
+            and time.monotonic() >= float(deadline_monotonic)
+        )
+
+    if stop_event is None and not (deadline_monotonic and float(deadline_monotonic) > 0):
+        return func()
+
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="image-http", daemon=True).start()
+    while not done.is_set():
+        if stopped():
+            if cleanup is not None:
+                def _cleanup_later() -> None:
+                    done.wait()
+                    try:
+                        cleanup()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_cleanup_later, name="image-http-cleanup", daemon=True).start()
+            raise ImageRequestStopped("image request deadline exceeded")
+        done.wait(0.05)
+    if "error" in outcome:
+        error = outcome["error"]
+        _reraise_image_http_stopped(error)
+        raise error
+    return outcome.get("value")
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -300,6 +382,7 @@ class OpenAIBackendAPI:
             deadline_monotonic: float | None = None,
             account: dict[str, Any] | None = None,
             use_global_proxy: bool = False,
+            stop_event: threading.Event | None = None,
     ) -> None:
         """初始化后端客户端。
 
@@ -326,6 +409,11 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        self.deadline_monotonic = deadline_monotonic if deadline_monotonic and deadline_monotonic > 0 else None
+        self.abandoned = stop_event
+        self._image_http_lock = threading.Lock()
+        self._http_inflight = 0
+        self._session_closed = False
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
@@ -343,6 +431,7 @@ class OpenAIBackendAPI:
             upstream=True,
             reserve_image_egress=reserve_image_egress,
             deadline_monotonic=deadline_monotonic,
+            stop_event=stop_event,
         )
         try:
             self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
@@ -389,15 +478,52 @@ class OpenAIBackendAPI:
                 continue
 
     def close(self) -> None:
-        if getattr(self, "_closed", False):
+        lock = getattr(self, "_image_http_lock", None)
+        if lock is None:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            self._close_session_locked()
             return
-        self._closed = True
+        with lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            if getattr(self, "_http_inflight", 0):
+                return
+            self._close_session_locked()
+
+    def _close_session_locked(self) -> None:
+        if getattr(self, "_session_closed", False):
+            return
+        self._session_closed = True
         session = getattr(self, "session", None)
         if session:
             try:
                 session.close()
             except Exception:
                 pass
+
+    def _ensure_http_lock(self) -> threading.Lock:
+        lock = getattr(self, "_image_http_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._image_http_lock = lock
+            self._http_inflight = 0
+            self._session_closed = False
+        return lock
+
+    def _note_http_started(self) -> None:
+        with self._ensure_http_lock():
+            if getattr(self, "_closed", False) or getattr(self, "_session_closed", False):
+                raise ImageRequestStopped("image request deadline exceeded")
+            self._http_inflight = int(getattr(self, "_http_inflight", 0) or 0) + 1
+
+    def _note_http_finished(self) -> None:
+        with self._ensure_http_lock():
+            self._http_inflight = max(0, int(getattr(self, "_http_inflight", 1) or 1) - 1)
+            if self._http_inflight == 0 and getattr(self, "_closed", False):
+                self._close_session_locked()
 
     def __del__(self):
         self.close()
@@ -517,7 +643,19 @@ class OpenAIBackendAPI:
         if sleep_for <= 0:
             return
         self._add_image_result_timing("poll_wait_ms", sleep_for * 1000)
-        time.sleep(sleep_for)
+        deadline = time.monotonic() + sleep_for
+        event = getattr(self, "abandoned", None)
+        while True:
+            if self._image_http_stopped():
+                raise TimeoutError("image request deadline exceeded")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if event is None:
+                time.sleep(remaining)
+                return
+            if event.wait(min(0.05, remaining)):
+                raise TimeoutError("image request deadline exceeded")
 
     @classmethod
     def _is_image_stream_terminal_payload(cls, payload: str) -> bool:
@@ -556,9 +694,13 @@ class OpenAIBackendAPI:
         max_gap_ms = 0
         last_payload_preview = ""
         try:
+            stop_check = None
+            if getattr(self, "abandoned", None) is not None or (getattr(self, "deadline_monotonic", None) or 0) > 0:
+                stop_check = self._image_http_stopped
             for payload in iter_sse_payloads(
                 response,
                 max_duration_secs=max_duration_secs,
+                should_stop=stop_check,
             ):
                 now = time.perf_counter()
                 gap_ms = int((now - last_event_at) * 1000)
@@ -1046,7 +1188,11 @@ class OpenAIBackendAPI:
         return f"SSE stream exceeded {timeout_secs:.0f}s" if timeout_secs >= 1 else f"SSE stream exceeded {timeout_secs:.3f}s"
 
     @staticmethod
-    def _iter_codex_response_events(raw: Any, max_duration_secs: float | None = None) -> Iterator[Dict[str, Any]]:
+    def _iter_codex_response_events(
+            raw: Any,
+            max_duration_secs: float | None = None,
+            stop_event: threading.Event | None = None,
+    ) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
         status_code = getattr(raw, "status", None)
         timeout_secs = float(max_duration_secs or 0)
@@ -1105,6 +1251,16 @@ class OpenAIBackendAPI:
             timer = threading.Timer(timeout_secs, _abort_stream)
             timer.daemon = True
             timer.start()
+        finished = threading.Event()
+        if stop_event is not None:
+            def _watch_stop() -> None:
+                while not finished.is_set():
+                    if stop_event.is_set():
+                        _abort_stream()
+                        return
+                    finished.wait(0.05)
+
+            threading.Thread(target=_watch_stop, name="image-codex-stop", daemon=True).start()
         try:
             if "application/json" in content_type:
                 _raise_if_timeout()
@@ -1121,6 +1277,9 @@ class OpenAIBackendAPI:
                 lines: list[str] = []
                 while True:
                     _raise_if_timeout()
+                    if stop_event is not None and stop_event.is_set():
+                        _abort_stream()
+                        raise TimeoutError("image request deadline exceeded")
                     raw_line = raw.readline()
                     _raise_if_timeout()
                     if not raw_line:
@@ -1143,6 +1302,7 @@ class OpenAIBackendAPI:
                 raise TimeoutError(OpenAIBackendAPI._stream_timeout_message(timeout_secs)) from exc
             raise
         finally:
+            finished.set()
             if timer is not None:
                 timer.cancel()
 
@@ -1240,7 +1400,7 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
-        stream_timeout = config.image_stream_timeout_secs
+        stream_timeout = self._bounded_image_timeout(config.image_stream_timeout_secs)
         response = self.session.post(
             self.base_url + path,
             headers=self._codex_responses_headers(),
@@ -1263,7 +1423,11 @@ class OpenAIBackendAPI:
                 raise UpstreamHTTPError(path, status_code, body, retry_after=retry_after)
             raw = _CurlResponseStream(response)
             try:
-                yield from self._iter_codex_response_events(raw, max_duration_secs=stream_timeout)
+                yield from self._iter_codex_response_events(
+                    raw,
+                    max_duration_secs=stream_timeout,
+                    stop_event=getattr(self, "abandoned", None),
+                )
             finally:
                 raw.close()
         finally:
@@ -1297,7 +1461,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=60,
+            timeout=self._bounded_image_timeout(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -1339,7 +1503,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=60,
+            timeout=self._bounded_image_timeout(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -1356,7 +1520,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=120,
+            timeout=self._bounded_image_timeout(120),
         )
         ensure_ok(response, "image_upload", credential_scope="signed_asset")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
@@ -1364,7 +1528,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=60,
+            timeout=self._bounded_image_timeout(60),
         )
         ensure_ok(response, path)
         return {
@@ -1430,7 +1594,7 @@ class OpenAIBackendAPI:
             "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
-        timeout_secs = config.image_stream_timeout_secs
+        timeout_secs = self._bounded_image_timeout(config.image_stream_timeout_secs)
         # Keep the transport/curl deadline slightly above the logical SSE
         # deadline.  Otherwise curl_cffi can raise curl(28) first and bypass
         # the stream-timeout recovery probe that fetches conversation/task
@@ -1463,6 +1627,7 @@ class OpenAIBackendAPI:
 
     def _get_conversation(self, conversation_id: str, timeout_secs: float = 60) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
+        timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=timeout_secs)
@@ -1471,6 +1636,7 @@ class OpenAIBackendAPI:
 
     def delete_conversation(self, conversation_id: str, timeout_secs: float = 10.0) -> Dict[str, Any]:
         """隐藏 ChatGPT 官网历史里的 conversation。"""
+        timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = f"/backend-api/conversation/{conversation_id}"
         headers = self._headers(path, {
             "Accept": "*/*",
@@ -1501,6 +1667,7 @@ class OpenAIBackendAPI:
         当 SSE 流太短导致 conversation_id 丢失时，可以通过此方法
         查找最近创建的对话来恢复 conversation_id。
         """
+        timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = f"/backend-api/conversations?offset=0&limit={limit}&order=updated&conversation_filter=all"
         try:
             response = self.session.get(
@@ -2465,6 +2632,61 @@ class OpenAIBackendAPI:
             raise TimeoutError(message)
         return max(0.001, remaining)
 
+    def _bounded_image_timeout(self, maximum: float) -> float:
+        deadline = getattr(self, "deadline_monotonic", None)
+        if not deadline or float(deadline) <= 0:
+            return maximum
+        return min(maximum, self._remaining_timeout(float(deadline), "image request deadline exceeded"))
+
+    def _image_http_stopped(self) -> bool:
+        event = getattr(self, "abandoned", None)
+        if event is not None and event.is_set():
+            return True
+        deadline = getattr(self, "deadline_monotonic", None)
+        return bool(deadline) and float(deadline) > 0 and time.monotonic() >= float(deadline)
+
+    def bind_image_stop(self, event: threading.Event) -> None:
+        """Stop image HTTP at the shared request event without wrapping text clients."""
+        self.abandoned = event
+        session = getattr(self, "session", None)
+        if session is None or getattr(session, "_image_stop_bound", False):
+            return
+        for name in ("get", "post", "put", "patch", "delete"):
+            original = getattr(session, name, None)
+            if callable(original):
+                setattr(session, name, self._image_http_method(original))
+        try:
+            session._image_stop_bound = True
+        except Exception:
+            pass
+
+    def _image_http_method(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            timeout = kwargs.get("timeout")
+            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+                kwargs["timeout"] = self._bounded_image_timeout(float(timeout))
+            if self._image_http_stopped():
+                raise ImageRequestStopped("image request deadline exceeded")
+            self._note_http_started()
+
+            def run_original() -> Any:
+                from utils.helper import pop_image_http_stop, push_image_http_stop
+
+                token = push_image_http_stop(self._image_http_stopped)
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    pop_image_http_stop(token)
+                    self._note_http_finished()
+
+            return call_until_image_stop(
+                run_original,
+                stop_event=getattr(self, "abandoned", None),
+                deadline_monotonic=getattr(self, "deadline_monotonic", None),
+            )
+
+        return wrapped
+
     @classmethod
     def _remaining_search_timeout(cls, deadline: float) -> float:
         return cls._remaining_timeout(deadline, "web search timed out")
@@ -3064,6 +3286,8 @@ class OpenAIBackendAPI:
             raise exc
 
         while _remaining() > 0:
+            if self._image_http_stopped():
+                raise TimeoutError("image request deadline exceeded")
             attempt += 1
             task_count = 0
             task_check_ok = False
@@ -3148,7 +3372,10 @@ class OpenAIBackendAPI:
             conversation_query_started = time.perf_counter()
             try:
                 try:
-                    conversation = self._get_conversation(conversation_id)
+                    conversation = self._get_conversation(
+                        conversation_id,
+                        timeout_secs=self._bounded_image_timeout(60),
+                    )
                 finally:
                     self._add_image_result_timing(
                         "poll_request_ms",
@@ -3321,7 +3548,7 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._bounded_image_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -3330,7 +3557,7 @@ class OpenAIBackendAPI:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._bounded_image_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -3351,6 +3578,7 @@ class OpenAIBackendAPI:
         返回：
         - 任务列表，每个任务包含 image_gen_message 等字段。
         """
+        timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = "/backend-api/tasks"
         response = self.session.get(
             self.base_url + path,
@@ -3407,9 +3635,13 @@ class OpenAIBackendAPI:
                 resolver: Callable[[], str],
         ) -> str:
             for attempt in range(2):
+                if self._image_http_stopped():
+                    raise TimeoutError("image request deadline exceeded")
                 try:
                     url = str(resolver() or "").strip()
                 except Exception as exc:
+                    if self._image_http_stopped():
+                        raise
                     failure = classify_image_exception(exc)
                     missing_candidate = (
                         isinstance(exc, UpstreamHTTPError)
@@ -3550,7 +3782,9 @@ class OpenAIBackendAPI:
         self._reset_image_result_timing()
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
-        timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        timeout = self._bounded_image_timeout(
+            poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        )
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
         if poll and conversation_id and (file_ids or sediment_ids):
@@ -3578,7 +3812,7 @@ class OpenAIBackendAPI:
                     sediment_ids,
                 )
             except ImagePollTimeoutError as exc:
-                if not file_ids and not sediment_ids:
+                if self._image_http_stopped() or (not file_ids and not sediment_ids):
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -3587,7 +3821,7 @@ class OpenAIBackendAPI:
                     "sediment_ids": sediment_ids,
                 })
             except Exception as exc:
-                if not file_ids and not sediment_ids:
+                if self._image_http_stopped() or (not file_ids and not sediment_ids):
                     raise
                 failure = classify_image_exception(exc)
                 if failure.capability == "auth":
@@ -3620,11 +3854,13 @@ class OpenAIBackendAPI:
                 else self._signed_asset_headers()
             )
             for attempt in range(2):
+                if self._image_http_stopped():
+                    raise TimeoutError("image request deadline exceeded")
                 try:
                     response = self.session.get(
                         request_url,
                         headers=download_headers,
-                        timeout=120,
+                        timeout=self._bounded_image_timeout(120),
                         allow_redirects=False,
                     )
                     if 300 <= int(getattr(response, "status_code", 0) or 0) < 400:
@@ -3727,7 +3963,7 @@ class OpenAIBackendAPI:
         try:
             for payload in self._iter_timed_sse_payloads(
                 response,
-                max_duration_secs=config.image_stream_timeout_secs,
+                max_duration_secs=self._bounded_image_timeout(config.image_stream_timeout_secs),
                 timing_key="image_generation_stream",
             ):
                 yield payload

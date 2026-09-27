@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import threading
 import time
 from contextvars import ContextVar
 from concurrent.futures import (
@@ -42,12 +43,13 @@ from services.image_failure import (
 )
 from services.image_storage_service import image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ImageRequestStopped, OpenAIBackendAPI
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
     UpstreamHTTPError,
+    close_iterator,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -545,6 +547,7 @@ class ConversationRequest:
     trace_image_perf: bool = False
     monitor_attempt: int = 0
     deadline_monotonic: float = 0.0
+    abandoned: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -1697,6 +1700,8 @@ def stream_image_outputs(
                     upstream_event_type=raw_type,
                 )
     except (TimeoutError, curl_exceptions.Timeout) as exc:
+        if _image_request_stopped(request):
+            raise _deadline_slot_error(index) from exc
         recovered = _recover_after_image_stream_timeout(
             backend,
             request,
@@ -1710,6 +1715,8 @@ def stream_image_outputs(
             yield recovered
             return
     except curl_exceptions.RequestException as exc:
+        if _image_request_stopped(request):
+            raise _deadline_slot_error(index) from exc
         if not any((
             last.get("conversation_id"),
             last.get("file_ids"),
@@ -2057,6 +2064,7 @@ def _note_image_session(
     conversation_id: str,
     access_token: str,
     seen: set[str],
+    slot_index: int = 0,
 ) -> None:
     """Persist a conversation id once, as soon as the upstream stream has it."""
     conversation_id = str(conversation_id or "").strip()
@@ -2070,7 +2078,10 @@ def _note_image_session(
     token = str(access_token or "").strip()
     if token:
         fingerprint = account_service._access_token_fingerprint(token)
-    callback(conversation_id, fingerprint)
+    try:
+        callback(conversation_id, fingerprint, slot_index)
+    except TypeError:
+        callback(conversation_id, fingerprint)
 
 
 def _generate_single_image(
@@ -2147,6 +2158,19 @@ def _generate_single_image(
         return True
 
     while True:
+        if _image_request_stopped(request):
+            held_token = retry_token
+            retry_token = ""
+            if held_token:
+                try:
+                    account_service.release_image_slot(held_token)
+                except Exception as exc:
+                    logger.warning({
+                        "event": "image_account_slot_release_failed",
+                        "error": diagnostic_excerpt(exc, 500),
+                        "index": index,
+                    })
+            raise _deadline_slot_error(index)
         if pause_worker is not None:
             pause_worker()
         request.monitor_attempt = len(image_attempts) + 1
@@ -2174,6 +2198,7 @@ def _generate_single_image(
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                     excluded_tokens=attempted_tokens,
                     deadline_monotonic=request.deadline_monotonic or None,
+                    stop_event=request.abandoned,
                 )
                 attempted_tokens.add(token)
                 account_attempt_started = account_wait_started
@@ -2414,6 +2439,7 @@ def _generate_single_image(
                     upstream=True,
                     reserve_image_egress=True,
                     deadline_monotonic=request.deadline_monotonic or None,
+                    stop_event=request.abandoned,
                 )
                 if fallback_profile is None:
                     raise ImageGenerationError(
@@ -2427,7 +2453,11 @@ def _generate_single_image(
                 reserve_image_egress=fallback_profile is None,
                 deadline_monotonic=request.deadline_monotonic or None,
                 use_global_proxy=True,
+                stop_event=request.abandoned,
             )
+            bind_image_stop = getattr(backend, "bind_image_stop", None)
+            if callable(bind_image_stop):
+                bind_image_stop(request.abandoned)
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
                 if using_fallback_profile:
@@ -2450,6 +2480,7 @@ def _generate_single_image(
             egress_acquire_ms = proxy_settings.acquire_image_egress(
                 backend.proxy_profile,
                 deadline_monotonic=request.deadline_monotonic or None,
+                stop_event=request.abandoned,
             )
             egress_acquired = (
                 int(getattr(backend.proxy_profile, "image_concurrency_limit", 0) or 0) > 0
@@ -2504,6 +2535,7 @@ def _generate_single_image(
                         attempt_conversation_id,
                         attempt_access_token,
                         checkpointed_conversations,
+                        index,
                     )
                 if output.kind == "message" and request.message_as_error:
                     failure = output.failure or image_failure(
@@ -2638,6 +2670,15 @@ def _generate_single_image(
                 if isinstance(exc, ImageEgressDeadlineError)
                 else classify_image_exception(exc)
             )
+            if isinstance(exc, ImageRequestStopped) or (
+                _image_request_stopped(request)
+                and failure.code in {
+                    "upstream_connection_failed",
+                    "upstream_connection_timeout",
+                    "upstream_unavailable",
+                }
+            ):
+                failure = image_failure("task_interrupted", raw_detail=str(exc))
             attempt_conversation_id = str(getattr(exc, "conversation_id", "") or attempt_conversation_id)
             stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
             http_timing = _backend_http_timing_data(backend)
@@ -2815,19 +2856,25 @@ def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
     return selected
 
 
-def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
-    if not is_supported_image_model(request.model):
+def ensure_supported_image_model(model: object, request: ConversationRequest | None = None) -> None:
+    if is_supported_image_model(model):
+        return
+    if request is not None:
         _monitor_image_stage(
             request,
             "image_local_rejected",
             local_reason="unsupported_model",
             status="failed",
         )
-        raise ImageGenerationError(
-            "unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)),
-            failure=image_failure("unsupported_model"),
-        )
+    raise ImageGenerationError(
+        "unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)),
+        failure=image_failure("unsupported_model"),
+    )
+
+
+def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
+    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    ensure_supported_image_model(request.model, request)
 
     if request.deadline_monotonic <= 0:
         bound = image_gate.image_generation_gate.current()
@@ -2840,12 +2887,94 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     return _stream_image_outputs_with_slot(request)
 
 
+def _deadline_exceeded(request: ConversationRequest) -> bool:
+    return request.deadline_monotonic > 0 and time.monotonic() >= request.deadline_monotonic
+
+
+def _abandon_image_request(request: ConversationRequest) -> None:
+    request.abandoned.set()
+
+
+def _share_image_stop(request: ConversationRequest, admission) -> None:
+    event = getattr(admission, "abandoned", None)
+    if event is None:
+        try:
+            admission.abandoned = request.abandoned
+        except Exception:
+            return
+        return
+    if request.abandoned.is_set():
+        event.set()
+    request.abandoned = event
+
+
+def _image_request_stopped(request: ConversationRequest) -> bool:
+    return request.abandoned.is_set() or _deadline_exceeded(request)
+
+
+def _deadline_slot_error(index: int) -> ImageGenerationError:
+    return ImageGenerationError(
+        f"image slot {index} exceeded the request deadline",
+        failure=image_failure("task_interrupted"),
+    )
+
+
+def _mark_deadline_slots(request: ConversationRequest, errors: dict[int, Exception], start: int) -> None:
+    _abandon_image_request(request)
+    for pending_index in range(start, request.n + 1):
+        errors.setdefault(pending_index, _deadline_slot_error(pending_index))
+
+
+def _consume_parallel_future(
+    future: Any,
+    futures: dict[Any, int],
+    processed_futures: set[Any],
+    errors: dict[int, Exception],
+    successful_slots: set[int],
+    request: ConversationRequest,
+) -> list[ImageOutput]:
+    index = futures[future]
+    processed_futures.add(future)
+    try:
+        outputs = future.result()
+    except Exception as exc:
+        _capture_failed_image_attempts(request, exc)
+        errors[index] = exc
+        error_text = str(exc)
+        logger.warning({
+            "event": "image_parallel_generation_error",
+            "index": index,
+            "error": error_text[:300],
+        })
+        if not successful_slots:
+            logger.warning({
+                "event": "image_parallel_failure_before_success",
+                "failed_index": index,
+                "error": error_text[:200],
+            })
+        return []
+    terminal = _returned_image_failure(outputs)
+    if terminal is not None:
+        errors[index] = _exception_from_image_failure(terminal)
+        logger.warning({
+            "event": "image_parallel_generation_error",
+            "index": index,
+            "error": str(errors[index])[:300],
+        })
+        return []
+    if any(output.kind == "result" and output.data for output in outputs):
+        successful_slots.add(index)
+    return outputs
+
+
 def _generate_limited_image(
     request: ConversationRequest,
     index: int,
     total: int,
     admission,
 ) -> list[ImageOutput]:
+    if _image_request_stopped(request):
+        raise _deadline_slot_error(index)
     gate = image_gate.image_generation_gate
     worker_held = False
 
@@ -2860,9 +2989,13 @@ def _generate_limited_image(
         nonlocal worker_held
         if worker_held:
             return
+        if _image_request_stopped(request):
+            raise _deadline_slot_error(index)
         try:
             gate.acquire_running(admission, request.deadline_monotonic)
         except image_gate.ImageGenerationQueueFullError as exc:
+            if _image_request_stopped(request):
+                raise _deadline_slot_error(index) from exc
             raise ImageGenerationError(
                 "Image generation is busy. Please try again later.",
                 failure=image_failure("image_generation_busy"),
@@ -2877,6 +3010,93 @@ def _generate_limited_image(
         _IMAGE_WORKER_CONTROL.reset(control)
         if worker_held:
             gate.release_running(admission)
+
+
+def _returned_image_failure(outputs: list[ImageOutput]) -> ImageOutput | None:
+    """A slot that came back without an image, instead of raising."""
+
+    if any(output.kind == "result" and output.data for output in outputs):
+        return None
+    for output in outputs:
+        if output.kind == "slot_failure" or (
+            output.kind == "message" and output.failure is not None
+        ):
+            return output
+    return None
+
+
+def _exception_from_image_failure(
+    output: ImageOutput,
+    image_attempts: list[dict[str, Any]] | None = None,
+) -> ImageGenerationError:
+    failure = output.failure or image_failure("no_image_generated", raw_detail=output.text)
+    attempts = image_attempts
+    if attempts is None:
+        attempts = [
+            dict(item)
+            for item in output.image_attempts
+            if isinstance(item, dict)
+        ]
+    return ImageGenerationError(
+        output.text or public_image_error_message(failure),
+        failure=failure,
+        account_email=output.account_email,
+        conversation_id=output.conversation_id,
+        image_attempts=attempts,
+    )
+
+
+def raise_if_no_delivered_image(
+    *,
+    delivered: bool,
+    failure: ImageOutput | None,
+    image_attempts: list[dict[str, Any]] | None = None,
+) -> None:
+    """A finished image stream with only failures is a failed call."""
+
+    if delivered or failure is None:
+        return
+    raise _exception_from_image_failure(failure, image_attempts)
+
+
+def _slot_failure_output(request: ConversationRequest, index: int, exc: Exception) -> ImageOutput:
+    failure = getattr(exc, "failure", None)
+    if not isinstance(failure, ImageFailure):
+        failure = classify_image_exception(exc)
+    attempts = [
+        dict(item)
+        for item in (getattr(exc, "image_attempts", None) or [])
+        if isinstance(item, dict)
+    ]
+    message = public_image_error_message(failure, exc) or str(exc) or "image generation failed"
+    if not attempts:
+        attempts = [{
+            "slot": index,
+            "attempt": 1,
+            "status": "failed",
+            "failure_code": failure.code,
+            "error_type": failure.error_type,
+            "public_error": message,
+        }]
+    return ImageOutput(
+        kind="slot_failure",
+        model=request.model,
+        index=index,
+        total=request.n,
+        text=message,
+        failure=failure,
+        account_email=str(getattr(exc, "account_email", "") or ""),
+        conversation_id=str(getattr(exc, "conversation_id", "") or ""),
+        image_attempts=attempts,
+    )
+
+
+def _iter_slot_failures(
+    request: ConversationRequest,
+    errors: dict[int, Exception],
+) -> Iterator[ImageOutput]:
+    for index in sorted(errors):
+        yield _slot_failure_output(request, index, errors[index])
 
 
 def _stream_image_outputs_with_slot(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -2901,6 +3121,7 @@ def _stream_image_outputs_with_slot(request: ConversationRequest) -> Iterator[Im
 
 
 def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> Iterator[ImageOutput]:
+    _share_image_stop(request, admission)
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
         outputs = _generate_limited_image(request, 1, 1, admission)
@@ -2909,6 +3130,9 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
                 "image generation completed without output",
                 failure=image_failure("no_image_generated"),
             )
+        terminal = _returned_image_failure(outputs)
+        if terminal is not None:
+            raise _exception_from_image_failure(terminal)
         for output in outputs:
             yield output
         return
@@ -2923,6 +3147,9 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
         successful_slots: set[int] = set()
         errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
+            if _image_request_stopped(request):
+                _mark_deadline_slots(request, errors, index)
+                break
             try:
                 outputs = _generate_limited_image(request, index, request.n, admission)
             except Exception as exc:
@@ -2933,8 +3160,18 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
                     "index": index,
                     "error": str(exc)[:300],
                 })
-                if time.monotonic() >= request.deadline_monotonic:
+                if _image_request_stopped(request):
+                    _mark_deadline_slots(request, errors, index + 1)
                     break
+                continue
+            terminal = _returned_image_failure(outputs)
+            if terminal is not None:
+                errors[index] = _exception_from_image_failure(terminal)
+                logger.warning({
+                    "event": "image_serial_generation_error",
+                    "index": index,
+                    "error": str(errors[index])[:300],
+                })
                 continue
             if any(output.kind == "result" and output.data for output in outputs):
                 successful_slots.add(index)
@@ -2947,6 +3184,7 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
                     "failed_index": index,
                     "error": str(exc)[:200],
                 })
+            yield from _iter_slot_failures(request, errors)
             return
         if selected_error := _select_image_pool_error(errors):
             raise selected_error
@@ -2955,74 +3193,64 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
             failure=image_failure("no_available_account"),
         )
 
-    logger.info({
-        "event": "image_parallel_generation_start",
-        "n": request.n,
-        "model": request.model,
-    })
-    # 每张图片一个线程，同时启动
-    futures = {}
     errors: dict[int, Exception] = {}
     successful_slots: set[int] = set()
-    processed_futures = set()
-    executor = ThreadPoolExecutor(max_workers=request.n)
+    if _image_request_stopped(request):
+        _mark_deadline_slots(request, errors, 1)
+    else:
+        logger.info({
+            "event": "image_parallel_generation_start",
+            "n": request.n,
+            "model": request.model,
+        })
+        # 每张图片一个线程，同时启动。截止已过的槽不再提交。
+        futures = {}
+        processed_futures = set()
+        executor = ThreadPoolExecutor(max_workers=request.n)
 
-    def consume_future(future: Any) -> list[ImageOutput]:
-        index = futures[future]
-        processed_futures.add(future)
+        def consume_future(future: Any) -> list[ImageOutput]:
+            return _consume_parallel_future(
+                future,
+                futures,
+                processed_futures,
+                errors,
+                successful_slots,
+                request,
+            )
+
         try:
-            outputs = future.result()
-        except Exception as exc:
-            _capture_failed_image_attempts(request, exc)
-            errors[index] = exc
-            error_text = str(exc)
-            logger.warning({
-                "event": "image_parallel_generation_error",
-                "index": index,
-                "error": error_text[:300],
-            })
-            if not successful_slots:
-                logger.warning({
-                    "event": "image_parallel_failure_before_success",
-                    "failed_index": index,
-                    "error": error_text[:200],
-                })
-            return []
-        if any(output.kind == "result" and output.data for output in outputs):
-            successful_slots.add(index)
-        return outputs
+            for index in range(1, request.n + 1):
+                if _image_request_stopped(request):
+                    _mark_deadline_slots(request, errors, index)
+                    break
+                future = executor.submit(_generate_limited_image, request, index, request.n, admission)
+                futures[future] = index
 
-    try:
-        for index in range(1, request.n + 1):
-            future = executor.submit(_generate_limited_image, request, index, request.n, admission)
-            futures[future] = index
-
-        # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。
-        try:
-            remaining = max(0.0, request.deadline_monotonic - time.monotonic())
-            for future in as_completed(futures, timeout=remaining):
-                for output in consume_future(future):
-                    yield output
-        except FuturesTimeoutError:
-            pending = [future for future in futures if future not in processed_futures]
-            done, _ = wait(pending, timeout=0.05)
-            for future in done:
-                for output in consume_future(future):
-                    yield output
-            for future in pending:
-                if future in processed_futures:
-                    continue
-                index = futures[future]
-                future.cancel()
-                errors[index] = ImageGenerationError(
-                    f"image slot {index} exceeded the request deadline",
-                    failure=image_failure("task_interrupted"),
-                )
-    finally:
-        for future in futures:
-            if not future.done():
-                future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+            if futures:
+                try:
+                    remaining = max(0.0, request.deadline_monotonic - time.monotonic())
+                    for future in as_completed(futures, timeout=remaining):
+                        for output in consume_future(future):
+                            yield output
+                except FuturesTimeoutError:
+                    _abandon_image_request(request)
+                    pending = [future for future in futures if future not in processed_futures]
+                    done, _ = wait(pending, timeout=0.05)
+                    for future in done:
+                        for output in consume_future(future):
+                            yield output
+                    for future in pending:
+                        if future in processed_futures:
+                            continue
+                        index = futures[future]
+                        future.cancel()
+                        errors.setdefault(index, _deadline_slot_error(index))
+        finally:
+            _abandon_image_request(request)
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # 如果有失败但也有成功，记录警告
     if successful_slots:
@@ -3033,6 +3261,7 @@ def _stream_image_outputs_unlocked(request: ConversationRequest, admission) -> I
                     "failed_index": index,
                     "error": str(errors[index])[:200],
                 })
+        yield from _iter_slot_failures(request, errors)
         return
 
     if selected_error := _select_image_pool_error(errors):
@@ -3063,30 +3292,69 @@ def stream_image_chunks(
     prefix = str(event_prefix or "image_generation").strip() or "image_generation"
     # ChatGPT Web only gives us final image bytes here. Emitting those bytes as a
     # synthetic partial_image makes some clients display the same image twice.
-    for output in outputs:
-        if output.kind == "result":
-            for item_index, item in enumerate(output.data):
-                if not isinstance(item, dict):
-                    continue
-                b64_json = str(item.get("b64_json") or "").strip()
-                if not b64_json:
-                    continue
-                completed: dict[str, Any] = {"b64_json": b64_json}
-                if usage_builder:
-                    usage = usage_builder([item])
-                    if usage:
-                        completed["usage"] = usage
-                completed_payload = _image_stream_payload(output, f"{prefix}.completed", completed)
-                completed_payload["_image_metadata"] = image_output_metadata([item])
-                if output.image_urls:
-                    completed_payload["_image_urls"] = list(output.image_urls)
-                yield completed_payload
-        elif output.kind == "message" and output.text:
-            yield _image_stream_payload(
-                output,
-                f"{prefix}.failed",
-                {"error": {"message": output.text, "type": "image_generation_error"}},
+    delivered = False
+    failure_output: ImageOutput | None = None
+    image_attempts: list[dict[str, Any]] = []
+    try:
+        for output in outputs:
+            image_attempts.extend(
+                dict(item) for item in output.image_attempts if isinstance(item, dict)
             )
+            if output.kind == "slot_failure" or (
+                output.kind == "message" and output.failure is not None
+            ):
+                if failure_output is None:
+                    failure_output = output
+            if output.kind == "result":
+                for item_index, item in enumerate(output.data):
+                    if not isinstance(item, dict):
+                        continue
+                    b64_json = str(item.get("b64_json") or "").strip()
+                    url = str(item.get("url") or "").strip()
+                    if b64_json:
+                        completed: dict[str, Any] = {"b64_json": b64_json}
+                    elif url:
+                        completed = {"url": url}
+                    else:
+                        continue
+                    if usage_builder:
+                        usage = usage_builder([item])
+                        if usage:
+                            completed["usage"] = usage
+                    completed_payload = _image_stream_payload(output, f"{prefix}.completed", completed)
+                    completed_payload["_image_metadata"] = image_output_metadata([item])
+                    if output.image_urls:
+                        completed_payload["_image_urls"] = list(output.image_urls)
+                    delivered = True
+                    yield completed_payload
+            elif output.kind == "message" and output.text:
+                yield _image_stream_payload(
+                    output,
+                    f"{prefix}.failed",
+                    {"error": {"message": output.text, "type": "image_generation_error"}},
+                )
+            elif output.kind == "slot_failure":
+                failure = output.failure
+                yield _image_stream_payload(
+                    output,
+                    f"{prefix}.failed",
+                    {
+                        "error": {
+                            "message": output.text or "image generation failed",
+                            "type": failure.error_type if failure is not None else "image_generation_error",
+                            "code": failure.code if failure is not None else "upstream_error",
+                            "param": None,
+                        },
+                        "index": output.index,
+                    },
+                )
+        raise_if_no_delivered_image(
+            delivered=delivered,
+            failure=failure_output,
+            image_attempts=image_attempts,
+        )
+    finally:
+        close_iterator(outputs)
 
 
 def collect_image_outputs(
@@ -3102,26 +3370,50 @@ def collect_image_outputs(
     image_urls: list[str] = []
     image_attempts: list[dict[str, Any]] = []
     failed_output: ImageOutput | None = None
-    for output in outputs:
-        created = created or output.created
-        if output.account_email and not account_email:
-            account_email = output.account_email
-        if output.conversation_id and not conversation_id:
-            conversation_id = output.conversation_id
-        for attempt in output.image_attempts:
-            if isinstance(attempt, dict) and attempt not in image_attempts:
-                image_attempts.append(dict(attempt))
-        if output.kind == "progress" and output.text:
-            progress_parts.append(output.text)
-        elif output.kind == "message":
-            message = output.text
-            if output.failure is not None and failed_output is None:
-                failed_output = output
-        elif output.kind == "result":
-            data.extend(output.data)
-            image_urls.extend(output.image_urls)
-            if callable(result_callback) and output.data:
-                result_callback([dict(item) for item in data])
+    slot_errors: list[dict[str, Any]] = []
+    try:
+        for output in outputs:
+            created = created or output.created
+            if output.account_email and not account_email:
+                account_email = output.account_email
+            if output.conversation_id and not conversation_id:
+                conversation_id = output.conversation_id
+            for attempt in output.image_attempts:
+                if isinstance(attempt, dict) and attempt not in image_attempts:
+                    image_attempts.append(dict(attempt))
+            if output.kind == "progress" and output.text:
+                progress_parts.append(output.text)
+            elif output.kind == "message":
+                message = output.text
+                if output.failure is not None and failed_output is None:
+                    failed_output = output
+            elif output.kind == "slot_failure":
+                failure = output.failure
+                slot_errors.append({
+                    "index": output.index,
+                    "error": {
+                        "message": output.text or "image generation failed",
+                        "type": failure.error_type if failure is not None else "image_generation_error",
+                        "code": failure.code if failure is not None else "upstream_error",
+                        "param": None,
+                    },
+                })
+                if failed_output is None:
+                    failed_output = output
+            elif output.kind == "result":
+                for item in output.data:
+                    if isinstance(item, dict):
+                        copied = dict(item)
+                        if output.index > 0:
+                            copied["_slot_index"] = output.index
+                        data.append(copied)
+                    else:
+                        data.append(item)
+                image_urls.extend(output.image_urls)
+                if callable(result_callback) and output.data:
+                    result_callback([dict(item) for item in data])
+    finally:
+        close_iterator(outputs)
 
     if failed_output is not None and not data:
         failure = failed_output.failure or image_failure(
@@ -3137,6 +3429,8 @@ def collect_image_outputs(
         )
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
+    if slot_errors and data:
+        result["errors"] = slot_errors
     if not data:
         text = message or "".join(progress_parts).strip()
         if text:

@@ -187,9 +187,14 @@ def create_router() -> APIRouter:
         return await call.run(openai_v1_chat_complete.handle, payload)
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(
+            body: ResponseCreateRequest,
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        payload["base_url"] = resolve_image_base_url(request)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         image_response = has_response_image_generation_tool(payload)

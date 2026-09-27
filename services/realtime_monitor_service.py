@@ -325,6 +325,8 @@ class RealtimeMonitorService:
                 }
             )
             outcome = str(call_summary.get("outcome") or "unknown")
+            if outcome == "partial_success":
+                detail["status"] = "partial_success"
             successful_outcome = outcome in {"success", "partial_success"}
             stage = (
                 "completed"
@@ -354,10 +356,8 @@ class RealtimeMonitorService:
                 record[key] = "" if successful_outcome and key == "public_error" else call_summary[key]
             record["call_id"] = call_id
             record["status"] = (
-                "success"
-                if outcome == "partial_success"
-                else outcome
-                if outcome in {"success", "failed", "rate_limited", "text_review"}
+                outcome
+                if outcome in {"success", "partial_success", "failed", "rate_limited", "text_review"}
                 else "failed"
             )
             record["stage"] = stage
@@ -685,11 +685,11 @@ class RealtimeMonitorService:
     def _summary(self, active: list[dict[str, Any]], completed: list[dict[str, Any]]) -> dict[str, Any]:
         outcomes = Counter(str(item.get("outcome") or "unknown") for item in completed)
         partial_success = outcomes["partial_success"]
-        success = outcomes["success"] + partial_success
+        success = outcomes["success"]
         failed = outcomes["failed"] + outcomes["unknown"]
         rate_limited = outcomes["rate_limited"]
         text_review = outcomes["text_review"]
-        measured = success + failed + rate_limited
+        measured = success + partial_success + failed + rate_limited
         account_switch_requests = sum(1 for item in completed if _int_ms(item.get("switch_count")) > 0)
         account_switches = sum(_int_ms(item.get("switch_count")) for item in completed)
         account_switch_success = sum(

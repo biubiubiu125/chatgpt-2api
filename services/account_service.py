@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -46,6 +46,24 @@ from utils.helper import anonymize_token
 
 _RemoteCheckMarker = tuple[str, str, str, str, bool | None, str, str]
 _CredentialGeneration = tuple[str, str, str]
+
+
+def _image_selection_stopped(
+    deadline_monotonic: float | None,
+    stop_event: Event | None,
+) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return True
+    return deadline_monotonic is not None and time.monotonic() >= float(deadline_monotonic)
+
+
+def _raise_if_image_selection_stopped(
+    deadline_monotonic: float | None,
+    stop_event: Event | None,
+    message: str,
+) -> None:
+    if _image_selection_stopped(deadline_monotonic, stop_event):
+        raise ImageAccountSelectionError("deadline_exceeded", message)
 
 
 
@@ -1323,26 +1341,55 @@ class AccountService:
         account: dict | None = None,
         *,
         image_scope: bool = False,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, str]:
         from curl_cffi import requests
+        from services.openai_backend_api import call_until_image_stop
         from services.openai_oauth import refresh_token_headers
         from services.proxy_service import proxy_settings
 
         # Refresh uses the global proxy. A stored account proxy is registration-only.
         _ = account
+        _raise_if_image_selection_stopped(
+            deadline_monotonic,
+            stop_event,
+            "image request deadline exceeded before token refresh",
+        )
+        timeout = 60.0
+        if deadline_monotonic is not None and float(deadline_monotonic) > 0:
+            timeout = min(60.0, max(0.001, float(deadline_monotonic) - time.monotonic()))
         session = requests.Session(**proxy_settings.build_session_kwargs(impersonate=CHROME146_IMPERSONATE, verify=True))
         try:
             with account_processing_slot():
-                response = session.post(
-                    self._OAUTH_TOKEN_URL,
-                    headers=refresh_token_headers(),
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": self._OAUTH_CLIENT_ID,
-                    },
-                    timeout=60,
-                )
+                try:
+                    response = call_until_image_stop(
+                        lambda: session.post(
+                            self._OAUTH_TOKEN_URL,
+                            headers=refresh_token_headers(),
+                            data={
+                                "grant_type": "refresh_token",
+                                "refresh_token": refresh_token,
+                                "client_id": self._OAUTH_CLIENT_ID,
+                            },
+                            timeout=timeout,
+                        ),
+                        stop_event=stop_event,
+                        deadline_monotonic=deadline_monotonic,
+                        cleanup=session.close,
+                    )
+                except Exception as exc:
+                    _raise_if_image_selection_stopped(
+                        deadline_monotonic,
+                        stop_event,
+                        "image request deadline exceeded during token refresh",
+                    )
+                    if type(exc).__name__ == "ImageRequestStopped":
+                        raise ImageAccountSelectionError(
+                            "deadline_exceeded",
+                            "image request deadline exceeded during token refresh",
+                        ) from exc
+                    raise
             raw_text = self._safe_response_text(response)
             try:
                 data = response.json() if raw_text else {}
@@ -1578,16 +1625,27 @@ class AccountService:
         *,
         event: str,
         image_scope: bool,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str:
         try:
+            refresh_kwargs = {
+                "stop_event": stop_event,
+                "deadline_monotonic": deadline_monotonic,
+            }
             if image_scope:
                 token_data = self._request_access_token_refresh(
                     refresh_token,
                     account,
                     image_scope=True,
+                    **refresh_kwargs,
                 )
             else:
-                token_data = self._request_access_token_refresh(refresh_token, account)
+                token_data = self._request_access_token_refresh(
+                    refresh_token,
+                    account,
+                    **refresh_kwargs,
+                )
         except TerminalRefreshTokenError as exc:
             exc.expected_access_token = active_token
             exc.expected_refresh_token = refresh_token
@@ -1634,9 +1692,16 @@ class AccountService:
         image_scope: bool = False,
         expected_credentials: _CredentialGeneration | None = None,
         skip_if_image_busy: bool = False,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str:
         if not access_token:
             return ""
+        _raise_if_image_selection_stopped(
+            deadline_monotonic,
+            stop_event,
+            "image request deadline exceeded before token refresh",
+        )
         for credential_attempt in range(2):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
@@ -1702,6 +1767,8 @@ class AccountService:
                         account,
                         event=event,
                         image_scope=image_scope,
+                        stop_event=stop_event,
+                        deadline_monotonic=deadline_monotonic,
                     )
                 except BaseException as exc:
                     future.set_exception(exc)
@@ -1791,6 +1858,8 @@ class AccountService:
         image_scope: bool = False,
         expected_credentials: _CredentialGeneration | None = None,
         skip_if_image_busy: bool = False,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str:
         """Return a usable AT, renewing it through RT only when needed."""
         return self._maintain_access_token(
@@ -1801,6 +1870,8 @@ class AccountService:
             image_scope=image_scope,
             expected_credentials=expected_credentials,
             skip_if_image_busy=skip_if_image_busy,
+            stop_event=stop_event,
+            deadline_monotonic=deadline_monotonic,
         )
 
     def force_refresh_access_token(
@@ -1969,19 +2040,24 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline_monotonic: float | None = None,
+            stop_event: Event | None = None,
     ) -> str:
         while True:
             with self._image_slot_condition:
+                _raise_if_image_selection_stopped(
+                    deadline_monotonic,
+                    stop_event,
+                    "image request deadline exceeded while waiting for an account slot",
+                )
                 remaining = (
                     float(deadline_monotonic) - time.monotonic()
                     if deadline_monotonic is not None
                     else None
                 )
-                if remaining is not None and remaining <= 0:
-                    raise ImageAccountSelectionError(
-                        "deadline_exceeded",
-                        "image request deadline exceeded while waiting for an account slot",
-                    )
+                if stop_event is not None:
+                    slice_timeout = 0.05 if remaining is None else min(0.05, max(0.0, remaining))
+                else:
+                    slice_timeout = 1.0 if remaining is None else min(1.0, remaining)
                 # Token refresh can rotate an attempted account's access token while
                 # this request waits for a slot. Resolve aliases on every pass so the
                 # same account cannot be selected again under its refreshed token.
@@ -2013,9 +2089,7 @@ class AccountService:
                     self._record_image_slot_start_locked(access_token)
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
-                self._image_slot_condition.wait(
-                    timeout=min(1.0, remaining) if remaining is not None else 1.0
-                )
+                self._image_slot_condition.wait(timeout=slice_timeout)
             # The wait can outlive the account snapshot TTL. Refresh outside the
             # account lock before considering another candidate so a remote delete
             # or disable cannot be leased from the stale in-memory view.
@@ -2109,8 +2183,19 @@ class AccountService:
             self._image_inflight[access_token] = current_inflight - 1
             self._pop_image_slot_start_locked(access_token)
 
-    def _refresh_image_access_token(self, access_token: str) -> str:
+    def _refresh_image_access_token(
+        self,
+        access_token: str,
+        *,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> str:
         """Refresh an image AT only when it is missing or near expiry."""
+        _raise_if_image_selection_stopped(
+            deadline_monotonic,
+            stop_event,
+            "image request deadline exceeded before token refresh",
+        )
         account = self.get_account(access_token) or {}
         active = str(account.get("access_token") or access_token).strip()
         if not self._token_needs_refresh(active):
@@ -2124,6 +2209,8 @@ class AccountService:
             event="image_preflight_refresh",
             raise_on_error=True,
             image_scope=True,
+            stop_event=stop_event,
+            deadline_monotonic=deadline_monotonic,
         )
         refreshed = str(refreshed or "").strip()
         if not refreshed:
@@ -2149,6 +2236,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             excluded_tokens: set[str] | None = None,
             deadline_monotonic: float | None = None,
+            stop_event: Event | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -2156,11 +2244,11 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         self._refresh_accounts_snapshot_if_stale()
-        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-            raise ImageAccountSelectionError(
-                "deadline_exceeded",
-                "image request deadline exceeded before account selection",
-            )
+        _raise_if_image_selection_stopped(
+            deadline_monotonic,
+            stop_event,
+            "image request deadline exceeded before account selection",
+        )
         max_attempts = 20  # 防止无限循环
         externally_excluded = set(excluded_tokens or set())
         attempted_tokens: set[str] = set()
@@ -2176,6 +2264,7 @@ class AccountService:
                     source_type=source_type,
                     plan_types=plan_types,
                     deadline_monotonic=deadline_monotonic,
+                    stop_event=stop_event,
                 )
             except ImageAccountSelectionError as exc:
                 if exc.kind == "deadline_exceeded":
@@ -2184,17 +2273,28 @@ class AccountService:
                     break
                 raise
             attempted_tokens.add(access_token)
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                self.release_image_slot(access_token)
-                raise ImageAccountSelectionError(
-                    "deadline_exceeded",
+            try:
+                _raise_if_image_selection_stopped(
+                    deadline_monotonic,
+                    stop_event,
                     "image request deadline exceeded before remote account validation",
                 )
-            try:
-                refreshed = self._refresh_image_access_token(access_token)
-            except Exception as exc:
-                saw_unavailable_failure = True
+                refreshed = self._refresh_image_access_token(
+                    access_token,
+                    stop_event=stop_event,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except ImageAccountSelectionError:
                 self.release_image_slot(access_token)
+                raise
+            except Exception as exc:
+                self.release_image_slot(access_token)
+                _raise_if_image_selection_stopped(
+                    deadline_monotonic,
+                    stop_event,
+                    "image request deadline exceeded before remote account validation",
+                )
+                saw_unavailable_failure = True
                 self._log_image_preflight_refresh_failure(exc)
                 continue
             if refreshed != access_token:
@@ -2205,24 +2305,32 @@ class AccountService:
                     access_token,
                     "get_available_access_token",
                     image_scope=True,
+                    stop_event=stop_event,
+                    deadline_monotonic=deadline_monotonic,
                 )
+            except ImageAccountSelectionError:
+                self.release_image_slot(access_token)
+                raise
             except Exception:
                 # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
                 # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
-                saw_unavailable_failure = True
                 self.release_image_slot(access_token)
-                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                    raise ImageAccountSelectionError(
-                        "deadline_exceeded",
-                        "image request deadline exceeded during remote account validation",
-                    )
-                continue
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                self.release_image_slot(access_token)
-                raise ImageAccountSelectionError(
-                    "deadline_exceeded",
+                _raise_if_image_selection_stopped(
+                    deadline_monotonic,
+                    stop_event,
                     "image request deadline exceeded during remote account validation",
                 )
+                saw_unavailable_failure = True
+                continue
+            try:
+                _raise_if_image_selection_stopped(
+                    deadline_monotonic,
+                    stop_event,
+                    "image request deadline exceeded during remote account validation",
+                )
+            except ImageAccountSelectionError:
+                self.release_image_slot(access_token)
+                raise
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
             # 把新 token 也加入排除列表，防止重复尝试
             resolved = str((account or {}).get("access_token") or "")
@@ -4309,14 +4417,25 @@ class AccountService:
         image_scope: bool = False,
         allow_refresh_token_exchange: bool = True,
         preflight_refresh: bool = True,
+        stop_event: Event | None = None,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
+        _raise_if_image_selection_stopped(
+            deadline_monotonic,
+            stop_event,
+            "image request deadline exceeded before remote account validation",
+        )
 
         if allow_refresh_token_exchange and preflight_refresh:
             refresh_kwargs = {"event": f"{event}:preflight"}
             if image_scope:
                 refresh_kwargs["image_scope"] = True
+            if stop_event is not None:
+                refresh_kwargs["stop_event"] = stop_event
+            if deadline_monotonic is not None:
+                refresh_kwargs["deadline_monotonic"] = deadline_monotonic
             active_token = self.ensure_access_token(access_token, **refresh_kwargs)
         else:
             active_token = self.resolve_access_token(access_token) or access_token
@@ -4324,7 +4443,13 @@ class AccountService:
 
         def request_user_info(token: str) -> dict[str, Any]:
             with account_processing_slot():
-                with OpenAIBackendAPI(token, use_global_proxy=True) as backend:
+                with OpenAIBackendAPI(
+                    token,
+                    use_global_proxy=True,
+                    deadline_monotonic=deadline_monotonic,
+                ) as backend:
+                    if stop_event is not None:
+                        backend.bind_image_stop(stop_event)
                     return backend.get_user_info()
 
         request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)

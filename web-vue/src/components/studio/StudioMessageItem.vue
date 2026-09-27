@@ -188,32 +188,43 @@
               <div
                 v-else
                 class="studio-result-block"
-                :class="{ 'studio-result-block-pending': message.pendingSlots.length > 0 }"
+                :class="{ 'studio-result-block-pending': message.imageSlots.some((slot) => slot.state === 'pending') }"
               >
                 <div class="studio-result-grid" :class="{ 'is-single': message.imageSlotCount <= 1 }">
                   <div
-                    v-for="(asset, assetIndex) in message.assets"
-                    :key="`${message.id}-${assetIndex}`"
+                    v-for="slot in message.imageSlots"
+                    :key="`${message.id}-slot-${slot.index}`"
                     class="studio-result-item"
                   >
                     <button
+                      v-if="slot.state === 'image' && slot.asset"
                       type="button"
                       class="studio-result-media"
-                      :class="{ 'has-image': Boolean(asset.url) }"
-                      @click="$emit('preview', asset.url, `结果 ${assetIndex + 1}`, asset.path)"
+                      :class="{ 'has-image': Boolean(slot.asset.url) }"
+                      @click="$emit('preview', slot.asset.url, `图片 ${slot.index}`, slot.asset.path)"
                     >
                       <img
-                        v-if="asset.url"
-                        :src="asset.url"
-                        :alt="`结果 ${assetIndex + 1}`"
-                        :width="asset.width || undefined"
-                        :height="asset.height || undefined"
+                        v-if="slot.asset.url"
+                        :src="slot.asset.url"
+                        :alt="`图片 ${slot.index}`"
+                        :width="slot.asset.width || undefined"
+                        :height="slot.asset.height || undefined"
                         loading="lazy"
                       />
                       <span v-else>无图片 URL</span>
                     </button>
-                    <div v-if="asset.url" class="studio-result-caption">
-                      <span v-if="message.imageSlotCount > 1" class="studio-result-caption-label">结果 {{ assetIndex + 1 }}</span>
+                    <div v-else-if="slot.state === 'pending'" class="studio-result-media studio-result-placeholder">
+                      <Icon icon="lucide:loader-circle" class="h-5 w-5 animate-spin" />
+                      <span>正在处理图片</span>
+                      <small>{{ message.imagePendingStageText }}</small>
+                    </div>
+                    <div v-else class="studio-result-media studio-result-placeholder studio-result-placeholder-failed">
+                      <Icon icon="lucide:circle-x" class="h-5 w-5" />
+                      <span>未生成</span>
+                      <small v-if="slot.message" class="studio-result-failure-reason" :title="slot.message">{{ slot.message }}</small>
+                    </div>
+                    <div v-if="slot.state === 'image' && slot.asset?.url" class="studio-result-caption">
+                      <span v-if="message.imageSlotCount > 1" class="studio-result-caption-label">图片 {{ slot.index }}</span>
                       <div class="studio-result-actions">
                         <Button
                           size="xs"
@@ -221,7 +232,7 @@
                           root-class="studio-result-action"
                           title="引用到输入框"
                           aria-label="引用到输入框"
-                          @click="$emit('reference-image', asset, `结果 ${assetIndex + 1}`, message)"
+                          @click="$emit('reference-image', slot.asset, `图片 ${slot.index}`, message)"
                         >
                           <Icon icon="lucide:image-plus" class="h-3.5 w-3.5" />
                           <span>引用</span>
@@ -232,7 +243,7 @@
                           root-class="studio-result-action"
                           title="局部修改"
                           aria-label="局部修改"
-                          @click="$emit('inpaint-image', asset, `结果 ${assetIndex + 1}`, message)"
+                          @click="$emit('inpaint-image', slot.asset, `图片 ${slot.index}`, message)"
                         >
                           <Icon icon="lucide:scan-line" class="h-3.5 w-3.5" />
                           <span>局部</span>
@@ -244,41 +255,15 @@
                           root-class="studio-result-action"
                           title="对比原图"
                           aria-label="对比原图"
-                          @click="$emit('compare-image', message.inpaintSource, asset, `结果 ${assetIndex + 1}`)"
+                          @click="$emit('compare-image', message.inpaintSource, slot.asset, `图片 ${slot.index}`)"
                         >
                           <Icon icon="lucide:columns-2" class="h-3.5 w-3.5" />
                           <span>对比</span>
                         </Button>
                       </div>
                     </div>
-                  </div>
-
-                  <div
-                    v-for="slot in message.pendingSlots"
-                    :key="`${message.id}-pending-${slot}`"
-                    class="studio-result-item"
-                  >
-                    <div class="studio-result-media studio-result-placeholder">
-                      <Icon icon="lucide:loader-circle" class="h-5 w-5 animate-spin" />
-                      <span>正在处理图片</span>
-                      <small>{{ message.imagePendingStageText }}</small>
-                    </div>
-                    <div v-if="message.imageSlotCount > 1" class="studio-result-caption">
-                      <span>图片 {{ slot + 1 }}</span>
-                    </div>
-                  </div>
-
-                  <div
-                    v-for="slot in message.failedSlots"
-                    :key="`${message.id}-failed-${slot}`"
-                    class="studio-result-item"
-                  >
-                    <div class="studio-result-media studio-result-placeholder studio-result-placeholder-failed">
-                      <Icon icon="lucide:circle-x" class="h-5 w-5" />
-                      <span>未生成</span>
-                    </div>
-                    <div v-if="message.imageSlotCount > 1" class="studio-result-caption">
-                      <span>图片 {{ slot + 1 }}</span>
+                    <div v-else-if="message.imageSlotCount > 1" class="studio-result-caption">
+                      <span>图片 {{ slot.index }}</span>
                     </div>
                   </div>
                 </div>
@@ -331,6 +316,7 @@ import {
 } from './editableFileTaskView'
 import StudioMarkdownContent from './StudioMarkdownContent.vue'
 import type { StudioImageAssetView, StudioImageCompareSource, StudioMessage } from './types'
+import type { StudioImageSlot } from '@/views/studio/studioImageSlots'
 
 export type StudioMessageActionKey = 'copy' | 'edit' | 'resend' | 'fill' | 'resume-poll' | 'retry' | 'delete'
 
@@ -350,8 +336,7 @@ export type StudioMessageView = StudioMessage & {
   isPendingImageMessage: boolean
   isSingleImageResult: boolean
   imageSlotCount: number
-  pendingSlots: number[]
-  failedSlots: number[]
+  imageSlots: StudioImageSlot<StudioImageAssetView>[]
   imagePendingStageText: string
   primaryMessage: string
   imagePreviewStyle?: CSSProperties
@@ -391,11 +376,7 @@ function actionsForMessage(message: StudioMessageView): StudioMessageAction[] {
     if (message.content) actions.push({ key: 'edit', label: '编辑', icon: 'lucide:pencil' })
     actions.push({ key: 'resend', label: '重发', icon: 'lucide:refresh-cw' })
     if (message.content) actions.push({ key: 'fill', label: '填入', icon: 'lucide:clipboard-paste' })
-  } else if (
-    message.mode === 'image'
-    && isImageMessageWithoutResult(message)
-    && message.task?.actions.resume_poll
-  ) {
+  } else if (message.mode === 'image' && message.task?.actions.resume_poll) {
     actions.push({ key: 'resume-poll', label: '继续任务', icon: 'lucide:refresh-cw' })
   } else if (message.mode === 'file' ? fileTaskStatus(message) === 'error' : message.mode !== 'image' || isImageMessageWithoutResult(message)) {
     actions.push({ key: 'retry', label: '重试并重新提交', icon: 'lucide:refresh-cw' })
@@ -405,6 +386,7 @@ function actionsForMessage(message: StudioMessageView): StudioMessageAction[] {
 }
 
 function isImageTaskWithoutResult(task: ImageTask | undefined) {
+  if ((task?.succeeded_count || 0) > 0 || (task?.results.length || 0) > 0) return false
   return task?.status === 'failed' || task?.status === 'text_review'
 }
 
@@ -1443,6 +1425,15 @@ async function handleFileTaskDownload(
 .studio-result-placeholder small {
   color: hsl(var(--muted-foreground) / 0.78);
   font-size: 0.75rem;
+}
+
+.studio-result-placeholder small.studio-result-failure-reason {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: normal;
+  text-overflow: unset;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .studio-result-caption {

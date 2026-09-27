@@ -72,6 +72,7 @@ class DashboardAccountView(BaseModel):
 class DashboardTotalsView(BaseModel):
     total: int
     success: int
+    partial_success: int = 0
     final_failed: int
     success_rate: float | None
     avg_success_duration_ms: float | None
@@ -83,6 +84,7 @@ class DashboardBucketView(BaseModel):
     end_at: str
     total_calls: int
     success_calls: int
+    partial_success_calls: int = 0
     final_failed_calls: int
     success_rate: float | None
     avg_success_duration_ms: float | None
@@ -101,6 +103,7 @@ class DashboardSwitchingView(BaseModel):
 class DashboardTrendView(BaseModel):
     labels: list[str]
     success_requests: list[int]
+    partial_success_requests: list[int] = Field(default_factory=list)
     final_failed_requests: list[int]
     success_rate: list[float | None]
     switch_count: list[int]

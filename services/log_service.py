@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import itertools
 import re
@@ -13,6 +14,42 @@ import anyio
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body when the client goes away.
+
+    Current Starlette turns a failed body write into ClientDisconnect without
+    closing the iterator, so image slots and call logs would wait for GC.
+    A generator that never started does not run its own finally on aclose.
+    """
+
+    def __init__(self, content, *, on_close=None, **kwargs):
+        super().__init__(content, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await _aclose_stream(self.body_iterator)
+                if self._on_close is not None:
+                    await self._on_close()
+
+
+async def _aclose_stream(iterator: object) -> None:
+    aclose = getattr(iterator, "aclose", None)
+    if callable(aclose):
+        try:
+            await aclose()
+        except RuntimeError as exc:
+            if "already running" not in str(exc):
+                raise
+        return
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
 
 from services import image_generation_gate as image_gate
 
@@ -34,7 +71,7 @@ from utils.diagnostics import (
     exception_diagnostic_fields,
     scrub_diagnostic_value,
 )
-from utils.helper import anthropic_sse_stream, image_sse_stream, sse_json_stream
+from utils.helper import anthropic_sse_stream, close_iterator, image_request_count, image_sse_stream, sse_json_stream
 from utils.image_tokens import image_output_metadata
 from utils.log import logger
 from utils.timezone import beijing_from_timestamp, beijing_now_str
@@ -50,9 +87,11 @@ INTERNAL_RESPONSE_KEYS = {
     "_image_urls",
     "_image_attempts",
     "_image_metadata",
+    "_slot_index",
 }
 LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/image-thumbnails/)[^\s)\"']+)\)")
 PERF_WAIT_WARN_MS = 1000
+IMAGE_STREAM_KEEPALIVE_SECS = 15
 REQUEST_TEXT_EXCERPT_LIMIT = 1000
 REQUEST_TEXT_FULL_LIMIT = 50000
 
@@ -471,6 +510,138 @@ def _next_item(items):
         return False, None
 
 
+def _next_item_timed(items):
+    started = time.perf_counter()
+    try:
+        found, item = _next_item(items)
+    finally:
+        finished = time.perf_counter()
+    return found, item, started, finished
+
+
+def _is_sse_comment(item: object) -> bool:
+    return isinstance(item, str) and item.lstrip().startswith(":")
+
+
+def _frame_delivers_image(frame: object) -> bool:
+    """True only after the client can use an image, not a preamble or progress text."""
+    if isinstance(frame, (dict, list)):
+        try:
+            text = json.dumps(frame, ensure_ascii=False)
+        except TypeError:
+            return False
+    elif isinstance(frame, str):
+        text = frame
+    else:
+        return False
+    if _is_sse_comment(text):
+        return False
+    # response.completed repeats the image already sent in output_item.done.
+    # Counting it again turns a written image into an undelivered one when the
+    # client leaves on the final event.
+    if re.search(r'"type"\s*:\s*"response\.completed"', text):
+        return False
+    # Chat delivery is the markdown image itself. A progress delta that only
+    # mentions data:image/ or ![image_ is not an image the client can use.
+    if re.search(r"!\[image_\d+\]\([^)\s]+", text):
+        return True
+    fields = {
+        key: value
+        for key, value in re.findall(r'"([A-Za-z0-9_]+)"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    }
+    if fields.get("b64_json"):
+        return True
+    if fields.get("url") and (
+        "image_generation.completed" in text or "image_edit.completed" in text
+    ):
+        return True
+    return "image_generation_call" in text and bool(fields.get("result"))
+
+
+def _frame_reports_slot_failure(item: object) -> bool:
+    if isinstance(item, (dict, list)):
+        try:
+            text = json.dumps(item, ensure_ascii=False)
+        except TypeError:
+            text = ""
+    elif isinstance(item, str):
+        text = item
+    else:
+        text = ""
+    if "image_generation.failed" in text or "image_edit.failed" in text:
+        return True
+    return _image_slots_missing_success(collect_image_attempts(item))
+
+
+def _undelivered_image_failure_fields(
+    attempts: list[dict[str, object]],
+) -> tuple[str, dict[str, object]]:
+    """The public failure from image attempts when no image was written."""
+
+    code = ""
+    message = ""
+    for item in attempts:
+        status = str(item.get("status") or "").strip().lower()
+        if not status or status == "success":
+            continue
+        if not code:
+            code = str(item.get("error_code") or item.get("failure_code") or "").strip()
+        if not message:
+            message = str(item.get("public_error") or item.get("error") or "").strip()
+    extra: dict[str, object] = {}
+    if code:
+        extra["error_code"] = code
+    return message or "image generation failed", extra
+
+
+def _image_slots_missing_success(attempts: list[dict[str, object]]) -> bool:
+    """A slot fails only when none of its attempts succeeded.
+
+    Account retry keeps the failed attempt on the later success frame. That
+    history is diagnostic and must not turn a delivered image into a partial
+    success.
+    """
+    succeeded: set[int] = set()
+    failed: set[int] = set()
+    unslotted_failure = False
+    for item in attempts:
+        status = str(item.get("status") or "").strip().lower()
+        try:
+            slot = int(item.get("slot") or 0)
+        except (TypeError, ValueError):
+            slot = 0
+        if status == "success" and slot > 0:
+            succeeded.add(slot)
+            continue
+        if not status or status == "success":
+            continue
+        if slot > 0:
+            failed.add(slot)
+        else:
+            unslotted_failure = True
+    return unslotted_failure or bool(failed - succeeded)
+
+
+def _image_stream_keepalive_secs() -> float:
+    return max(0.001, float(IMAGE_STREAM_KEEPALIVE_SECS))
+
+
+def _undelivered_image_log_fields(image_attempts: list[dict[str, object]]) -> dict[str, object]:
+    """A generated image that never reached the client is not a delivered result."""
+    rewritten: list[dict[str, object]] = []
+    for item in image_attempts:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").lower()
+        if status == "success":
+            rewritten.append(dict(item, status="generated_not_delivered"))
+        else:
+            rewritten.append(dict(item))
+    if not rewritten:
+        return {}
+    return {"image_attempts": rewritten}
+
+
 @dataclass
 class LoggedCall:
     identity: dict[str, object]
@@ -502,6 +673,7 @@ class LoggedCall:
         admission = None
         admission_token = None
         image_limiter = None
+        cleanup_deferred = False
         try:
             if image_request:
                 try:
@@ -516,6 +688,9 @@ class LoggedCall:
                         extra=_exception_log_fields(exc, image=image_request),
                     )
                     return _image_error_response(exc)
+                except HTTPException as exc:
+                    self.log("调用失败", status="failed", error=str(exc.detail))
+                    raise
                 admission_token = image_gate.image_generation_gate.bind(admission)
                 image_limiter = image_gate.image_generation_gate.handler_limiter()
             handler_submitted = time.perf_counter()
@@ -593,6 +768,30 @@ class LoggedCall:
                     sender = lambda items: sse_json_stream(items, error_builder=_image_error_payload)
                 else:
                     sender = sse_json_stream
+            if image_request:
+                formatted = sender(self.stream(result))
+                self._image_keepalive_items = formatted
+                self._image_keepalive_generator = result
+                self._image_keepalive_admission = admission
+                self._image_keepalive_token = admission_token
+                self._image_keepalive_limiter = image_limiter
+                body = self._iterate_image_stream_keepalive(
+                    formatted,
+                    result,
+                    admission,
+                    admission_token,
+                )
+                response = _ClosingStreamingResponse(
+                    body,
+                    on_close=self._close_image_keepalive_response,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                cleanup_deferred = True
+                return response
             first_item_submitted = time.perf_counter()
 
             def _next_item_with_timing():
@@ -642,18 +841,15 @@ class LoggedCall:
             if not has_first:
                 self.log("流式调用结束")
                 body = sender(())
-                if image_request:
-                    body = self._iterate_image_stream(body, result)
                 return StreamingResponse(body, media_type="text/event-stream")
             body = sender(self.stream(itertools.chain([first], result)))
-            if image_request:
-                body = self._iterate_image_stream(body, result)
             return StreamingResponse(body, media_type="text/event-stream")
         finally:
-            if admission_token is not None:
-                image_gate.image_generation_gate.unbind(admission_token)
-            if admission is not None and not admission.handed_off:
-                image_gate.image_generation_gate.release(admission)
+            if not cleanup_deferred:
+                if admission_token is not None:
+                    image_gate.image_generation_gate.unbind(admission_token)
+                if admission is not None and not admission.handed_off:
+                    image_gate.image_generation_gate.release(admission)
 
     async def _reserve_image_admission(self, args):
         gate = image_gate.image_generation_gate
@@ -684,12 +880,7 @@ class LoggedCall:
     def _image_slot_count(args) -> int:
         if not args or not isinstance(args[0], dict):
             return 1
-        raw = args[0].get("n", 1)
-        try:
-            count = int(raw or 1)
-        except (TypeError, ValueError):
-            count = 1
-        return min(4, max(1, count))
+        return image_request_count(args[0])
 
     @staticmethod
     async def _run_on_limiter(func, limiter):
@@ -697,39 +888,332 @@ class LoggedCall:
             return await run_in_threadpool(func)
         return await anyio.to_thread.run_sync(func, limiter=limiter)
 
-    async def _iterate_image_stream(self, items, image_generator=None):
+    def _abandon_open_image_request(self) -> None:
+        admission = getattr(self, "_image_keepalive_admission", None)
+        event = getattr(admission, "abandoned", None)
+        if event is not None:
+            event.set()
+
+    async def _iterate_image_stream_keepalive(self, items, image_generator, admission, admission_token):
         iterator = iter(items)
         limiter = image_gate.image_generation_gate.handler_limiter()
+        self._image_keepalive_items = items
+        self._image_keepalive_generator = image_generator
+        self._image_keepalive_admission = admission
+        self._image_keepalive_token = admission_token
+        self._image_keepalive_limiter = limiter
+        pending: asyncio.Task | None = None
+        pending_frame = ""
+        frame_timing: tuple[float, float, float] | None = None
         try:
-            while True:
-                has_item, item = await anyio.to_thread.run_sync(_next_item, iterator, limiter=limiter)
-                if not has_item:
-                    break
-                yield item
-        finally:
-            def _close_streams() -> None:
-                first_error: Exception | None = None
-                for candidate in (iterator, image_generator):
-                    close = getattr(candidate, "close", None)
-                    if close is None:
+            try:
+                yield ": keep-alive\n\n"
+                while True:
+                    if pending is None:
+                        submitted = time.perf_counter()
+                        pending = asyncio.create_task(
+                            anyio.to_thread.run_sync(_next_item_timed, iterator, limiter=limiter)
+                        )
+                    done, _waiting = await asyncio.wait(
+                        {pending},
+                        timeout=_image_stream_keepalive_secs(),
+                    )
+                    if pending not in done:
+                        if not pending_frame:
+                            yield ": keep-alive\n\n"
                         continue
-                    try:
-                        close()
-                    except Exception as exc:
-                        if first_error is None:
-                            first_error = exc
-                if first_error is not None:
-                    raise first_error
+                    found, item, started, finished = pending.result()
+                    pending = None
+                    if (
+                        _frame_delivers_image(item)
+                        and getattr(self, "_image_metric_origin", None) is None
+                    ):
+                        self._image_metric_origin = (submitted, started)
+                    if not found:
+                        if pending_frame:
+                            yield pending_frame
+                            self._note_image_frame_sent(pending_frame, frame_timing)
+                        break
+                    if not isinstance(item, str):
+                        if pending_frame:
+                            yield pending_frame
+                            self._note_image_frame_sent(pending_frame, frame_timing)
+                            pending_frame = ""
+                            frame_timing = None
+                        yield item
+                        self._note_image_frame_sent(item, (submitted, started, finished))
+                        continue
+                    if frame_timing is None:
+                        frame_timing = (submitted, started, finished)
+                    pending_frame += item
+                    if not pending_frame.endswith("\n\n"):
+                        continue
+                    frame = pending_frame
+                    timing = frame_timing
+                    pending_frame = ""
+                    frame_timing = None
+                    yield frame
+                    self._note_image_frame_sent(frame, timing)
+            except (GeneratorExit, asyncio.CancelledError):
+                self._image_client_closed = True
+                raise
+        finally:
             with anyio.CancelScope(shield=True):
-                await anyio.to_thread.run_sync(_close_streams, limiter=limiter)
+                try:
+                    if (
+                        getattr(self, "_image_client_closed", False)
+                        and not getattr(self, "_image_business_frame_sent", False)
+                    ):
+                        self._image_delivery_abandoned = True
+                    if pending is not None and not pending.done():
+                        self._abandon_open_image_request()
+                        try:
+                            await pending
+                        except Exception:
+                            pass
+                finally:
+                    await self._ensure_image_keepalive_closed()
+
+    def _queue_image_delivery(self, item: object) -> None:
+        if not _frame_delivers_image(item):
+            return
+        pending = getattr(self, "_pending_image_deliveries", None)
+        if pending is None:
+            pending = []
+            self._pending_image_deliveries = pending
+        pending.append({
+            "metrics": image_result_metrics(item),
+            "urls": _collect_urls(item),
+            "account_emails": _collect_account_emails(item),
+            "conversation_ids": _collect_conversation_ids(item),
+            "image_attempts": collect_image_attempts(item),
+        })
+
+    def _commit_sent_image_delivery(self) -> None:
+        pending = getattr(self, "_pending_image_deliveries", None)
+        if not pending:
+            return
+        sent = getattr(self, "_sent_image_deliveries", None)
+        if sent is None:
+            sent = []
+            self._sent_image_deliveries = sent
+        sent.append(pending.pop(0))
+
+    def _log_delivered_image_stream(self) -> None:
+        sent = list(getattr(self, "_sent_image_deliveries", []) or [])
+        pending = list(getattr(self, "_pending_image_deliveries", []) or [])
+
+        def merge(records: list[dict[str, object]]):
+            metrics: dict[str, object] = {}
+            urls: list[str] = []
+            emails: list[str] = []
+            conversation_ids: list[str] = []
+            attempts: list[dict[str, object]] = []
+            for record in records:
+                item_metrics = record.get("metrics")
+                if isinstance(item_metrics, dict):
+                    for key, value in item_metrics.items():
+                        if key == "result_images" and isinstance(value, list):
+                            metrics.setdefault(key, []).extend(value)
+                        elif isinstance(value, int):
+                            metrics[key] = int(metrics.get(key, 0) or 0) + value
+                urls.extend(url for url in record.get("urls") or [] if isinstance(url, str))
+                emails.extend(email for email in record.get("account_emails") or [] if isinstance(email, str))
+                conversation_ids.extend(
+                    item for item in record.get("conversation_ids") or [] if isinstance(item, str)
+                )
+                attempts = collect_image_attempts([attempts, record.get("image_attempts")])
+            return metrics, urls, emails, conversation_ids, attempts
+
+        metrics, urls, emails, conversation_ids, attempts = merge(sent)
+        _, _, _, _, undelivered = merge(pending)
+        extra = dict(metrics)
+
+        def attempt_identity(item: dict[str, object]) -> tuple[int, int] | None:
+            try:
+                slot = int(item.get("slot") or 0)
+                attempt_no = int(item.get("attempt") or 0)
+            except (TypeError, ValueError):
+                return None
+            if slot <= 0 or attempt_no <= 0:
+                return None
+            return slot, attempt_no
+
+        delivered_keys = {
+            key for item in attempts if (key := attempt_identity(item)) is not None
+        }
+        # One slot can emit several image frames with the same attempt. A later
+        # frame that was not written must not replace the success of a frame
+        # that was already written.
+        undelivered_attempts = [
+            dict(item, status="generated_not_delivered")
+            for item in undelivered
+            if (key := attempt_identity(item)) is None or key not in delivered_keys
+        ]
+        combined = [*attempts, *undelivered_attempts]
+        seen_failures: list[dict[str, object]] = []
+        for item in collect_image_attempts(getattr(self, "_observed_image_attempts", None)):
+            status = str(item.get("status") or "").strip().lower()
+            if not status or status == "success":
+                continue
+            key = attempt_identity(item)
+            if key is not None and key in delivered_keys:
+                continue
+            seen_failures.append(dict(item))
+        existing = {
+            key for item in combined if (key := attempt_identity(item)) is not None
+        }
+        for item in seen_failures:
+            key = attempt_identity(item)
+            if key is not None and key in existing:
+                continue
+            combined.append(item)
+            if key is not None:
+                existing.add(key)
+        if combined:
+            extra["image_attempts"] = combined
+            slot_failed = _image_slots_missing_success(combined)
+        else:
+            slot_failed = bool(getattr(self, "_image_slot_failure_seen", False))
+        error = ""
+        if not sent and slot_failed:
+            status = "failed"
+            error, failure_fields = _undelivered_image_failure_fields(combined)
+            extra.update(failure_fields)
+        elif sent and (pending or slot_failed):
+            status = "partial_success"
+        else:
+            status = "success"
+        self.log(
+            "流式调用结束",
+            status=status,
+            error=error,
+            urls=urls,
+            account_email=emails[0] if emails else "",
+            conversation_id=conversation_ids[0] if conversation_ids else "",
+            extra=extra,
+        )
+
+    def _note_image_frame_sent(self, frame: object, timing: tuple[float, float, float] | None = None) -> None:
+        if not _frame_delivers_image(frame):
+            return
+        self._commit_sent_image_delivery()
+        self._image_business_frame_sent = True
+        if getattr(self, "_image_first_metric_noted", False):
+            return
+        origin = getattr(self, "_image_metric_origin", None)
+        if timing is not None:
+            submitted, started, finished = timing
+        elif origin is not None:
+            submitted, started = origin
+            finished = started
+        else:
+            return
+        self._note_stream_first_item(submitted, started, finished)
+        self._image_first_metric_noted = True
+
+    async def _close_image_keepalive_response(self) -> None:
+        if getattr(self, "_image_keepalive_closed", False):
+            return
+        if not getattr(self, "_image_business_frame_sent", False):
+            self._image_delivery_abandoned = True
+        await self._ensure_image_keepalive_closed()
+
+    async def _ensure_image_keepalive_closed(self) -> None:
+        if getattr(self, "_image_keepalive_closed", False):
+            return
+        self._image_keepalive_closed = True
+        try:
+            await self._close_image_iterators(
+                getattr(self, "_image_keepalive_items", None),
+                getattr(self, "_image_keepalive_generator", None),
+                getattr(self, "_image_keepalive_limiter", None),
+            )
+        finally:
+            self._finish_deferred_image_admission(
+                getattr(self, "_image_keepalive_admission", None),
+                getattr(self, "_image_keepalive_token", None),
+            )
+            if not getattr(self, "_stream_started", False):
+                if getattr(self, "_image_delivery_abandoned", False):
+                    self._log_image_client_disconnected()
+                else:
+                    self.log("流式调用结束")
+
+    def _log_image_client_disconnected(
+        self,
+        *,
+        urls: list[str] | None = None,
+        account_email: str = "",
+        conversation_id: str = "",
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        fields: dict[str, object] = {"error_code": "client_disconnected"}
+        if extra:
+            fields.update(extra)
+            fields["error_code"] = "client_disconnected"
+        self.log(
+            "流式调用失败",
+            status="failed",
+            error="client disconnected before the image was delivered",
+            urls=urls,
+            account_email=account_email,
+            conversation_id=conversation_id,
+            extra=fields,
+        )
+
+    def _note_stream_first_item(self, submitted: float, started: float, finished: float) -> None:
+        if not self._trace_image_perf():
+            return
+        queue_ms = int((started - submitted) * 1000)
+        self.perf_timings["stream_first_queue_ms"] = queue_ms
+        realtime_monitor_service.stage(
+            self.call_id,
+            "stream_first_item",
+            stream_first_queue_ms=queue_ms,
+            endpoint=self.endpoint,
+            model=self.model,
+        )
+        if queue_ms >= PERF_WAIT_WARN_MS:
+            logger.warning({
+                "event": "api_stream_first_item_threadpool_wait_slow",
+                "call_id": self.call_id,
+                "endpoint": self.endpoint,
+                "model": self.model,
+                "queue_ms": queue_ms,
+            })
+        self.perf_timings["stream_first_exec_ms"] = int((finished - started) * 1000)
+
+    @staticmethod
+    async def _close_image_iterators(iterator, image_generator, limiter) -> None:
+        def _close_streams() -> None:
+            first_error: Exception | None = None
+            for candidate in (iterator, image_generator):
+                close = getattr(candidate, "close", None)
+                if close is None:
+                    continue
+                try:
+                    close()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        await anyio.to_thread.run_sync(_close_streams, limiter=limiter)
+
+    @staticmethod
+    def _finish_deferred_image_admission(admission, admission_token) -> None:
+        try:
+            if admission_token is not None:
+                image_gate.image_generation_gate.unbind(admission_token)
+        finally:
+            if admission is None or admission.handed_off or admission.state != "open":
+                return
+            image_gate.image_generation_gate.release(admission)
 
     def _is_image_request(self) -> bool:
-        if self.image_request or self.endpoint.startswith("/v1/images"):
-            return True
-        model = str(self.model or "").strip().lower()
-        if self.endpoint in {"/v1/chat/completions", "/v1/responses"}:
-            return "image" in model
-        return False
+        return bool(self.image_request) or self.endpoint.startswith("/v1/images")
 
     def _trace_image_perf(self) -> bool:
         return self._is_image_request()
@@ -744,6 +1228,7 @@ class LoggedCall:
         self.trace_metadata.update(image_request_metadata(body))
 
     def stream(self, items):
+        self._stream_started = True
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
@@ -751,9 +1236,15 @@ class LoggedCall:
         result_metrics: dict[str, Any] = {}
         failed = False
         image_request = self._is_image_request()
+        if image_request:
+            self._pending_image_deliveries = []
+            self._sent_image_deliveries = []
         try:
             for item in items:
                 if image_request:
+                    self._queue_image_delivery(item)
+                    if _frame_reports_slot_failure(item):
+                        self._image_slot_failure_seen = True
                     for key, value in image_result_metrics(item).items():
                         if key == "result_images":
                             result_metrics.setdefault(key, []).extend(value)
@@ -765,6 +1256,8 @@ class LoggedCall:
                 image_attempts = collect_image_attempts([image_attempts, item])
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
+            if image_request and getattr(self, "_image_delivery_abandoned", False):
+                raise
             failed = True
             extra = _exception_log_fields(exc, image=image_request)
             extra.update(result_metrics)
@@ -794,12 +1287,34 @@ class LoggedCall:
                 ) from exc
             raise
         finally:
-            if not failed:
-                extra = dict(result_metrics)
-                if image_attempts:
-                    extra["image_attempts"] = image_attempts
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
-                         conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra)
+            self._observed_image_attempts = image_attempts
+            try:
+                if not failed:
+                    if getattr(self, "_image_delivery_abandoned", False):
+                        self._log_image_client_disconnected(
+                            account_email=account_emails[0] if account_emails else "",
+                            conversation_id=conversation_ids[0] if conversation_ids else "",
+                            extra=_undelivered_image_log_fields(image_attempts),
+                        )
+                    elif image_request and hasattr(self, "_sent_image_deliveries"):
+                        pending = getattr(self, "_pending_image_deliveries", []) or []
+                        sent = getattr(self, "_sent_image_deliveries", []) or []
+                        if pending and not sent:
+                            self._log_image_client_disconnected(
+                                account_email=account_emails[0] if account_emails else "",
+                                conversation_id=conversation_ids[0] if conversation_ids else "",
+                                extra=_undelivered_image_log_fields(image_attempts),
+                            )
+                        else:
+                            self._log_delivered_image_stream()
+                    else:
+                        extra = dict(result_metrics)
+                        if image_attempts:
+                            extra["image_attempts"] = image_attempts
+                        self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                                 conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra)
+            finally:
+                close_iterator(items)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",

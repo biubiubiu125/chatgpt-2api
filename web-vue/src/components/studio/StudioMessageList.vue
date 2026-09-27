@@ -59,6 +59,7 @@ import StudioMessageItem, {
   type StudioMessageActionKey,
   type StudioMessageView,
 } from './StudioMessageItem.vue'
+import { buildStudioImageSlots } from '@/views/studio/studioImageSlots'
 import type {
   StudioConversation,
   StudioImageAssetView,
@@ -150,12 +151,20 @@ function buildMessageView(message: StudioMessage): StudioMessageView {
   }
   const assets = buildImageAssetViews(taskAssets)
   const isPendingImageMessage = isImageMessage && (task ? !task.terminal : isLocalImageMessagePending(message))
-  const pendingSlotCount = isPendingImageMessage
-    ? (task ? task.pending_count : imageSlotCount)
-    : 0
-  const pendingSlotStart = task ? task.succeeded_count : 0
-  const failedSlotCount = task?.terminal ? task.failed_count : 0
-  const failedSlotStart = task ? task.succeeded_count : 0
+  const imageSlots = isImageMessage
+    ? buildStudioImageSlots({
+      requestedCount: imageSlotCount,
+      terminal: Boolean(task?.terminal),
+      assets: taskAssets.filter((asset) => imageAssetUrl(asset)),
+      slotFailures: task?.slot_failures || [],
+      publicError: task?.public_error || message.error || '',
+    }).map((slot) => ({
+      index: slot.index,
+      state: slot.state,
+      message: slot.message,
+      asset: slot.asset ? buildImageAssetViews([slot.asset])[0] || null : null,
+    }))
+    : []
   const revision = (cached?.revision || 0) + 1
   const view: StudioMessageView = {
     ...message,
@@ -167,8 +176,7 @@ function buildMessageView(message: StudioMessage): StudioMessageView {
     isPendingImageMessage,
     isSingleImageResult: isImageMessage && !isPendingImageMessage && imageSlotCount === 1 && assets.length === 1,
     imageSlotCount,
-    pendingSlots: Array.from({ length: pendingSlotCount }, (_, index) => pendingSlotStart + index),
-    failedSlots: Array.from({ length: failedSlotCount }, (_, index) => failedSlotStart + index),
+    imageSlots,
     imagePendingStageText: task?.stage_label || '正在提交',
     primaryMessage: task?.public_error || '',
     imagePreviewStyle: isImageMessage ? buildImagePreviewStyle(message, task, imageSlotCount, assets) : undefined,
@@ -231,6 +239,7 @@ function messageViewSignature(
     task?.stage_code,
     task?.stage_label,
     compactStringSignature(task?.public_error),
+    (task?.slot_failures || []).map((item) => `${item.index}:${item.code}:${compactStringSignature(item.message)}`).join('\u001e'),
     task?.error_code,
     task?.actions.resume_poll,
     fileTask?.id,
@@ -308,6 +317,7 @@ function assetSignature(asset: ImageTaskAsset) {
     compactStringSignature(asset.url),
     compactStringSignature(asset.path),
     compactStringSignature(asset.b64_json),
+    asset.slot_index ?? '',
     positiveDimension(asset.width) || '',
     positiveDimension(asset.height) || '',
   ].join('\u001f')

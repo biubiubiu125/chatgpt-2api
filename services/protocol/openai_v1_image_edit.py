@@ -12,9 +12,11 @@ from services.protocol.conversation import (
     collect_image_outputs,
     count_text_tokens,
     encode_images,
+    ensure_supported_image_model,
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from utils.helper import run_until_image_stop
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -49,19 +51,57 @@ def _composite_mask(
     return result
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def _require_edit_images(images: list) -> None:
+    if any(item and item[0] for item in images):
+        return
+    raise ImageGenerationError(
+        "image is required",
+        failure=image_failure("invalid_image_input"),
+    )
+
+
+def _require_readable_edit_inputs(
+    images: list[tuple[bytes, str, str]],
+    masks: list[tuple[bytes, str, str]],
+) -> None:
+    """Reject an unreadable mask before the stream opens. Composition itself waits."""
+    if not masks:
+        return
+    try:
+        for item in (*images, *masks):
+            data = item[0] if item else b""
+            if not data:
+                continue
+            with Image.open(BytesIO(data)) as img:
+                img.verify()
+    except (OSError, ValueError) as exc:
+        raise ImageGenerationError(
+            "image is invalid",
+            failure=image_failure("invalid_image_input"),
+        ) from exc
+
+
+def _prepared_edit_images(body: dict[str, Any]) -> list[tuple[bytes, str, str]]:
+    try:
+        return _composite_mask(body.get("images") or [], body.get("mask") or [])
+    except (OSError, ValueError) as exc:
+        raise ImageGenerationError(
+            "image is invalid",
+            failure=image_failure("invalid_image_input"),
+        ) from exc
+
+
+def _edit_outputs(
+    body: dict[str, Any],
+    images: list[tuple[bytes, str, str]] | None = None,
+):
     prompt = str(body.get("prompt") or "")
-    images = body.get("images") or []
-    masks = body.get("mask") or []
-    images = _composite_mask(images, masks)
+    if images is None:
+        images = run_until_image_stop(lambda: _prepared_edit_images(body))
     model = str(body.get("model") or "gpt-image-2")
-    n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
-    response_format = str(body.get("response_format") or "b64_json")
-    base_url = str(body.get("base_url") or "") or None
-    progress_callback = body.get("progress_callback")
-    encoded_images = encode_images(images)
+    encoded_images = run_until_image_stop(lambda: encode_images(images))
     if not encoded_images:
         raise ImageGenerationError(
             "image is required",
@@ -70,31 +110,48 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
-        n=n,
+        n=int(body.get("n") or 1),
         size=size,
         quality=quality,
-        response_format=response_format,
-        base_url=base_url,
+        response_format=str(body.get("response_format") or "b64_json"),
+        base_url=str(body.get("base_url") or "") or None,
         images=encoded_images,
         message_as_error=True,
-        progress_callback=progress_callback,
+        progress_callback=body.get("progress_callback"),
         session_checkpoint=body.get("session_checkpoint"),
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
+    return prompt, model, images, size, quality, outputs
+
+
+def _stream_edit(
+    body: dict[str, Any],
+    images: list[tuple[bytes, str, str]] | None = None,
+) -> Iterator[dict[str, Any]]:
+    prompt, model, images, size, quality, outputs = _edit_outputs(body, images)
+    input_text_tokens = count_text_tokens(prompt, model)
+    input_image_tokens = count_image_inputs_tokens(images, model)
+    yield from stream_image_chunks(
+        outputs,
+        event_prefix="image_edit",
+        partial_images=body.get("partial_images"),
+        usage_builder=lambda data: image_usage(
+            input_text_tokens=input_text_tokens,
+            input_image_tokens=input_image_tokens,
+            output_tokens=count_image_output_items_tokens(data, size, quality),
+        ),
+    )
+
+
+def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    _require_edit_images(body.get("images") or [])
+    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    ensure_supported_image_model(model)
     if body.get("stream"):
-        input_text_tokens = count_text_tokens(prompt, model)
-        input_image_tokens = count_image_inputs_tokens(images, model)
-        return stream_image_chunks(
-            outputs,
-            event_prefix="image_edit",
-            partial_images=body.get("partial_images"),
-            usage_builder=lambda data: image_usage(
-                input_text_tokens=input_text_tokens,
-                input_image_tokens=input_image_tokens,
-                output_tokens=count_image_output_items_tokens(data, size, quality),
-            ),
-        )
+        _require_readable_edit_inputs(body.get("images") or [], body.get("mask") or [])
+        return _stream_edit(body)
+    prompt, model, images, size, quality, outputs = _edit_outputs(body)
     result = collect_image_outputs(outputs, result_callback=body.get("_image_result_callback"))
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),

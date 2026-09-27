@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from services.image_failure import image_failure
+from services.image_failure import is_text_review_failure_code
 
 
 TERMINAL_STATUSES = frozenset({"success", "partial_success", "failed", "text_review"})
@@ -35,6 +36,7 @@ _TERMINAL_STAGE_LABELS = {
 _ASSET_TEXT_FIELDS = ("url", "path", "b64_json", "revised_prompt")
 _ASSET_DIMENSION_FIELDS = ("width", "height")
 _ASSET_PAYLOAD_FIELDS = ("url", "b64_json")
+_SLOT_FAILURE_TEXT = re.compile(r"第\s*(\d+)\s*张失败：([^；]*)")
 
 
 def _text(value: object, default: str = "") -> str:
@@ -71,6 +73,44 @@ def _asset_dimension(value: object) -> int | None:
     return parsed if parsed and parsed > 0 else None
 
 
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _slot_index(raw: Mapping[str, object]) -> int | None:
+    return _positive_int(raw.get("slot_index")) or _positive_int(raw.get("_slot_index"))
+
+
+def _slot_failures(raw: Mapping[str, object]) -> list[dict[str, Any]]:
+    stored = raw.get("slot_failures")
+    records: list[dict[str, Any]] = []
+    if isinstance(stored, list):
+        for item in stored:
+            if not isinstance(item, Mapping):
+                continue
+            index = _positive_int(item.get("index"))
+            message = _text(item.get("message"))
+            if not index or not message:
+                continue
+            records.append({
+                "index": index,
+                "message": message,
+                "code": _text(item.get("code")),
+            })
+    if records:
+        return records
+    text = _text(raw.get("public_error") or raw.get("error"))
+    parsed: list[dict[str, Any]] = []
+    for match in _SLOT_FAILURE_TEXT.finditer(text):
+        index = int(match.group(1))
+        message = match.group(2).strip()
+        if index > 0 and message:
+            parsed.append({"index": index, "message": message, "code": ""})
+    return parsed
+
+
 def _asset(raw: object) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
@@ -82,6 +122,7 @@ def _asset(raw: object) -> dict[str, Any] | None:
         return None
     for field in _ASSET_DIMENSION_FIELDS:
         result[field] = _asset_dimension(raw.get(field))
+    result["slot_index"] = _slot_index(raw)
     return result
 
 
@@ -106,9 +147,13 @@ def _status(raw: Mapping[str, object], result_count: int, requested_count: int) 
         return "failed"
     if raw_status == "error":
         status_code = _non_negative_int_or_none(raw.get("status_code"))
-        failure = image_failure(_text(raw.get("error_code")))
-        if status_code == 400 or failure.outcome == "text":
+        code = _text(raw.get("error_code"))
+        if is_text_review_failure_code(code) or (status_code == 400 and not code):
             return "text_review"
+        if result_count >= requested_count:
+            return "success"
+        if result_count > 0:
+            return "partial_success"
     return "failed"
 
 
@@ -147,6 +192,7 @@ def image_task_row(
     requested_count = _image_count(raw.get("requested_count", raw.get("n")))
     results = _results(raw)[:requested_count]
     succeeded_count = len(results)
+    raw_status = _text(raw.get("status")).lower()
     status = _status(raw, len(results), requested_count)
     terminal = status in TERMINAL_STATUSES
     if terminal and status != "text_review":
@@ -184,9 +230,14 @@ def image_task_row(
         ),
         "error_code": error_code,
         "public_error": public_error,
+        "slot_failures": _slot_failures(raw),
         "results": results,
         "actions": {
-            "resume_poll": status == "failed" and raw.get("can_resume_poll") is True,
+            "resume_poll": (
+                raw.get("can_resume_poll") is True
+                and raw_status == "error"
+                and status in {"failed", "partial_success"}
+            ),
         },
     }
 

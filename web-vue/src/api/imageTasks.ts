@@ -10,6 +10,13 @@ export interface ImageTaskAsset {
   revised_prompt: string
   width: number | null
   height: number | null
+  slot_index: number | null
+}
+
+export interface ImageTaskSlotFailure {
+  index: number
+  message: string
+  code: string
 }
 
 export interface ImageTaskActions {
@@ -36,6 +43,7 @@ export interface ImageTask {
   elapsed_ms: number | null
   error_code: string
   public_error: string
+  slot_failures: ImageTaskSlotFailure[]
   results: ImageTaskAsset[]
   actions: ImageTaskActions
 }
@@ -264,6 +272,16 @@ function parseTaskAsset(value: unknown, path: string): ImageTaskAsset {
     revised_prompt: expectString(asset.revised_prompt, `${path}.revised_prompt`),
     width,
     height,
+    slot_index: expectNullableInteger(asset.slot_index, `${path}.slot_index`),
+  }
+}
+
+function parseSlotFailure(value: unknown, path: string): ImageTaskSlotFailure {
+  const failure = expectObject(value, path)
+  return {
+    index: expectInteger(failure.index, `${path}.index`, 1),
+    message: expectString(failure.message, `${path}.message`),
+    code: expectString(failure.code, `${path}.code`),
   }
 }
 
@@ -274,6 +292,9 @@ function parseImageTask(value: unknown, path = 'response'): ImageTask {
   const results = Array.isArray(raw.results)
     ? raw.results.map((asset, index) => parseTaskAsset(asset, `${path}.results[${index}]`))
     : imageTaskContractError(`${path}.results`, 'array')
+  const slotFailures = Array.isArray(raw.slot_failures)
+    ? raw.slot_failures.map((failure, index) => parseSlotFailure(failure, `${path}.slot_failures[${index}]`))
+    : imageTaskContractError(`${path}.slot_failures`, 'array')
   const requestedCount = expectInteger(raw.requested_count, `${path}.requested_count`, 1)
   if (requestedCount > 4) imageTaskContractError(`${path}.requested_count`, 'integer between 1 and 4')
   const succeededCount = expectInteger(raw.succeeded_count, `${path}.succeeded_count`)
@@ -306,6 +327,7 @@ function parseImageTask(value: unknown, path = 'response'): ImageTask {
     elapsed_ms: expectNullableInteger(raw.elapsed_ms, `${path}.elapsed_ms`),
     error_code: expectString(raw.error_code, `${path}.error_code`),
     public_error: expectString(raw.public_error, `${path}.public_error`),
+    slot_failures: slotFailures,
     results,
     actions: {
       resume_poll: expectBoolean(actions.resume_poll, `${path}.actions.resume_poll`),

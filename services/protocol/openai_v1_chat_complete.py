@@ -16,7 +16,9 @@ from services.protocol.conversation import (
     count_message_text_tokens,
     count_text_tokens,
     encode_images,
+    ensure_supported_image_model,
     normalize_messages,
+    raise_if_no_delivered_image,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
@@ -30,7 +32,15 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import (
+    build_chat_image_markdown_content,
+    close_iterator,
+    extract_chat_image,
+    extract_chat_prompt,
+    image_request_count,
+    is_image_chat_request,
+    run_until_image_stop,
+)
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -187,7 +197,7 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
         for idx, (data, mime) in enumerate(extract_chat_image(body), start=1)
     ]
     base_url = str(body.get("base_url") or "").strip() or None
-    return model, prompt, parse_image_count(body.get("n")), images, base_url
+    return model, prompt, image_request_count(body), images, base_url
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -242,8 +252,22 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
 def image_result_content(result: dict[str, Any]) -> str:
     data = result.get("data")
     if isinstance(data, list) and data:
-        return build_chat_image_markdown_content(result)
-    return str(result.get("message") or "Image generation completed.")
+        content = build_chat_image_markdown_content(result)
+    else:
+        content = str(result.get("message") or "Image generation completed.")
+    messages: list[str] = []
+    for item in result.get("errors") or []:
+        if not isinstance(item, dict):
+            continue
+        error = item.get("error")
+        message = error.get("message") if isinstance(error, dict) else ""
+        text = str(message or "").strip()
+        if text:
+            messages.append(text)
+    if not messages:
+        return content
+    extra = "\n".join(messages)
+    return f"{content}\n{extra}" if content else extra
 
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
@@ -253,7 +277,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         model=model,
         n=n,
         response_format="b64_json",
-        images=encode_images(images) or None,
+        images=run_until_image_stop(lambda: encode_images(images)) or None,
         base_url=base_url,
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
@@ -277,6 +301,19 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def _require_chat_image_request(body: dict[str, Any]) -> None:
+    """Reject a bad chat image request before the SSE response is returned.
+
+    Do not download or decode images here. That work stays inside the generator,
+    after the first keepalive has been written.
+    """
+    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    if not extract_chat_prompt(body):
+        raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    image_request_count(body)
+    ensure_supported_image_model(model)
+
+
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     model, prompt, n, images, base_url = chat_image_args(body)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
@@ -284,7 +321,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         model=model,
         n=n,
         response_format="b64_json",
-        images=encode_images(images) or None,
+        images=run_until_image_stop(lambda: encode_images(images)) or None,
         base_url=base_url,
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
@@ -298,36 +335,58 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     created = int(time.time())
     sent_role = False
     sent_text = ""
-    for output in image_outputs:
-        content = ""
-        if output.kind == "progress":
-            content = output.text
-            sent_text += content
-        elif output.kind == "result":
-            content = build_chat_image_markdown_content({"data": output.data})
-        elif output.kind == "message":
-            content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
-        if not content:
-            continue
-        if not sent_role:
-            sent_role = True
-            yield _with_log_metadata(
-                completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created),
-                output.account_email,
-                output.conversation_id,
-                output.image_urls,
-                output.image_attempts,
-                output.data if output.kind == "result" else None,
+    delivered = False
+    failure_output: ImageOutput | None = None
+    image_attempts: list[dict[str, Any]] = []
+    try:
+        for output in image_outputs:
+            image_attempts.extend(
+                dict(item) for item in output.image_attempts if isinstance(item, dict)
             )
-        else:
-            yield _with_log_metadata(
-                completion_chunk(model, {"content": content}, None, completion_id, created),
-                output.account_email,
-                output.conversation_id,
-                output.image_urls,
-                output.image_attempts,
-                output.data if output.kind == "result" else None,
-            )
+            content = ""
+            if output.kind == "progress":
+                content = output.text
+                sent_text += content
+            elif output.kind == "result":
+                content = build_chat_image_markdown_content({"data": output.data})
+                if output.data:
+                    delivered = True
+            elif output.kind == "message":
+                content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
+                if output.failure is not None and failure_output is None:
+                    failure_output = output
+            elif output.kind == "slot_failure":
+                content = output.text or "image generation failed"
+                if failure_output is None:
+                    failure_output = output
+            if not content:
+                continue
+            if not sent_role:
+                sent_role = True
+                yield _with_log_metadata(
+                    completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created),
+                    output.account_email,
+                    output.conversation_id,
+                    output.image_urls,
+                    output.image_attempts,
+                    output.data if output.kind == "result" else None,
+                )
+            else:
+                yield _with_log_metadata(
+                    completion_chunk(model, {"content": content}, None, completion_id, created),
+                    output.account_email,
+                    output.conversation_id,
+                    output.image_urls,
+                    output.image_attempts,
+                    output.data if output.kind == "result" else None,
+                )
+        raise_if_no_delivered_image(
+            delivered=delivered,
+            failure=failure_output,
+            image_attempts=image_attempts,
+        )
+    finally:
+        close_iterator(image_outputs)
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
@@ -346,6 +405,7 @@ def text_completion_response(model: str, messages: list[dict[str, Any]], thinkin
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
+            _require_chat_image_request(body)
             return image_chat_events(body)
         model, messages = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):

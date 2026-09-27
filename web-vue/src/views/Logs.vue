@@ -241,6 +241,7 @@ const logMeta = reactive<SystemLogsResponse>({
   stats: {
     total: 0,
     success: 0,
+    partial_success: 0,
     text_review: 0,
     failed: 0,
     limited: 0,

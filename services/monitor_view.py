@@ -617,9 +617,10 @@ def _count_map(value: object) -> dict[str, int]:
 def _project_summary(value: object) -> dict[str, Any]:
     summary = _mapping(value)
     success = _int(summary.get("success"))
+    partial_success = _int(summary.get("partial_success"))
     failed = _int(summary.get("failed"))
     rate_limited = _int(summary.get("rate_limited"))
-    measured = success + failed + rate_limited
+    measured = success + partial_success + failed + rate_limited
     switch_requests = _int(summary.get("account_switch_requests"))
     switches = _int(summary.get("account_switches"))
     switch_success = _int(summary.get("account_switch_success"))
@@ -707,9 +708,10 @@ def _build_diagnostic_groups(
                 _diagnostic_item("active", "当前并发", _int(summary.get("active")), f"线程容量 {thread_tokens}"),
                 _diagnostic_item("completed", "完成窗口", _int(summary.get("completed")), completed_window_text),
                 _diagnostic_item("success", "成功数", _int(summary.get("success")), "窗口内成功", "success"),
+                _diagnostic_item("partial_success", "部分成功", _int(summary.get("partial_success")), "成功图片已返回，失败槽位另计", "warning"),
                 _diagnostic_item("failed", "失败数", _int(summary.get("failed")), "窗口内失败", "danger" if _int(summary.get("failed")) else "muted"),
                 _diagnostic_item("text_review", "文本数", _int(summary.get("text_review")), "返回文本，不计失败", "warning"),
-                _diagnostic_item("success_rate", "成功率", f"{summary.get('success_rate', 0)}%", "不含文本", "success"),
+                _diagnostic_item("success_rate", "成功率", f"{summary.get('success_rate', 0)}%", "不含文本和部分成功", "success"),
                 _diagnostic_item("slow_total", "慢请求", _int(slow.get("total_over_120s")), "总耗时超过 120 秒", "warning" if _int(slow.get("total_over_120s")) else "muted"),
                 _diagnostic_item("rate_limited", "限流数", _int(summary.get("rate_limited")), "窗口内限流", "warning"),
             ],

@@ -118,7 +118,7 @@
     <section class="grid grid-cols-1 gap-4">
       <ChartCard title="模型请求分布">
         <template #title-extra>
-          <HelpTip text="仅统计成功及部分成功请求。" />
+          <HelpTip text="仅统计完全成功请求，部分成功不计入。" />
         </template>
         <template #actions>
           <TimeRangeTabs v-model="modelTimeRange" aria-label="模型请求分布时间范围" />
@@ -282,6 +282,12 @@ const callStats = computed(() => {
       value: formatPercent(totals?.success_rate),
       icon: 'lucide:circle-check',
       iconTone: 'success' as const,
+    },
+    {
+      label: '部分成功',
+      value: formatCount(totals?.partial_success ?? 0),
+      icon: 'lucide:circle-dashed',
+      iconTone: 'warning' as const,
     },
     {
       label: '平均成功耗时',
@@ -478,7 +484,7 @@ function activityCellClass(value: number) {
 }
 
 function activityTooltip(bucket: DashboardBucket) {
-  return `${bucket.label} · 调用 ${formatCount(bucket.total_calls)} · 成功 ${formatCount(bucket.success_calls)} · 失败 ${formatCount(bucket.final_failed_calls)} · 成功率 ${formatPercent(bucket.success_rate)}`
+  return `${bucket.label} · 调用 ${formatCount(bucket.total_calls)} · 成功 ${formatCount(bucket.success_calls)} · 部分成功 ${formatCount(bucket.partial_success_calls ?? 0)} · 失败 ${formatCount(bucket.final_failed_calls)} · 成功率 ${formatPercent(bucket.success_rate)}`
 }
 
 function activityTooltipItems(bucket: DashboardBucket) {
@@ -492,6 +498,11 @@ function activityTooltipItems(bucket: DashboardBucket) {
       label: '成功',
       value: formatCount(bucket.success_calls),
       markerClass: 'bg-emerald-500',
+    },
+    {
+      label: '部分成功',
+      value: formatCount(bucket.partial_success_calls ?? 0),
+      markerClass: 'bg-amber-500',
     },
     {
       label: '失败',

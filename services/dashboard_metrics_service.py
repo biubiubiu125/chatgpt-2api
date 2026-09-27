@@ -98,7 +98,9 @@ def _increment(counter: dict[str, int], key: object, default: str = "unknown") -
 
 def _dashboard_outcome(item: dict[str, Any]) -> str:
     outcome = call_outcome(item)
-    if outcome in {"success", "partial_success"}:
+    if outcome == "partial_success":
+        return "partial_success"
+    if outcome == "success":
         return "success"
     if outcome == "text_review":
         return "excluded"
@@ -113,6 +115,7 @@ def _empty_bucket() -> dict[str, Any]:
     return {
         "total": 0,
         "success": 0,
+        "partial_success": 0,
         "final_failed": 0,
         "switch_requests": 0,
         "switch_count": 0,
@@ -129,6 +132,7 @@ def _merge_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key in (
         "total",
         "success",
+        "partial_success",
         "final_failed",
         "switch_requests",
         "switch_count",
@@ -160,8 +164,9 @@ def _percentage(numerator: int, denominator: int) -> float | None:
 
 def _bucket_metrics(bucket: dict[str, Any]) -> dict[str, Any]:
     success = int(bucket.get("success", 0) or 0)
+    partial_success = int(bucket.get("partial_success", 0) or 0)
     final_failed = int(bucket.get("final_failed", 0) or 0)
-    measured = success + final_failed
+    measured = success + partial_success + final_failed
     duration_total = float(bucket.get("success_duration_total_ms", 0.0) or 0.0)
     duration_count = int(bucket.get("success_duration_count", 0) or 0)
     switch_requests = int(bucket.get("switch_requests", 0) or 0)
@@ -169,6 +174,7 @@ def _bucket_metrics(bucket: dict[str, Any]) -> dict[str, Any]:
     return {
         "total_calls": int(bucket.get("total", 0) or 0),
         "success_calls": success,
+        "partial_success_calls": partial_success,
         "final_failed_calls": final_failed,
         "success_rate": _percentage(success, measured),
         "avg_success_duration_ms": (
@@ -651,9 +657,10 @@ class DashboardMetricsService:
             return [int(bucket.get(key, 0) or 0) for bucket in series_buckets]
 
         success_requests = integer_series("success")
+        partial_requests = integer_series("partial_success")
         final_failed_requests = integer_series("final_failed")
         measured_requests = [
-            success_requests[index] + final_failed_requests[index]
+            success_requests[index] + partial_requests[index] + final_failed_requests[index]
             for index in range(bucket_count)
         ]
         success_rate = [
@@ -712,6 +719,7 @@ class DashboardMetricsService:
         totals = {
             "total": current_metrics["total_calls"],
             "success": current_metrics["success_calls"],
+            "partial_success": current_metrics["partial_success_calls"],
             "final_failed": current_metrics["final_failed_calls"],
             "success_rate": current_metrics["success_rate"],
             "avg_success_duration_ms": current_metrics["avg_success_duration_ms"],
@@ -731,6 +739,7 @@ class DashboardMetricsService:
                 "end_at": (start + bucket_delta).isoformat(timespec="seconds"),
                 "total_calls": metrics["total_calls"],
                 "success_calls": metrics["success_calls"],
+                "partial_success_calls": metrics["partial_success_calls"],
                 "final_failed_calls": metrics["final_failed_calls"],
                 "success_rate": metrics["success_rate"],
                 "avg_success_duration_ms": metrics["avg_success_duration_ms"],
@@ -741,6 +750,7 @@ class DashboardMetricsService:
         trend = {
             "labels": labels,
             "success_requests": success_requests,
+            "partial_success_requests": partial_requests,
             "final_failed_requests": final_failed_requests,
             "success_rate": success_rate,
             "switch_count": integer_series("switch_count"),

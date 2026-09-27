@@ -41,6 +41,36 @@ class ImageEgressDeadlineError(RuntimeError):
     """Raised when image egress capacity cannot be acquired before its deadline."""
 
 
+def _image_egress_deadline_exceeded(deadline_monotonic: float | None) -> bool:
+    return (
+        deadline_monotonic is not None
+        and deadline_monotonic > 0
+        and time.monotonic() >= deadline_monotonic
+    )
+
+
+def _raise_if_image_egress_stopped(
+    stop_event: threading.Event | None,
+    deadline_monotonic: float | None,
+    *,
+    waiting: str,
+) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise ImageEgressDeadlineError(f"image request stopped {waiting}")
+    if _image_egress_deadline_exceeded(deadline_monotonic):
+        raise ImageEgressDeadlineError(f"image request deadline exceeded {waiting}")
+
+
+def _image_egress_wait_timeout(
+    stop_event: threading.Event | None,
+    deadline_monotonic: float | None,
+) -> float:
+    cap = 0.05 if stop_event is not None else 1.0
+    if deadline_monotonic is None or deadline_monotonic <= 0:
+        return cap
+    return max(0.0, min(cap, deadline_monotonic - time.monotonic()))
+
+
 def normalize_proxy_url(url: str) -> str:
     """Normalize proxy URLs for curl_cffi.
 
@@ -191,6 +221,7 @@ class ProxySettingsStore:
         upstream: bool = False,
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
@@ -216,6 +247,7 @@ class ProxySettingsStore:
                 terminal_when_unresolved=True,
                 reserve_image_egress=reserve_image_egress,
                 deadline_monotonic=deadline_monotonic,
+                stop_event=stop_event,
             )
             selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
             egress_key = resolved.egress_key
@@ -236,6 +268,7 @@ class ProxySettingsStore:
                     terminal_when_unresolved=False,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
+                    stop_event=stop_event,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -256,6 +289,7 @@ class ProxySettingsStore:
                     terminal_when_unresolved=True,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
+                    stop_event=stop_event,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -276,6 +310,7 @@ class ProxySettingsStore:
                     terminal_when_unresolved=True,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
+                    stop_event=stop_event,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -296,6 +331,7 @@ class ProxySettingsStore:
                     terminal_when_unresolved=False,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
+                    stop_event=stop_event,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -337,6 +373,7 @@ class ProxySettingsStore:
         upstream: bool = False,
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ProxyRuntimeProfile | None:
         reference = self.get_fallback_proxy_reference()
         if not reference:
@@ -348,6 +385,7 @@ class ProxySettingsStore:
             upstream=upstream,
             reserve_image_egress=reserve_image_egress,
             deadline_monotonic=deadline_monotonic,
+            stop_event=stop_event,
         )
         source = str(profile.proxy_source or "direct").strip() or "direct"
         if source.startswith("explicit"):
@@ -479,12 +517,9 @@ class ProxySettingsStore:
         profile: ProxyRuntimeProfile,
         *,
         deadline_monotonic: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> int:
-        if (
-            deadline_monotonic is not None
-            and deadline_monotonic > 0
-            and time.monotonic() >= deadline_monotonic
-        ):
+        if _image_egress_deadline_exceeded(deadline_monotonic):
             raise ImageEgressDeadlineError(
                 "image request deadline exceeded before egress acquisition"
             )
@@ -493,22 +528,28 @@ class ProxySettingsStore:
         limit = max(0, int(getattr(profile, "image_concurrency_limit", 0) or 0))
         if limit <= 0:
             return 0
+        _raise_if_image_egress_stopped(
+            stop_event,
+            deadline_monotonic,
+            waiting="before egress acquisition",
+        )
         key = _clean(getattr(profile, "egress_key", "")) or _egress_key_for_proxy(profile.proxy_url)
         started = time.perf_counter()
         with self._egress_condition:
             while int(self._egress_inflight.get(key, 0)) >= limit:
-                remaining = (
-                    deadline_monotonic - time.monotonic()
-                    if deadline_monotonic is not None and deadline_monotonic > 0
-                    else None
+                _raise_if_image_egress_stopped(
+                    stop_event,
+                    deadline_monotonic,
+                    waiting="while waiting for egress capacity",
                 )
-                if remaining is not None and remaining <= 0:
-                    raise ImageEgressDeadlineError(
-                        "image request deadline exceeded while waiting for egress capacity"
-                    )
                 self._egress_condition.wait(
-                    timeout=min(1.0, remaining) if remaining is not None else 1.0
+                    timeout=_image_egress_wait_timeout(stop_event, deadline_monotonic)
                 )
+            _raise_if_image_egress_stopped(
+                stop_event,
+                deadline_monotonic,
+                waiting="while waiting for egress capacity",
+            )
             self._egress_inflight[key] = int(self._egress_inflight.get(key, 0)) + 1
         return int((time.perf_counter() - started) * 1000)
 
@@ -581,6 +622,7 @@ class ProxySettingsStore:
         terminal_when_unresolved: bool,
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ResolvedProxyReference:
         raw = _clean(value)
         lower = raw.lower()
@@ -603,6 +645,7 @@ class ProxySettingsStore:
                 group_id,
                 reserve_image_egress=reserve_image_egress,
                 deadline_monotonic=deadline_monotonic,
+                stop_event=stop_event,
             )
             if not selection.proxy_url:
                 raise ProxyReferenceUnavailableError(
@@ -644,6 +687,7 @@ class ProxySettingsStore:
         *,
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ProxyGroupSelection:
         normalized = _clean(group_id)
         if not normalized:
@@ -663,15 +707,11 @@ class ProxySettingsStore:
             indexed_nodes = list(enumerate(nodes))
             with self._egress_condition:
                 while True:
-                    remaining = (
-                        deadline_monotonic - time.monotonic()
-                        if deadline_monotonic is not None and deadline_monotonic > 0
-                        else None
+                    _raise_if_image_egress_stopped(
+                        stop_event,
+                        deadline_monotonic,
+                        waiting="while selecting proxy group capacity",
                     )
-                    if remaining is not None and remaining <= 0:
-                        raise ImageEgressDeadlineError(
-                            "image request deadline exceeded while selecting proxy group capacity"
-                        )
                     available_nodes = [
                         (node_index, node)
                         for node_index, node in indexed_nodes
@@ -697,7 +737,7 @@ class ProxySettingsStore:
                         )
                         return _proxy_group_selection(normalized, selected, selected_index)
                     self._egress_condition.wait(
-                        timeout=min(1.0, remaining) if remaining is not None else 1.0
+                        timeout=_image_egress_wait_timeout(stop_event, deadline_monotonic)
                     )
         return ProxyGroupSelection()
 

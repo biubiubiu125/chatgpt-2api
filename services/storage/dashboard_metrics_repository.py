@@ -31,6 +31,7 @@ from services.storage.call_record_repository import CallRecordStateModel
 _COUNT_FIELDS = (
     "total",
     "success",
+    "partial_success",
     "final_failed",
     "switch_requests",
     "switch_count",
@@ -60,6 +61,7 @@ class DashboardMetricHourlyModel(DatabaseBase):
     bucket_start = Column(String(13), primary_key=True)
     total = Column(BigInteger, nullable=False, default=0)
     success = Column(BigInteger, nullable=False, default=0)
+    partial_success = Column(BigInteger, nullable=False, default=0)
     final_failed = Column(BigInteger, nullable=False, default=0)
     switch_requests = Column(BigInteger, nullable=False, default=0)
     switch_count = Column(BigInteger, nullable=False, default=0)

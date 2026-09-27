@@ -327,11 +327,17 @@ def call_outcome(item: Mapping[str, Any]) -> str:
         if account_status == "禁用":
             return "unknown"
 
-    if status == "partial_success" or result_status == "partial_success" or (
-        requested > 0 and succeeded > 0 and failed > 0
+    # An explicit failure stays failed. Mixed image counts must not turn a
+    # disconnect, or any other failed call, into a partial success.
+    if status == "partial_success" or (
+        status != "failed"
+        and (
+            result_status == "partial_success"
+            or (requested > 0 and succeeded > 0 and failed > 0)
+        )
     ):
         return "partial_success"
-    if status == "text_review" or status_code == 400 or is_text_review_failure_code(error_code):
+    if is_text_review_failure_code(error_code) or (status == "text_review" and not error_code):
         return "text_review"
     if status in {"success", "completed", "complete", "done"}:
         return "success"

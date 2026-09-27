@@ -75,6 +75,7 @@ function validateTotals(value: unknown, path: string) {
   ;['total', 'success', 'final_failed'].forEach((field) => {
     expectNumber(totals[field], `${path}.${field}`, true)
   })
+  if ('partial_success' in totals) expectNumber(totals.partial_success, `${path}.partial_success`, true)
   expectNullableNumber(totals.success_rate, `${path}.success_rate`)
   expectNullableNumber(totals.avg_success_duration_ms, `${path}.avg_success_duration_ms`)
 }
@@ -91,6 +92,9 @@ function validateBuckets(value: unknown, path: string, expectedCount: number) {
       'total_calls', 'success_calls', 'final_failed_calls',
       'switch_count', 'switch_recovered',
     ].forEach((field) => expectNumber(bucket[field], `${bucketPath}.${field}`, true))
+    if ('partial_success_calls' in bucket) {
+      expectNumber(bucket.partial_success_calls, `${bucketPath}.partial_success_calls`, true)
+    }
     ;[
       'success_rate', 'avg_success_duration_ms',
       'switch_recovery_rate',
@@ -195,6 +199,9 @@ function validateTrend(value: unknown, path: string) {
   ;[
     'success_requests', 'final_failed_requests', 'switch_count',
   ].forEach((field) => expectNumberArray(trend[field], `${path}.${field}`, pointCount, true))
+  if ('partial_success_requests' in trend) {
+    expectNumberArray(trend.partial_success_requests, `${path}.partial_success_requests`, pointCount, true)
+  }
   expectNullableNumberArray(trend.success_rate, `${path}.success_rate`, pointCount)
   expectSeriesRecord(trend.model_success_requests, `${path}.model_success_requests`, pointCount, true)
   expectNullableSeriesRecord(

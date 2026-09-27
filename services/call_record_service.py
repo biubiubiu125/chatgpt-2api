@@ -111,7 +111,9 @@ class CallRecordService:
     def _outcomes(status: str) -> tuple[str, ...]:
         normalized = str(status or "").strip().lower()
         if normalized == "success":
-            return ("success", "partial_success")
+            return ("success",)
+        if normalized == "partial_success":
+            return ("partial_success",)
         if normalized == "failed":
             return ("failed",)
         if normalized == "limited":
@@ -210,7 +212,8 @@ class CallRecordService:
             "facets": page.facets,
             "stats": {
                 "total": page.total,
-                "success": int(outcomes.get("success", 0)) + int(outcomes.get("partial_success", 0)),
+                "success": int(outcomes.get("success", 0)),
+                "partial_success": int(outcomes.get("partial_success", 0)),
                 "text_review": int(outcomes.get("text_review", 0)),
                 "failed": int(outcomes.get("failed", 0)),
                 "limited": int(outcomes.get("rate_limited", 0)),

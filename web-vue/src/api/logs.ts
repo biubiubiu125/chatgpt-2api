@@ -201,6 +201,7 @@ export type SystemLogsResponse = {
   stats: {
     total: number
     success: number
+    partial_success: number
     text_review: number
     failed: number
     limited: number

@@ -14,6 +14,7 @@ from services.protocol.conversation import (
     count_message_text_tokens,
     count_text_tokens,
     encode_images,
+    ensure_supported_image_model,
     normalize_messages,
     stream_image_outputs_with_pool,
     stream_text_deltas,
@@ -29,7 +30,13 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import (
+    close_iterator,
+    extract_image_from_message_content,
+    extract_response_prompt,
+    has_response_image_generation_tool,
+    image_request_count,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -60,6 +67,10 @@ def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
         if isinstance(tool, dict) and tool.get("type") == "image_generation":
             return tool
     return {}
+
+
+def response_image_count(body: dict[str, Any]) -> int:
+    return image_request_count(body)
 
 
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
@@ -383,48 +394,65 @@ def stream_image_response(
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
     yield response_created(response_id, model, created)
-    for output in image_outputs:
-        if output.kind == "message":
-            text = output.text
-            item = text_output_item(text)
-            usage = token_usage(
-                input_text_tokens=count_text_tokens(prompt, model),
-                input_image_tokens=input_image_tokens,
-                output_text_tokens=count_text_tokens(text, model),
-            )
-            yield _with_log_metadata(
-                {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text},
-                output.account_email,
-                output.conversation_id,
-                image_attempts=output.image_attempts,
-            )
-            yield _with_log_metadata(
-                {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": text},
-                output.account_email,
-                output.conversation_id,
-                image_attempts=output.image_attempts,
-            )
-            yield _with_log_metadata(
-                {"type": "response.output_item.done", "output_index": 0, "item": item},
-                output.account_email,
-                output.conversation_id,
-                image_attempts=output.image_attempts,
-            )
-            completed = response_completed(response_id, model, created, [item], usage)
-            _with_log_metadata(completed, output.account_email, output.conversation_id, image_attempts=output.image_attempts)
-            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, image_attempts=output.image_attempts)
-            yield completed
-            return
-        if output.kind != "result":
-            continue
-        items = image_output_items(prompt, output.data)
-        if items:
-            usage = image_usage(
-                input_text_tokens=count_text_tokens(prompt, model),
-                input_image_tokens=input_image_tokens,
-                output_tokens=count_image_output_items_tokens(output.data, size, quality),
-            )
-            for output_index, item in enumerate(items):
+    completed_items: list[dict[str, Any]] = []
+    image_rows: list[dict[str, Any]] = []
+    output_index = 0
+    account_email = ""
+    conversation_id = ""
+    image_urls: list[str] = []
+    image_attempts: list[dict[str, Any]] = []
+    try:
+        for output in image_outputs:
+            if output.account_email and not account_email:
+                account_email = output.account_email
+            if output.conversation_id and not conversation_id:
+                conversation_id = output.conversation_id
+            image_urls.extend(output.image_urls)
+            image_attempts.extend(attempt for attempt in output.image_attempts if isinstance(attempt, dict))
+            if output.kind == "message" and not completed_items:
+                text = output.text
+                item = text_output_item(text)
+                usage = token_usage(
+                    input_text_tokens=count_text_tokens(prompt, model),
+                    input_image_tokens=input_image_tokens,
+                    output_text_tokens=count_text_tokens(text, model),
+                )
+                yield _with_log_metadata(
+                    {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text},
+                    output.account_email,
+                    output.conversation_id,
+                    image_attempts=output.image_attempts,
+                )
+                yield _with_log_metadata(
+                    {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": text},
+                    output.account_email,
+                    output.conversation_id,
+                    image_attempts=output.image_attempts,
+                )
+                yield _with_log_metadata(
+                    {"type": "response.output_item.done", "output_index": 0, "item": item},
+                    output.account_email,
+                    output.conversation_id,
+                    image_attempts=output.image_attempts,
+                )
+                completed = response_completed(response_id, model, created, [item], usage)
+                _with_log_metadata(completed, output.account_email, output.conversation_id, image_attempts=output.image_attempts)
+                _with_log_metadata(completed["response"], output.account_email, output.conversation_id, image_attempts=output.image_attempts)
+                yield completed
+                return
+            if output.kind == "slot_failure":
+                failure = output.failure
+                item = {
+                    "id": f"ig_{output_index + 1}",
+                    "type": "image_generation_call",
+                    "status": "failed",
+                    "error": {
+                        "message": output.text or "image generation failed",
+                        "type": failure.error_type if failure is not None else "image_generation_error",
+                        "code": failure.code if failure is not None else "upstream_error",
+                        "param": None,
+                    },
+                }
                 yield _with_log_metadata(
                     {"type": "response.output_item.done", "output_index": output_index, "item": item},
                     output.account_email,
@@ -432,13 +460,53 @@ def stream_image_response(
                     output.image_urls,
                     output.image_attempts,
                 )
-            completed = response_completed(response_id, model, created, items, usage)
-            _with_log_metadata(completed, output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
-            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
-            completed["response"]["_image_metadata"] = image_output_metadata(output.data)
-            yield completed
-            return
-    raise RuntimeError("image generation failed")
+                completed_items.append(item)
+                output_index += 1
+                continue
+            if output.kind != "result":
+                continue
+            items = image_output_items(prompt, output.data)
+            rows = [
+                row for row in output.data
+                if isinstance(row, dict) and str(row.get("b64_json") or "").strip()
+            ]
+            for offset, item in enumerate(items):
+                item["id"] = f"ig_{output_index + 1}"
+                payload = _with_log_metadata(
+                    {"type": "response.output_item.done", "output_index": output_index, "item": item},
+                    output.account_email,
+                    output.conversation_id,
+                    output.image_urls,
+                    output.image_attempts,
+                )
+                if offset < len(rows):
+                    payload["_image_metadata"] = image_output_metadata([rows[offset]])
+                    image_rows.append(rows[offset])
+                yield payload
+                completed_items.append(item)
+                output_index += 1
+        if not any(item.get("status") != "failed" for item in completed_items):
+            raise RuntimeError("image generation failed")
+        usage = image_usage(
+            input_text_tokens=count_text_tokens(prompt, model),
+            input_image_tokens=input_image_tokens,
+            output_tokens=count_image_output_items_tokens(image_rows, size, quality),
+        )
+        completed = response_completed(response_id, model, created, completed_items, usage)
+        failed_items = [item for item in completed_items if item.get("status") == "failed"]
+        if failed_items:
+            error = failed_items[0].get("error") if isinstance(failed_items[0].get("error"), dict) else {}
+            completed["response"]["status"] = "incomplete"
+            completed["response"]["incomplete_details"] = {
+                "reason": str(error.get("code") or "error"),
+            }
+        _with_log_metadata(completed, account_email, conversation_id, image_urls, image_attempts)
+        _with_log_metadata(completed["response"], account_email, conversation_id, image_urls, image_attempts)
+        if image_rows:
+            completed["response"]["_image_metadata"] = image_output_metadata(image_rows)
+        yield completed
+    finally:
+        close_iterator(image_outputs)
 
 
 def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -471,11 +539,14 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     image_info = extract_response_image(body.get("input"))
     if image_info:
         image_data, mime_type = image_info
-        images = encode_images([(image_data, "image.png", mime_type)])
+        from utils.helper import run_until_image_stop
+
+        images = run_until_image_stop(lambda: encode_images([(image_data, "image.png", mime_type)]))
     else:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
+    base_url = str(body.get("base_url") or "").strip() or None
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -483,6 +554,8 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
+        n=response_image_count(body),
+        base_url=base_url,
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
@@ -491,6 +564,12 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if body.get("stream") and not is_text_response_request(body):
+        if not extract_response_prompt(body.get("input")):
+            raise HTTPException(status_code=400, detail={"error": "input text is required"})
+        model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+        ensure_supported_image_model(model)
+        response_image_count(body)
     events = response_events(body)
     if body.get("stream"):
         return events

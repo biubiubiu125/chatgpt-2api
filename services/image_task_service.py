@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from services.bounded_task_runner import BoundedTaskRunner, TaskReservation, env_int
@@ -160,6 +162,187 @@ def _clear_task_details() -> dict[str, str]:
     return {key: "" for key in TASK_DETAIL_KEYS}
 
 
+def _slot_index_value(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _image_payloads(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict) and item]
+
+
+def _kept_call_status(kept: list[dict[str, Any]], requested: int) -> str:
+    count = len(kept)
+    if count <= 0:
+        return "failed"
+    if requested > 0 and count >= requested:
+        return "success"
+    return "partial_success"
+
+
+_STORED_IMAGE_NAME = re.compile(r"^\d+_([0-9a-fA-F]{32})\.png$")
+
+
+def _stored_image_content_hash(url: str) -> str:
+    name = urlsplit(url).path.rsplit("/", 1)[-1]
+    match = _STORED_IMAGE_NAME.fullmatch(name)
+    if match is None:
+        return ""
+    return match.group(1).lower()
+
+
+def _image_item_identity(item: Mapping[str, Any]) -> str:
+    """Identity ignores a new signature or timestamp for the same saved bytes."""
+    url = _clean(item.get("url"))
+    if url:
+        content_hash = _stored_image_content_hash(url)
+        if content_hash:
+            return "hash:" + content_hash
+        parts = urlsplit(url)
+        return "url:" + urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    encoded = _clean(item.get("b64_json"))
+    if encoded:
+        return "b64:" + encoded
+    return ""
+
+
+def _stored_slot_failures(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        index = _slot_index_value(item.get("index"))
+        message = _clean(item.get("message"))
+        if not index or not message:
+            continue
+        record = _slot_failure_record(item)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _merge_resumed_image_data(
+    kept: object,
+    resumed: object,
+    requested_count: int,
+    slot_failures: object,
+    resumed_slot_index: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep saved images and attach newly resumed ones to the polled slot."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _image_payloads(kept):
+        identity = _image_item_identity(item)
+        if identity:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        merged.append(dict(item))
+    fresh: list[dict[str, Any]] = []
+    for item in _image_payloads(resumed):
+        copy = dict(item)
+        identity = _image_item_identity(copy)
+        if identity and identity in seen:
+            continue
+        if identity:
+            seen.add(identity)
+        fresh.append(copy)
+    failures = _stored_slot_failures(slot_failures)
+    filled: list[int] = []
+    if resumed_slot_index and fresh:
+        fresh[0]["_slot_index"] = resumed_slot_index
+        filled.append(resumed_slot_index)
+    elif not resumed_slot_index:
+        for item, failure in zip(fresh, failures):
+            item["_slot_index"] = failure["index"]
+            filled.append(failure["index"])
+    remaining = [item for item in failures if item["index"] not in set(filled)]
+    stored = _stored_image_data(
+        merged + fresh,
+        requested_count,
+        {item["index"] for item in remaining},
+    )
+    return stored, remaining, fresh
+
+
+def _slot_failure_records(result: object) -> list[dict[str, Any]]:
+    """Keep the failed slot index and public reason from a mixed image result."""
+    if not isinstance(result, dict):
+        return []
+    errors = result.get("errors")
+    if not isinstance(errors, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        error = item.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        message = _clean(error.get("message"))
+        code = _clean(error.get("code"))
+        if not message:
+            if not code:
+                continue
+            message = "有图片没有生成成功"
+        index = _slot_index_value(item.get("index")) or 0
+        records.append({"index": index, "message": message, "code": code})
+    return records
+
+
+def _partial_slot_failure(result: object) -> tuple[str, str]:
+    """Return the public reason for image slots that failed beside a saved image."""
+    records = _slot_failure_records(result)
+    if not records:
+        return "", ""
+    messages = [
+        f"第 {item['index']} 张失败：{item['message']}" if item["index"] else item["message"]
+        for item in records
+    ]
+    code = next((item["code"] for item in records if item["code"]), "")
+    return "；".join(messages), code or "upstream_error"
+
+
+def _stored_image_data(
+    data: object,
+    requested_count: int,
+    failed_indexes: set[int],
+) -> list[dict[str, Any]]:
+    if not isinstance(data, list):
+        return []
+    items = [dict(item) for item in data if isinstance(item, dict)]
+    used: set[int] = set()
+    unindexed: list[dict[str, Any]] = []
+    for item in items:
+        index = _slot_index_value(item.pop("_slot_index", None))
+        if index is None:
+            index = _slot_index_value(item.get("slot_index"))
+        if (
+            index is not None
+            and index <= requested_count
+            and index not in failed_indexes
+            and index not in used
+        ):
+            item["slot_index"] = index
+            used.add(index)
+        else:
+            item.pop("slot_index", None)
+            unindexed.append(item)
+    free = [
+        index
+        for index in range(1, requested_count + 1)
+        if index not in failed_indexes and index not in used
+    ]
+    for item, index in zip(unindexed, free):
+        item["slot_index"] = index
+    return items
+
+
 def _account_token_fingerprint(value: object) -> str:
     text = _clean(value).lower()
     if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
@@ -167,10 +350,62 @@ def _account_token_fingerprint(value: object) -> str:
     return ""
 
 
+def _slot_failure_record(item: Mapping[str, object]) -> dict[str, Any] | None:
+    index = _slot_index_value(item.get("index"))
+    message = _clean(item.get("message"))
+    if not index or not message:
+        return None
+    record = {"index": index, "message": message, "code": _clean(item.get("code"))}
+    if item.get("quota_consumed") is True:
+        record["quota_consumed"] = True
+    return record
+
+
 def _quota_already_consumed(task: Mapping[str, object]) -> bool:
     if task.get("quota_consumed") is True:
         return True
     return image_failure(_clean(task.get("error_code"))).code == "image_download_failed"
+
+
+def _slot_quota_already_consumed(task: Mapping[str, object], conversation_id: object) -> bool:
+    """Quota already taken for this slot, not for every slot on the task."""
+    sessions = _slot_session_records(task.get("slot_sessions"))
+    index = _session_index_for_conversation(sessions, conversation_id)
+    if not index or not sessions:
+        return _quota_already_consumed(task)
+    for item in _stored_slot_failures(task.get("slot_failures")):
+        if item["index"] != index:
+            continue
+        if "quota_consumed" in item:
+            return item["quota_consumed"] is True
+        return image_failure(item["code"]).code == "image_download_failed"
+    return False
+
+
+def _slot_failures_after_quota(
+    task: Mapping[str, object],
+    conversation_id: object,
+    *,
+    consumed: bool,
+    code: str = "",
+) -> list[dict[str, Any]] | None:
+    if not consumed:
+        return None
+    failures = _stored_slot_failures(task.get("slot_failures"))
+    index = _session_index_for_conversation(task.get("slot_sessions"), conversation_id)
+    if not index or not failures:
+        return None
+    updated: list[dict[str, Any]] = []
+    found = False
+    for item in failures:
+        copy = dict(item)
+        if copy["index"] == index:
+            found = True
+            copy["quota_consumed"] = True
+            if code:
+                copy["code"] = code
+        updated.append(copy)
+    return updated if found else None
 
 
 def _resume_access_token(task: Mapping[str, object]) -> str:
@@ -185,7 +420,167 @@ def _resume_access_token(task: Mapping[str, object]) -> str:
     return token
 
 
+def _session_index_for_conversation(sessions: object, conversation_id: object) -> int:
+    conversation_id = _clean(conversation_id)
+    if not conversation_id:
+        return 0
+    for session in _slot_session_records(sessions):
+        if session["conversation_id"] == conversation_id and session["index"]:
+            return session["index"]
+    return 0
+
+
+def _select_resume_target(task: Mapping[str, object]) -> tuple[str, str]:
+    """Pick an unfinished slot whose account is still available."""
+    pending = _resume_poll_targets(task, task.get("conversation_id"))
+    primary = _clean(task.get("conversation_id"))
+    ordered = sorted(
+        pending,
+        key=lambda item: (item["conversation_id"] != primary, item["index"] or 0),
+    )
+    if not ordered:
+        if not primary:
+            raise ValueError("task has no conversation_id")
+        ordered = [{
+            "index": 0,
+            "conversation_id": primary,
+            "account_token_fingerprint": _account_token_fingerprint(
+                task.get("account_token_fingerprint")
+            ),
+        }]
+    last_error: Exception | None = None
+    for session in ordered:
+        conversation = _clean(session.get("conversation_id"))
+        if not conversation:
+            continue
+        try:
+            return conversation, _resume_access_token(session)
+        except ValueError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("task has no conversation_id")
+
+
 _RESUMABLE_IMAGE_CODES = frozenset({"image_poll_timeout", "image_download_failed"})
+
+
+def _resume_error_code_after_busy(preferred: object, current: object, conversation_id: object) -> str:
+    """A busy account slot must not erase the error that still allows resume."""
+    for candidate in (preferred, current):
+        code = image_failure(_clean(candidate)).code
+        if code in _RESUMABLE_IMAGE_CODES:
+            return code
+    if _clean(conversation_id):
+        return "image_poll_timeout"
+    return "image_generation_busy"
+
+
+class _ResumeAttemptDone(BaseException):
+    """Leave this slot attempt after its cleanup and poll another saved session."""
+
+
+def _slot_session_records(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = _clean(item.get("conversation_id"))
+        if not conversation_id:
+            continue
+        records.append({
+            "index": _slot_index_value(item.get("index")) or 0,
+            "conversation_id": conversation_id,
+            "account_token_fingerprint": _account_token_fingerprint(
+                item.get("account_token_fingerprint")
+            ),
+        })
+    return records
+
+
+def _remember_slot_session(
+    value: object,
+    slot_index: object,
+    conversation_id: object,
+    fingerprint: object,
+) -> list[dict[str, Any]]:
+    """Keep each image slot's conversation with the account that created it."""
+    conversation_id = _clean(conversation_id)
+    fingerprint = _account_token_fingerprint(fingerprint)
+    records = _slot_session_records(value)
+    if not conversation_id:
+        return records
+    index = _slot_index_value(slot_index) or 0
+    updated: list[dict[str, Any]] = []
+    replaced = False
+    for item in records:
+        same_slot = index > 0 and item["index"] == index
+        same_conversation = index == 0 and item["conversation_id"] == conversation_id
+        if not same_slot and not same_conversation:
+            updated.append(item)
+            continue
+        updated.append({
+            "index": index or item["index"],
+            "conversation_id": conversation_id,
+            "account_token_fingerprint": fingerprint or item["account_token_fingerprint"],
+        })
+        replaced = True
+    if not replaced:
+        updated.append({
+            "index": index,
+            "conversation_id": conversation_id,
+            "account_token_fingerprint": fingerprint,
+        })
+    return updated
+
+
+def _resume_poll_targets(task: Mapping[str, object], conversation_id: object) -> list[dict[str, Any]]:
+    """Sessions that still need a poll, or the single legacy conversation."""
+    filled = {
+        index
+        for item in _image_payloads(task.get("data"))
+        if (index := _slot_index_value(item.get("slot_index")))
+    }
+    failed_indexes = {item["index"] for item in _stored_slot_failures(task.get("slot_failures"))}
+    pending = []
+    for session in _slot_session_records(task.get("slot_sessions")):
+        if session["index"] and session["index"] in filled:
+            continue
+        if failed_indexes and session["index"] and session["index"] not in failed_indexes:
+            continue
+        pending.append(session)
+    pending.sort(key=lambda item: item["index"] or 0)
+    if pending:
+        return pending
+    fallback = _clean(conversation_id)
+    if not fallback:
+        return []
+    return [{
+        "index": 0,
+        "conversation_id": fallback,
+        "account_token_fingerprint": _account_token_fingerprint(
+            task.get("account_token_fingerprint")
+        ),
+    }]
+
+
+def _resumable_slot_sessions(
+    sessions: object,
+    slot_failures: object,
+) -> list[dict[str, Any]]:
+    """Failed slots that can still be polled, each with its own account."""
+    records = _slot_session_records(sessions)
+    matched: list[dict[str, Any]] = []
+    for failure in _stored_slot_failures(slot_failures):
+        if image_failure(failure["code"]).code not in _RESUMABLE_IMAGE_CODES:
+            continue
+        session = next((item for item in records if item["index"] == failure["index"]), None)
+        if session is None or not session["conversation_id"]:
+            continue
+        matched.append(session)
+    return matched
 
 
 def _normalize_task_failure(
@@ -716,7 +1111,7 @@ class ImageTaskService:
                     key,
                     status=TASK_STATUS_ERROR,
                     error=public_error,
-                    data=[],
+                    data=self._kept_image_data(key),
                     **_task_detail_fields(error_details),
                 )
             except Exception as persist_exc:
@@ -750,7 +1145,7 @@ class ImageTaskService:
         )
         task["status"] = TASK_STATUS_ERROR
         task["error"] = public_error
-        task["data"] = []
+        task["data"] = _image_payloads(task.get("data"))
         for field, value in _task_detail_fields(details).items():
             if value in (None, ""):
                 task.pop(field, None)
@@ -808,18 +1203,29 @@ class ImageTaskService:
                 updates["started_ts"] = time.time()
             self._update_task(key, persist=False, **updates)
 
-        def session_checkpoint(conversation_id: str, fingerprint: str) -> None:
+        def session_checkpoint(
+            conversation_id: str,
+            fingerprint: str,
+            slot_index: int = 0,
+        ) -> None:
             updates: dict[str, Any] = {}
             cleaned_conversation_id = _clean(conversation_id)
             if cleaned_conversation_id:
                 updates["conversation_id"] = cleaned_conversation_id
             if _account_token_fingerprint(fingerprint):
                 updates["account_token_fingerprint"] = fingerprint
+            if cleaned_conversation_id:
+                updates["_slot_session"] = {
+                    "index": slot_index,
+                    "conversation_id": cleaned_conversation_id,
+                    "fingerprint": fingerprint,
+                }
             if updates:
                 self._update_task(key, persist=True, **updates)
 
         def image_result_callback(data: list[dict[str, Any]]) -> None:
-            partial_data = [dict(item) for item in data if isinstance(item, dict)]
+            requested_count = _image_count(self._tasks.get(key, {}).get("n"))
+            partial_data = _stored_image_data(data, requested_count, set())
             if partial_data:
                 self._update_task(key, data=partial_data)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
@@ -862,16 +1268,59 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(
-                key,
-                status=TASK_STATUS_SUCCESS,
-                data=data,
-                usage=usage,
-                error="",
-                duration_ms=duration_ms,
-                account_token_fingerprint="",
-                **_clear_task_details(),
-            )
+            slot_failures = _slot_failure_records(result)
+            partial_error, partial_code = _partial_slot_failure(result)
+            requested_count = _image_count(self._tasks.get(key, {}).get("n"))
+            failed_indexes = {
+                item["index"] for item in slot_failures if item["index"] > 0
+            }
+            with self._lock:
+                resume_sessions = _resumable_slot_sessions(
+                    (self._tasks.get(key) or {}).get("slot_sessions"),
+                    slot_failures,
+                )
+            stored_data = _stored_image_data(data, requested_count, failed_indexes)
+            if resume_sessions:
+                resume_code = next(
+                    image_failure(item["code"]).code
+                    for item in slot_failures
+                    if image_failure(item["code"]).code in _RESUMABLE_IMAGE_CODES
+                )
+                detail_updates = _clear_task_details()
+                detail_updates["error_code"] = resume_code
+                detail_updates["error_message_version"] = TASK_ERROR_MESSAGE_VERSION
+                detail_updates["can_resume_poll"] = True
+                primary = resume_sessions[0]
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_ERROR,
+                    data=stored_data,
+                    slot_failures=slot_failures,
+                    slot_sessions=resume_sessions,
+                    usage=usage,
+                    error=partial_error or "有图片没有生成成功",
+                    duration_ms=duration_ms,
+                    conversation_id=primary["conversation_id"],
+                    account_token_fingerprint=primary["account_token_fingerprint"],
+                    **detail_updates,
+                )
+            else:
+                detail_updates = _clear_task_details()
+                if partial_code:
+                    detail_updates["error_code"] = partial_code
+                    detail_updates["error_message_version"] = TASK_ERROR_MESSAGE_VERSION
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_SUCCESS,
+                    data=stored_data,
+                    slot_failures=slot_failures,
+                    slot_sessions=[],
+                    usage=usage,
+                    error=partial_error,
+                    duration_ms=duration_ms,
+                    account_token_fingerprint="",
+                    **detail_updates,
+                )
             # Auto-push only the assets produced by this task and carry through
             # metadata that is present in the real generation response.
             auto_push_gallery_urls(
@@ -887,6 +1336,7 @@ class ImageTaskService:
                 started,
                 "调用完成",
                 request_preview=request_text(payload.get("prompt")),
+                error=partial_error,
                 urls=_collect_image_urls(result),
                 account_email=account_email,
                 call_id=call_id,
@@ -904,25 +1354,35 @@ class ImageTaskService:
             failure_fields: dict[str, Any] = {
                 "status": TASK_STATUS_ERROR,
                 "error": public_error,
-                "data": [],
+                "data": self._kept_image_data(key),
                 "duration_ms": duration_ms,
             }
+            with self._lock:
+                sessions = _slot_session_records((self._tasks.get(key) or {}).get("slot_sessions"))
+            matched = next(
+                (item for item in sessions if item["conversation_id"] == conversation_id),
+                None,
+            ) if conversation_id else None
             fingerprint = _account_token_fingerprint(getattr(exc, "account_token_fingerprint", ""))
-            if fingerprint:
+            if matched is not None and matched["account_token_fingerprint"]:
+                failure_fields["account_token_fingerprint"] = matched["account_token_fingerprint"]
+            elif fingerprint:
                 failure_fields["account_token_fingerprint"] = fingerprint
             if conversation_id:
                 failure_fields["conversation_id"] = conversation_id
+            if error_details.get("can_resume_poll") and sessions:
+                failure_fields["slot_sessions"] = sessions
             failure_fields.update(_task_detail_fields(error_details))
             self._update_task(key, **failure_fields)
-            self._log_call(
+            self._log_saved_image_failure(
                 identity,
                 mode,
                 model,
                 started,
                 "调用失败",
-                request_preview=request_text(payload.get("prompt")),
-                status="failed",
+                key=key,
                 error=public_error,
+                request_preview=request_text(payload.get("prompt")),
                 account_email=account_email,
                 conversation_id=conversation_id,
                 call_id=call_id,
@@ -993,6 +1453,42 @@ class ImageTaskService:
         except Exception:
             pass
 
+    def _kept_image_data(self, key: str) -> list[dict[str, Any]]:
+        with self._lock:
+            task = self._tasks.get(key) or {}
+            return _image_payloads(task.get("data"))
+
+    def _log_saved_image_failure(
+        self,
+        identity: dict[str, object],
+        mode: str,
+        model: str,
+        started: float,
+        suffix: str,
+        *,
+        key: str,
+        error: str,
+        **kwargs: Any,
+    ) -> None:
+        images = self._kept_image_data(key)
+        with self._lock:
+            task = self._tasks.get(key) or {}
+        requested = _image_count(task.get("requested_count", task.get("n")))
+        status = _kept_call_status(images, requested)
+        if status != "failed":
+            suffix = suffix.replace("调用失败", "调用完成", 1)
+        self._log_call(
+            identity,
+            mode,
+            model,
+            started,
+            suffix,
+            status=status,
+            error="" if status == "success" else error,
+            result={"data": images} if images else None,
+            **kwargs,
+        )
+
     def _update_task(self, key: str, *, persist: bool = True, **updates: Any) -> None:
         with self._lock:
             task = self._tasks.get(key)
@@ -1005,6 +1501,38 @@ class ImageTaskService:
                         task[field] = fingerprint
                     else:
                         task.pop(field, None)
+                    continue
+                if field == "slot_failures":
+                    records = []
+                    for item in value if isinstance(value, list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        index = _slot_index_value(item.get("index"))
+                        message = _clean(item.get("message"))
+                        if not index or not message:
+                            continue
+                        record = _slot_failure_record(item)
+                        if record is not None:
+                            records.append(record)
+                    if records:
+                        task[field] = records
+                    else:
+                        task.pop(field, None)
+                    continue
+                if field == "slot_sessions":
+                    records = _slot_session_records(value)
+                    if records:
+                        task[field] = records
+                    else:
+                        task.pop(field, None)
+                    continue
+                if field == "_slot_session" and isinstance(value, dict):
+                    task["slot_sessions"] = _remember_slot_session(
+                        task.get("slot_sessions"),
+                        value.get("index"),
+                        value.get("conversation_id"),
+                        value.get("fingerprint"),
+                    )
                     continue
                 if field in TASK_DETAIL_KEYS and value in (None, ""):
                     task.pop(field, None)
@@ -1094,6 +1622,12 @@ class ImageTaskService:
             fingerprint = _account_token_fingerprint(item.get("account_token_fingerprint"))
             if fingerprint:
                 task["account_token_fingerprint"] = fingerprint
+            slot_failures = _stored_slot_failures(item.get("slot_failures"))
+            if slot_failures:
+                task["slot_failures"] = slot_failures
+            slot_sessions = _slot_session_records(item.get("slot_sessions"))
+            if slot_sessions:
+                task["slot_sessions"] = slot_sessions
             _copy_task_details(item, task)
             if status == TASK_STATUS_ERROR:
                 stored_error = _clean(item.get("error"))
@@ -1179,11 +1713,8 @@ class ImageTaskService:
                 raise ValueError("task is not in error state")
             if image_failure(_clean(task.get("error_code"))).code not in _RESUMABLE_IMAGE_CODES:
                 raise ValueError("task error is not a timeout error")
-            conversation_id = _clean(task.get("conversation_id"))
-            if not conversation_id:
-                raise ValueError("task has no conversation_id")
-            access_token = _resume_access_token(task)
-            quota_already_consumed = _quota_already_consumed(task)
+            conversation_id, access_token = _select_resume_target(task)
+            quota_already_consumed = _slot_quota_already_consumed(task, conversation_id)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             base_url = _clean(task.get("base_url"))
@@ -1217,6 +1748,7 @@ class ImageTaskService:
                     submitted_wall,
                     submitted_perf,
                     quota_already_consumed,
+                    _clean(task.get("error_code")),
                     image_slots=1,
                     hold_running=False,
                 )
@@ -1238,10 +1770,16 @@ class ImageTaskService:
         submitted_wall: float,
         submitted_perf: float,
         quota_already_consumed: bool = False,
+        resume_error_code: str = "",
+        _seen_conversations: tuple[str, ...] = (),
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         from services.account_service import account_service
 
+        current_conversation = _clean(conversation_id)
+        if current_conversation in _seen_conversations:
+            return
+        seen = _seen_conversations + (current_conversation,)
         started = submitted_wall
         handler_queue_ms = max(0, int((time.perf_counter() - submitted_perf) * 1000))
         self._update_task(key, status=TASK_STATUS_RUNNING)
@@ -1253,6 +1791,7 @@ class ImageTaskService:
         failure = None
         with self._lock:
             request_payload = dict(self._tasks.get(key) or {})
+        follow_up: tuple[str, str] | None = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
@@ -1265,28 +1804,38 @@ class ImageTaskService:
             except TimeoutError:
                 failure = image_failure("image_generation_busy")
                 message = public_image_error_message(failure)
+                with self._lock:
+                    current_code = _clean((self._tasks.get(key) or {}).get("error_code"))
+                error_code = _resume_error_code_after_busy(
+                    resume_error_code,
+                    current_code,
+                    conversation_id,
+                )
                 self._update_task(
                     key,
                     status=TASK_STATUS_ERROR,
                     error=message,
-                    data=[],
+                    data=self._kept_image_data(key),
                     duration_ms=int((time.time() - started) * 1000),
-                    error_code=failure.code,
-                    can_resume_poll=False,
+                    error_code=error_code,
+                    can_resume_poll=(
+                        error_code in _RESUMABLE_IMAGE_CODES and bool(_clean(conversation_id))
+                    ),
                     conversation_id=conversation_id,
                 )
-                self._log_call(
+                self._log_saved_image_failure(
                     identity,
                     mode,
                     model,
                     started,
                     "调用失败（续轮询）",
-                    status="failed",
+                    key=key,
                     error=message,
                     perf={"handler_queue_ms": handler_queue_ms},
                     request_payload=request_payload,
                 )
-                return
+                follow_up = self._resume_follow_up(key, conversation_id, seen)
+                raise _ResumeAttemptDone
             access_token = held_token
             try:
                 access_token = account_service._refresh_image_access_token(access_token)
@@ -1298,26 +1847,27 @@ class ImageTaskService:
                     key,
                     status=TASK_STATUS_ERROR,
                     error=message,
-                    data=[],
+                    data=self._kept_image_data(key),
                     duration_ms=int((time.time() - started) * 1000),
                     error_code=failure.code,
                     can_resume_poll=False,
                     conversation_id=conversation_id,
                 )
-                self._log_call(
+                self._log_saved_image_failure(
                     identity,
                     mode,
                     model,
                     started,
                     "调用失败（续轮询）",
-                    status="failed",
+                    key=key,
                     error=message,
                     perf={"handler_queue_ms": handler_queue_ms},
                     request_payload=request_payload,
                 )
                 account_service.release_image_slot(held_token)
                 held_token = ""
-                return
+                follow_up = self._resume_follow_up(key, conversation_id, seen)
+                raise _ResumeAttemptDone
             held_token = access_token
             resume_admission = image_gate.image_generation_gate.current()
             if resume_admission is not None:
@@ -1349,9 +1899,15 @@ class ImageTaskService:
                 for image_data in backend.download_image_bytes(image_urls)
             ]
             with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+                task = self._tasks.get(key) or {}
+                quality = _clean(task.get("quality"), "auto")
+                size = _clean(task.get("size"))
+                requested_count = _image_count(task.get("requested_count", task.get("n")))
+                kept_images = _image_payloads(task.get("data"))
+                previous_error_code = _clean(task.get("error_code"))
+                previous_failures = task.get("slot_failures")
+                slot_sessions = task.get("slot_sessions")
+                resumed_slot_index = _session_index_for_conversation(slot_sessions, conversation_id)
             formatted = format_image_result(
                 image_items,
                 "",
@@ -1360,65 +1916,150 @@ class ImageTaskService:
                 int(time.time()),
                 requested_size=size,
             )
-            data = formatted["data"]
-            self._update_task(
-                key,
-                status=TASK_STATUS_SUCCESS,
-                data=data,
-                error="",
-                duration_ms=int((time.time() - started) * 1000),
-                account_token_fingerprint="",
-                **_clear_task_details(),
+            resumed_images = formatted.get("data") if isinstance(formatted, dict) else []
+            data, remaining_failures, fresh_images = _merge_resumed_image_data(
+                kept_images,
+                resumed_images,
+                requested_count,
+                previous_failures,
+                resumed_slot_index,
             )
-            auto_push_gallery_urls(
-                _collect_image_urls(formatted),
-                metadata=_generation_push_metadata(formatted, model=model),
-                base_url=base_url,
-            )
+            new_urls = _collect_image_urls({"data": fresh_images})
+            duration_ms = int((time.time() - started) * 1000)
+            call_status = _kept_call_status(data, requested_count)
+            if call_status == "success":
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_SUCCESS,
+                    data=data,
+                    error="",
+                    duration_ms=duration_ms,
+                    account_token_fingerprint="",
+                    slot_failures=[],
+                    slot_sessions=[],
+                    **_clear_task_details(),
+                )
+                public_error = ""
+            else:
+                public_error, failure_code = _partial_slot_failure({"errors": [
+                    {
+                        "index": item["index"],
+                        "error": {"message": item["message"], "code": item["code"]},
+                    }
+                    for item in remaining_failures
+                ]})
+                resumable_remaining = [
+                    item for item in remaining_failures
+                    if image_failure(item["code"]).code in _RESUMABLE_IMAGE_CODES
+                ]
+                next_sessions = _resumable_slot_sessions(slot_sessions, resumable_remaining)
+                next_session = next_sessions[0] if next_sessions else None
+                if failure_code not in _RESUMABLE_IMAGE_CODES and resumable_remaining:
+                    failure_code = (
+                        previous_error_code
+                        if previous_error_code in _RESUMABLE_IMAGE_CODES
+                        else "image_poll_timeout"
+                    )
+                resume_conversation = conversation_id
+                resume_fingerprint = ""
+                if next_session is not None:
+                    resume_conversation = next_session["conversation_id"]
+                    resume_fingerprint = next_session["account_token_fingerprint"]
+                    can_resume = True
+                elif not _slot_session_records(slot_sessions):
+                    can_resume = bool(resumable_remaining) and bool(conversation_id)
+                else:
+                    can_resume = False
+                if not public_error:
+                    public_error = "有图片没有生成成功"
+                detail_updates: dict[str, Any] = {
+                    "error_code": failure_code,
+                    "can_resume_poll": can_resume,
+                    "conversation_id": resume_conversation,
+                }
+                if resume_fingerprint:
+                    detail_updates["account_token_fingerprint"] = resume_fingerprint
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_ERROR,
+                    data=data,
+                    error=public_error,
+                    duration_ms=duration_ms,
+                    slot_failures=remaining_failures,
+                    **detail_updates,
+                )
+            if new_urls:
+                auto_push_gallery_urls(
+                    new_urls,
+                    metadata=_generation_push_metadata(formatted, model=model),
+                    base_url=base_url,
+                )
             self._log_call(
                 identity,
                 mode,
                 model,
                 started,
                 "调用完成（续轮询）",
-                status="success",
-                urls=_collect_image_urls(formatted),
+                status=call_status,
+                error=public_error,
+                urls=_collect_image_urls({"data": data}),
                 perf={"handler_queue_ms": handler_queue_ms},
                 request_payload=request_payload,
-                result=formatted,
+                result={"data": data},
             )
-            outcome = True
+            outcome = True if fresh_images else None
+            if call_status != "success":
+                follow_up = self._resume_follow_up(key, conversation_id, seen)
+        except _ResumeAttemptDone:
+            pass
         except Exception as exc:
             failure = classify_image_exception(exc)
             outcome = False
             public_error, raw_error, error_details = _normalize_task_failure(exc, "resume poll failed")
             if error_details.get("error_code") in _RESUMABLE_IMAGE_CODES and conversation_id:
                 error_details["can_resume_poll"] = True
-            if quota_already_consumed or (
+            slot_consumed = quota_already_consumed or (
                 failure is not None and failure.code == "image_download_failed"
-            ):
+            )
+            if slot_consumed:
                 error_details["quota_consumed"] = True
+            with self._lock:
+                current_task = self._tasks.get(key) or {}
+            updated_failures = _slot_failures_after_quota(
+                current_task,
+                conversation_id,
+                consumed=slot_consumed,
+                code=(
+                    failure.code
+                    if failure is not None and failure.code in _RESUMABLE_IMAGE_CODES
+                    else ""
+                ),
+            )
+            detail_fields = _task_detail_fields(error_details)
+            if updated_failures is not None:
+                detail_fields["slot_failures"] = updated_failures
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(
                 key,
                 status=TASK_STATUS_ERROR,
                 error=public_error,
-                data=[],
+                data=self._kept_image_data(key),
                 duration_ms=duration_ms,
-                **_task_detail_fields(error_details),
+                **detail_fields,
             )
-            self._log_call(
+            self._log_saved_image_failure(
                 identity,
                 mode,
                 model,
                 started,
                 "调用失败（续轮询）",
-                status="failed",
+                key=key,
                 error=public_error,
                 perf={"handler_queue_ms": handler_queue_ms},
                 request_payload=request_payload,
                 extra=error_details,
             )
+            follow_up = self._resume_follow_up(key, conversation_id, seen)
         finally:
             if held_token:
                 try:
@@ -1455,6 +2096,49 @@ class ImageTaskService:
                     proxy_settings.release_image_egress(profile)
             if backend is not None:
                 backend.close()
+        if follow_up is None:
+            return
+        next_conversation, next_token = follow_up
+        with self._lock:
+            next_consumed = _slot_quota_already_consumed(
+                self._tasks.get(key) or {},
+                next_conversation,
+            )
+        self._run_resume_poll(
+            key,
+            next_conversation,
+            next_token,
+            extra_timeout_secs,
+            identity,
+            mode,
+            model,
+            base_url,
+            submitted_wall,
+            submitted_perf,
+            next_consumed,
+            resume_error_code,
+            _seen_conversations=seen,
+        )
+
+    def _resume_follow_up(
+        self,
+        key: str,
+        current_conversation: str,
+        seen: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        """The next unfinished slot, using that slot's own account token."""
+        with self._lock:
+            pending = _resume_poll_targets(self._tasks.get(key) or {}, current_conversation)
+        current = _clean(current_conversation)
+        for session in pending:
+            conversation = session["conversation_id"]
+            if not conversation or conversation == current or conversation in seen:
+                continue
+            try:
+                return conversation, _resume_access_token(session)
+            except ValueError:
+                continue
+        return None
 
     def runtime_status(self) -> dict[str, int | bool]:
         return self.task_runner.status()

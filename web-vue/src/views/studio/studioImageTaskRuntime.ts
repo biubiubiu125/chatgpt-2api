@@ -125,7 +125,11 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
       if (!task.terminal) {
         message.status = 'running'
         message.error = undefined
-      } else if (task.status === 'success' || task.status === 'partial_success' || task.status === 'text_review') {
+      } else if (task.status === 'partial_success') {
+        message.status = 'done'
+        message.error = task.public_error || undefined
+        if (previousStatus !== 'done') input.hooks.markConversationNotice(conversation.id, 'done')
+      } else if (task.status === 'success' || task.status === 'text_review') {
         message.status = 'done'
         message.error = undefined
         if (previousStatus !== 'done') input.hooks.markConversationNotice(conversation.id, 'done')

@@ -182,11 +182,10 @@ RATE_LIMIT_FAILURE_CODES = frozenset({
     "限流",
 })
 
-TEXT_REVIEW_FAILURE_CODES = frozenset(
-    code
-    for code, policy in FAILURE_POLICIES.items()
-    if policy.status_code == 400
-)
+TEXT_REVIEW_FAILURE_CODES = frozenset({
+    "content_policy_violation",
+    "upstream_text_reply",
+})
 
 FAILED_STATUSES = frozenset({"error", "fail", "failed", "limited", "rate_limited", "限流"})
 

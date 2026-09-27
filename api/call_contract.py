@@ -210,6 +210,7 @@ class LogFacets(BaseModel):
 class LogStats(BaseModel):
     total: int = Field(ge=0)
     success: int = Field(ge=0)
+    partial_success: int = Field(default=0, ge=0)
     text_review: int = Field(ge=0)
     failed: int = Field(ge=0)
     limited: int = Field(ge=0)

@@ -328,6 +328,7 @@ export interface DashboardAccountStats {
 export interface DashboardTotals {
   total: number
   success: number
+  partial_success?: number
   final_failed: number
   success_rate: number | null
   avg_success_duration_ms: number | null
@@ -339,6 +340,7 @@ export interface DashboardBucket {
   end_at: string
   total_calls: number
   success_calls: number
+  partial_success_calls?: number
   final_failed_calls: number
   success_rate: number | null
   avg_success_duration_ms: number | null
@@ -357,6 +359,7 @@ export interface DashboardSwitching {
 export interface DashboardTrend {
   labels: string[]
   success_requests: number[]
+  partial_success_requests?: number[]
   final_failed_requests: number[]
   success_rate: Array<number | null>
   switch_count: number[]

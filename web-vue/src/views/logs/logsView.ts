@@ -79,6 +79,7 @@ export const systemLogPageSizeOptions = [20, 50, 100, 200, 500]
 export const statusOptions = [
   { label: '全部状态', value: '' },
   { label: '成功', value: 'success' },
+  { label: '部分成功', value: 'partial_success' },
   { label: '失败', value: 'failed' },
   { label: '限流/受限', value: 'limited' },
 ]
@@ -294,6 +295,7 @@ export function systemMetricItems(logMeta: Pick<SystemLogsResponse, 'stats' | 's
   return [
     { label: pageScope ? '本页总数' : '总数', value: stats.total, class: 'text-foreground' },
     { label: pageScope ? '本页成功' : '成功', value: stats.success, class: 'text-emerald-600' },
+    { label: pageScope ? '本页部分成功' : '部分成功', value: stats.partial_success ?? 0, class: 'text-amber-600' },
     { label: pageScope ? '本页文本' : '文本', value: stats.text_review, class: 'text-violet-600' },
     { label: pageScope ? '本页失败' : '失败', value: stats.failed, class: 'text-rose-600' },
     { label: pageScope ? '本页限流' : '限流', value: stats.limited, class: 'text-amber-600' },
