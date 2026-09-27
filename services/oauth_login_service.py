@@ -192,7 +192,7 @@ class OAuthLoginService:
     @staticmethod
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
-        kwargs = proxy_settings.build_session_kwargs(impersonate=CHROME146_IMPERSONATE, verify=False)
+        kwargs = proxy_settings.build_session_kwargs(impersonate=CHROME146_IMPERSONATE)
         session = requests.Session(**kwargs)
         try:
             response = session.post(

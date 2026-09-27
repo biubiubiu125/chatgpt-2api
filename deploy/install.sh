@@ -149,7 +149,7 @@ text() {
       step_port) printf 'Web/API port' ;;
       hint_port) printf 'Browser and API clients will use this host port. The container still listens on port 80.' ;;
       step_base_url) printf 'Image access URL' ;;
-      hint_base_url) printf 'Prefix used in returned image URLs. Press Enter to leave it empty and follow the current request. A bare domain or IP is saved as https, for example example.com becomes https://example.com.' ;;
+      hint_base_url) printf 'Prefix used in returned image URLs. Press Enter to leave it empty; links stay relative and do not use the request Host. A bare domain or IP is saved as https, for example example.com becomes https://example.com.' ;;
       step_dir) printf 'Install directory' ;;
       hint_dir) printf 'Compose files, .env, and config.json are written here. The default is /opt/chatgpt-2api.' ;;
       step_auth) printf 'Admin login key' ;;
@@ -173,7 +173,7 @@ text() {
       summary_mode) printf 'Run mode' ;;
       summary_port) printf 'Port' ;;
       summary_base_url) printf 'Image URL' ;;
-      summary_base_url_empty) printf 'not set; image links follow the current request address' ;;
+      summary_base_url_empty) printf 'not set; image links stay relative' ;;
       summary_dir) printf 'Directory' ;;
       summary_database) printf 'Database' ;;
       summary_git) printf 'Source' ;;
@@ -237,7 +237,7 @@ text() {
     step_port) printf 'Web/API 端口' ;;
     hint_port) printf '浏览器打开控制台、调用 API 都走这个宿主机端口。容器内部仍监听 80。' ;;
     step_base_url) printf '图片访问地址' ;;
-    hint_base_url) printf '用来生成图片结果的访问前缀。直接回车留空，按当前请求地址生成链接。只填域名或 IP 会自动补成 https，例如 example.com 会变成 https://example.com。' ;;
+    hint_base_url) printf '用来生成图片结果的访问前缀。直接回车留空，结果链接保持相对路径，不使用请求里的 Host。只填域名或 IP 会自动补成 https，例如 example.com 会变成 https://example.com。' ;;
     step_dir) printf '安装目录' ;;
     hint_dir) printf 'Compose、.env 和 config.json 会写到这里。默认目录是 /opt/chatgpt-2api。' ;;
     step_auth) printf '管理员登录密钥' ;;
@@ -261,7 +261,7 @@ text() {
     summary_mode) printf '运行方式' ;;
     summary_port) printf '端口' ;;
     summary_base_url) printf '图片访问地址' ;;
-    summary_base_url_empty) printf '未设置，按当前请求地址生成图片链接' ;;
+    summary_base_url_empty) printf '未设置，结果链接保持相对路径' ;;
     summary_dir) printf '安装目录' ;;
     summary_database) printf '数据库' ;;
     summary_git) printf '代码来源' ;;

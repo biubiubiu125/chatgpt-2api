@@ -48,7 +48,10 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    # Host is caller-controlled. A missing public origin must stay relative
+    # instead of signing a media URL onto an attacker-chosen host.
+    del request
+    return config.base_url
 
 
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:

@@ -2218,6 +2218,18 @@ class AccountService:
         return refreshed
 
     @staticmethod
+    def _log_image_result_persist_failure(exc: BaseException) -> None:
+        try:
+            from utils.log import logger
+
+            logger.warning({
+                "event": "image_result_persist_failed",
+                "error_type": type(exc).__name__,
+            })
+        except Exception:
+            return
+
+    @staticmethod
     def _log_image_preflight_refresh_failure(exc: BaseException) -> None:
         try:
             from utils.log import logger
@@ -4330,6 +4342,7 @@ class AccountService:
         now = datetime.now(timezone.utc)
         should_verify_after_failure = False
         consumed_quota = success if quota_consumed is None else bool(quota_consumed)
+        result: dict | None = None
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             self._release_image_slot_locked(access_token)
@@ -4393,19 +4406,27 @@ class AccountService:
                     should_verify_after_failure = False
                     return None
                 result = dict(persisted)
+            except Exception as exc:
+                # The slot was already released above. Raising here makes the
+                # caller release it again and drops another in-flight request.
+                self._log_image_result_persist_failure(exc)
+                return None
             finally:
                 self._image_slot_condition.notify_all()
         if should_verify_after_failure:
-            scheduled = self._schedule_account_refresh_after_image_failure(
-                access_token,
-                force=True,
-            )
-            if not scheduled:
-                self._record_remote_check_error(
+            try:
+                scheduled = self._schedule_account_refresh_after_image_failure(
                     access_token,
-                    "image_failure",
-                    "Account verification could not be scheduled.",
+                    force=True,
                 )
+                if not scheduled:
+                    self._record_remote_check_error(
+                        access_token,
+                        "image_failure",
+                        "Account verification could not be scheduled.",
+                    )
+            except Exception as exc:
+                self._log_image_result_persist_failure(exc)
         return result
 
     def fetch_remote_info(

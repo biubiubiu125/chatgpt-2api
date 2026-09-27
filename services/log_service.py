@@ -1259,14 +1259,18 @@ class LoggedCall:
             if image_request and getattr(self, "_image_delivery_abandoned", False):
                 raise
             failed = True
+            sent_images = list(getattr(self, "_sent_image_deliveries", []) or []) if image_request else []
+            delivered = bool(sent_images)
             extra = _exception_log_fields(exc, image=image_request)
             extra.update(result_metrics)
             combined_attempts = collect_image_attempts([image_attempts, exc])
             if combined_attempts:
                 extra["image_attempts"] = combined_attempts
+            if delivered:
+                extra["image_result_status"] = "partial_success"
             self.log(
-                "流式调用失败",
-                status="failed",
+                "流式调用结束" if delivered else "流式调用失败",
+                status="partial_success" if delivered else "failed",
                 error=(
                     _public_image_exception_message(exc)
                     if image_request else str(exc)
