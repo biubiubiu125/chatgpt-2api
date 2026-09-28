@@ -9,7 +9,6 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from contracts.settings_specification import (
-    normalize_float_setting,
     normalize_integer_setting,
     numeric_setting_spec,
 )
@@ -531,25 +530,6 @@ class ConfigStore:
         return self.image_stream_timeout_secs + self.image_poll_timeout_secs + 30
 
     @property
-    def image_poll_interval_secs(self) -> float:
-        self.reload_if_changed()
-        return normalize_float_setting(
-            "image_poll_interval_secs",
-            self.data.get("image_poll_interval_secs"),
-        )
-
-    @property
-    def image_poll_initial_wait_secs(self) -> float:
-        """Image generation upstream takes ~30s; polling immediately wastes requests
-        and trips a transient 429. Default 5s gives the conversation document time
-        to commit before the first poll."""
-        self.reload_if_changed()
-        return normalize_float_setting(
-            "image_poll_initial_wait_secs",
-            self.data.get("image_poll_initial_wait_secs"),
-        )
-
-    @property
     def image_account_concurrency(self) -> int:
         return normalize_integer_setting(
             "image_account_concurrency",
@@ -599,30 +579,6 @@ class ConfigStore:
     def image_remove_conversation_after_result(self) -> bool:
         self.reload_if_changed()
         return _normalize_bool(self.data.get("image_remove_conversation_after_result"), False)
-
-    @property
-    def image_settle_enabled(self) -> bool:
-        """图片二次确认机制：找到 file_ids 后等待一段时间再次确认。"""
-        value = self.data.get("image_settle_enabled", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def image_check_before_hit_enabled(self) -> bool:
-        """先check再hit：通过轮询确认 file_ids 存在后再返回，而非仅依赖 SSE 事件。"""
-        value = self.data.get("image_check_before_hit_enabled", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def image_settle_secs(self) -> float:
-        """二次确认等待时间（秒）。"""
-        return normalize_float_setting(
-            "image_settle_secs",
-            self.data.get("image_settle_secs"),
-        )
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
@@ -699,8 +655,6 @@ class ConfigStore:
             data["console_request_timeout_secs"] = self.console_request_timeout_secs
             data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
             data["image_stream_timeout_secs"] = self.image_stream_timeout_secs
-            data["image_poll_interval_secs"] = self.image_poll_interval_secs
-            data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
             data["image_account_concurrency"] = self.image_account_concurrency
             data["account_processing_concurrency"] = self.account_processing_concurrency
             data["image_account_retry_enabled"] = self.image_account_retry_enabled

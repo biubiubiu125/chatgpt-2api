@@ -46,15 +46,6 @@
         <div class="settings-check-item">
           <div class="settings-check-control">
             <Checkbox
-              v-model="settings.image_settle_enabled"
-              :disabled="fieldReadOnly('image_settle_enabled')"
-            >图片二次确认机制</Checkbox>
-            <HelpTip text="找到图片结果后再等待指定秒数复查一次，减少结果尚未稳定时提前返回。" />
-          </div>
-        </div>
-        <div class="settings-check-item">
-          <div class="settings-check-control">
-            <Checkbox
               v-model="settings.image_remove_conversation_after_result"
               :disabled="fieldReadOnly('image_remove_conversation_after_result')"
             >图片成功后删除官网会话</Checkbox>
@@ -62,12 +53,6 @@
           </div>
         </div>
       </div>
-      <FormField label="二次确认等待（秒）">
-        <SettingsNumberInput
-          :field="imageSettleSecondsField"
-          :disabled="!settings.image_settle_enabled"
-        />
-      </FormField>
     </FormSection>
 
     <FormSection title="图片放大">
@@ -134,7 +119,6 @@ const props = defineProps<{
   settings: Settings
   fields: SettingsFields
   imageMaxAccountAttemptsField: NumberSettingField
-  imageSettleSecondsField: NumberSettingField
 }>()
 
 defineEmits<{

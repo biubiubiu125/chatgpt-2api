@@ -29,7 +29,6 @@ from contracts.settings import (
     ThirdPartyAppsSettings,
 )
 from contracts.settings_specification import (
-    normalize_float_setting,
     normalize_integer_setting,
     numeric_setting_spec,
 )
@@ -55,8 +54,6 @@ _MANAGED_TOP_LEVEL_FIELDS = (
     "console_request_timeout_secs",
     "image_poll_timeout_secs",
     "image_stream_timeout_secs",
-    "image_poll_initial_wait_secs",
-    "image_poll_interval_secs",
     "image_account_concurrency",
     "account_processing_concurrency",
     "image_account_retry_enabled",
@@ -64,8 +61,6 @@ _MANAGED_TOP_LEVEL_FIELDS = (
     "image_upscale_engine",
     "image_max_account_attempts",
     "image_remove_conversation_after_result",
-    "image_settle_enabled",
-    "image_settle_secs",
     "auto_remove_invalid_accounts",
     "auto_remove_rate_limited_accounts",
     "log_levels",
@@ -243,8 +238,6 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
     "console_request_timeout_secs": _numeric_field_metadata("console_request_timeout_secs"),
     "image_poll_timeout_secs": _numeric_field_metadata("image_poll_timeout_secs"),
     "image_stream_timeout_secs": _numeric_field_metadata("image_stream_timeout_secs"),
-    "image_poll_initial_wait_secs": _numeric_field_metadata("image_poll_initial_wait_secs"),
-    "image_poll_interval_secs": _numeric_field_metadata("image_poll_interval_secs"),
     "image_account_concurrency": _numeric_field_metadata("image_account_concurrency"),
     "account_processing_concurrency": _numeric_field_metadata("account_processing_concurrency"),
     "image_account_retry_enabled": _field_metadata(True),
@@ -252,8 +245,6 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
     "image_upscale_engine": _field_metadata("sharp_lanczos3", options=("sharp_lanczos3", "pillow_lanczos")),
     "image_max_account_attempts": _numeric_field_metadata("image_max_account_attempts"),
     "image_remove_conversation_after_result": _field_metadata(False),
-    "image_settle_enabled": _field_metadata(True),
-    "image_settle_secs": _numeric_field_metadata("image_settle_secs"),
     "auto_remove_invalid_accounts": _field_metadata(True),
     "auto_remove_rate_limited_accounts": _field_metadata(False),
     "log_levels": _field_metadata([], options=("debug", "info", "warning", "error")),
@@ -506,14 +497,6 @@ class SettingsManagementService:
                 "image_stream_timeout_secs",
                 effective.get("image_stream_timeout_secs"),
             ),
-            image_poll_initial_wait_secs=normalize_float_setting(
-                "image_poll_initial_wait_secs",
-                effective.get("image_poll_initial_wait_secs"),
-            ),
-            image_poll_interval_secs=normalize_float_setting(
-                "image_poll_interval_secs",
-                effective.get("image_poll_interval_secs"),
-            ),
             image_account_concurrency=normalize_integer_setting(
                 "image_account_concurrency",
                 effective.get("image_account_concurrency"),
@@ -536,11 +519,6 @@ class SettingsManagementService:
             image_remove_conversation_after_result=_bool(
                 effective.get("image_remove_conversation_after_result"),
                 False,
-            ),
-            image_settle_enabled=_bool(effective.get("image_settle_enabled"), True),
-            image_settle_secs=normalize_float_setting(
-                "image_settle_secs",
-                effective.get("image_settle_secs"),
             ),
             auto_remove_invalid_accounts=_bool(effective.get("auto_remove_invalid_accounts"), True),
             auto_remove_rate_limited_accounts=_bool(

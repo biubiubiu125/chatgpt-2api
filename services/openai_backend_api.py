@@ -3165,6 +3165,10 @@ class OpenAIBackendAPI:
         }
         return snapshot, diagnostic_excerpt(terminal_assistant_text(data), 2000)
 
+    _IMAGE_POLL_IDLE_SECS = 1.0
+    # Leave this much of a short poll budget so the first query can start.
+    _IMAGE_POLL_QUERY_RESERVE_SECS = 0.05
+
     def _poll_image_results(
             self,
             conversation_id: str,
@@ -3174,20 +3178,24 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 5s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
-        - Subsequent polls are image_poll_interval_secs apart (default 5s).
-        - Failures marked retryable by the canonical image-failure policy back
-          off exponentially (capped at 16s, +jitter), honoring Retry-After.
-        - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
+        Idle waits are fixed at 1 second and are not settings. The first wait adds
+        at most 0.2 seconds of jitter. ChatGPT image generation takes ~30s; polling
+        immediately wastes requests and trips a transient 429 the upstream returns
+        within ~200ms of the SSE stream closing (the conversation document is not
+        yet committed). Empty polls and the confirmation wait use the same 1 second.
+        Retryable upstream failures still back off exponentially (capped at 16s,
+        plus jitter) and honor Retry-After. That backoff is not limited to 1 second.
+        All sleeps stay within timeout_secs. An idle sleep never consumes the whole
+        budget, so the minimum 1 second timeout still issues one conversation query.
+        If the confirmation wait would leave no time for that recheck, the ids
+        already seen are returned instead of being discarded as a timeout.
+        On exhaustion raises ImagePollTimeoutError.
         """
         self._reset_image_result_timing()
         started_at = time.monotonic()
         attempt = 0
-        interval = float(config.image_poll_interval_secs)
-        initial_wait = float(config.image_poll_initial_wait_secs)
+        interval = self._IMAGE_POLL_IDLE_SECS
+        initial_wait = self._IMAGE_POLL_IDLE_SECS
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -3209,15 +3217,21 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             return timeout_secs - (time.monotonic() - started_at)
 
-        if has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
-            if settle_for > 0:
-                self._sleep_for_image_poll(settle_for)
-        elif initial_wait > 0:
-            jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
+        def _idle_sleep(desired: float) -> None:
+            remaining = max(0.0, _remaining())
+            if remaining <= 0 or desired <= 0:
+                return
+            sleep_for = min(desired, remaining)
+            if remaining - sleep_for < self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                sleep_for = max(0.0, remaining - self._IMAGE_POLL_QUERY_RESERVE_SECS)
             if sleep_for > 0:
                 self._sleep_for_image_poll(sleep_for)
+
+        if has_initial_ids:
+            _idle_sleep(min(self._IMAGE_POLL_IDLE_SECS, max(0.0, _remaining())))
+        elif initial_wait > 0:
+            jitter = random.uniform(0, min(0.2, initial_wait * 0.2))
+            _idle_sleep(initial_wait + jitter)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -3464,30 +3478,25 @@ class OpenAIBackendAPI:
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
-                if not config.image_check_before_hit_enabled:
-                    # 先check再hit 机制关闭：直接返回首次发现的 file_ids
-                    logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
-                                 "file_ids": file_ids, "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
                 if last_hit_key == hit_key:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
                 last_hit_key = hit_key
-                if not config.image_settle_enabled:
-                    # 二次确认机制关闭：直接返回首次发现的 file_ids
-                    logger.info({"event": "image_poll_hit_settle_disabled", "conversation_id": conversation_id,
+                remaining_now = max(0.0, _remaining())
+                wait = min(self._IMAGE_POLL_IDLE_SECS, remaining_now)
+                # Sleeping out the last of the budget cannot confirm anything.
+                # Keep the ids this query already returned.
+                if wait <= 0 or remaining_now - wait < self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                    logger.info({"event": "image_poll_hit", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
-                             "settle_secs": config.image_settle_secs})
-                wait = min(config.image_settle_secs, max(0.0, _remaining()))
-                if wait > 0:
-                    self._sleep_for_image_poll(wait)
-                    continue
-                return file_ids, sediment_ids
+                             "settle_secs": wait})
+                self._sleep_for_image_poll(wait)
+                continue
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - started_at, 1)})
             wait = min(interval, max(0.0, _remaining()))
@@ -3785,17 +3794,6 @@ class OpenAIBackendAPI:
         timeout = self._bounded_image_timeout(
             poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
         )
-        # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
-        # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
-        if poll and conversation_id and (file_ids or sediment_ids):
-            if not config.image_check_before_hit_enabled and not config.image_settle_enabled:
-                logger.info({
-                    "event": "image_resolve_skip_poll_direct_resolve",
-                    "conversation_id": conversation_id,
-                    "file_ids": file_ids,
-                    "sediment_ids": sediment_ids,
-                })
-                return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",

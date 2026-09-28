@@ -71,8 +71,6 @@ export interface Settings {
   console_request_timeout_secs: number
   image_poll_timeout_secs: number
   image_stream_timeout_secs: number
-  image_poll_initial_wait_secs: number
-  image_poll_interval_secs: number
   image_account_concurrency: number
   account_processing_concurrency: number
   image_account_retry_enabled: boolean
@@ -80,8 +78,6 @@ export interface Settings {
   image_upscale_engine: 'sharp_lanczos3' | 'pillow_lanczos'
   image_max_account_attempts: number
   image_remove_conversation_after_result: boolean
-  image_settle_enabled: boolean
-  image_settle_secs: number
   auto_remove_invalid_accounts: boolean
   auto_remove_rate_limited_accounts: boolean
   log_levels: string[]

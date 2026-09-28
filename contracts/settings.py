@@ -187,8 +187,6 @@ class _SettingsEditableFields(_StrictModel):
     console_request_timeout_secs: int = _numeric_field("console_request_timeout_secs")
     image_poll_timeout_secs: int = _numeric_field("image_poll_timeout_secs")
     image_stream_timeout_secs: int = _numeric_field("image_stream_timeout_secs")
-    image_poll_initial_wait_secs: float = _numeric_field("image_poll_initial_wait_secs")
-    image_poll_interval_secs: float = _numeric_field("image_poll_interval_secs")
     image_account_concurrency: int = _numeric_field("image_account_concurrency")
     account_processing_concurrency: int = _numeric_field("account_processing_concurrency")
     image_account_retry_enabled: bool = True
@@ -196,8 +194,6 @@ class _SettingsEditableFields(_StrictModel):
     image_upscale_engine: ImageUpscaleEngine = "sharp_lanczos3"
     image_max_account_attempts: int = _numeric_field("image_max_account_attempts")
     image_remove_conversation_after_result: bool = False
-    image_settle_enabled: bool = True
-    image_settle_secs: float = _numeric_field("image_settle_secs")
     auto_remove_invalid_accounts: bool = True
     auto_remove_rate_limited_accounts: bool = False
     log_levels: list[LogLevel] = Field(default_factory=list)

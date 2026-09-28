@@ -78,20 +78,6 @@
           </template>
           <SettingsNumberInput :field="imagePollTimeoutField" />
         </FormField>
-
-        <FormField label="图片首次轮询等待">
-          <template #label-extra>
-            <HelpTip text="单位秒，开始查询图片结果前先等待的时间。" />
-          </template>
-          <SettingsNumberInput :field="imagePollInitialWaitField" />
-        </FormField>
-
-        <FormField label="图片轮询间隔">
-          <template #label-extra>
-            <HelpTip text="单位秒，两次图片结果查询之间的等待时间。" />
-          </template>
-          <SettingsNumberInput :field="imagePollIntervalField" />
-        </FormField>
       </div>
     </FormSection>
   </div>
@@ -113,8 +99,6 @@ const props = defineProps<{
   consoleRequestTimeoutField: NumberSettingField
   imagePollTimeoutField: NumberSettingField
   imageStreamTimeoutField: NumberSettingField
-  imagePollInitialWaitField: NumberSettingField
-  imagePollIntervalField: NumberSettingField
   imageAccountConcurrencyField: NumberSettingField
   accountProcessingConcurrencyField: NumberSettingField
 }>()

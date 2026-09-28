@@ -36,8 +36,6 @@
               :console-request-timeout-field="consoleRequestTimeoutField"
               :image-poll-timeout-field="imagePollTimeoutField"
               :image-stream-timeout-field="imageStreamTimeoutField"
-              :image-poll-initial-wait-field="imagePollInitialWaitField"
-              :image-poll-interval-field="imagePollIntervalField"
               :image-account-concurrency-field="imageAccountConcurrencyField"
               :account-processing-concurrency-field="accountProcessingConcurrencyField"
             />
@@ -74,7 +72,6 @@
             :settings="localSettings"
             :fields="settingsFields"
             :image-max-account-attempts-field="imageMaxAccountAttemptsField"
-            :image-settle-seconds-field="imageSettleSecondsField"
             @set-log-level="setLogLevel"
           />
         </div>
@@ -547,22 +544,6 @@ const imageStreamTimeoutField = useNumberSettingField(
   },
   { integer: true, metadata: () => fieldMetadata('image_stream_timeout_secs') },
 )
-const imagePollInitialWaitField = useNumberSettingField(
-  () => localSettings.value?.image_poll_initial_wait_secs,
-  (value) => {
-    if (!localSettings.value) return
-    localSettings.value.image_poll_initial_wait_secs = value
-  },
-  { metadata: () => fieldMetadata('image_poll_initial_wait_secs') },
-)
-const imagePollIntervalField = useNumberSettingField(
-  () => localSettings.value?.image_poll_interval_secs,
-  (value) => {
-    if (!localSettings.value) return
-    localSettings.value.image_poll_interval_secs = value
-  },
-  { metadata: () => fieldMetadata('image_poll_interval_secs') },
-)
 const imageAccountConcurrencyField = useNumberSettingField(
   () => localSettings.value?.image_account_concurrency,
   (value) => {
@@ -589,17 +570,6 @@ const imageMaxAccountAttemptsField = useNumberSettingField(
     integer: true,
     metadata: () => fieldMetadata('image_max_account_attempts'),
     enabled: () => Boolean(localSettings.value?.image_account_retry_enabled),
-  },
-)
-const imageSettleSecondsField = useNumberSettingField(
-  () => localSettings.value?.image_settle_secs,
-  (value) => {
-    if (!localSettings.value) return
-    localSettings.value.image_settle_secs = value
-  },
-  {
-    metadata: () => fieldMetadata('image_settle_secs'),
-    enabled: () => Boolean(localSettings.value?.image_settle_enabled),
   },
 )
 const backupIntervalMinutesField = useNumberSettingField(
@@ -629,12 +599,9 @@ const numberSettingFields = [
   consoleRequestTimeoutField,
   imagePollTimeoutField,
   imageStreamTimeoutField,
-  imagePollInitialWaitField,
-  imagePollIntervalField,
   imageAccountConcurrencyField,
   accountProcessingConcurrencyField,
   imageMaxAccountAttemptsField,
-  imageSettleSecondsField,
   backupIntervalMinutesField,
   backupRotationKeepField,
   genboxTimeoutSecondsField,
