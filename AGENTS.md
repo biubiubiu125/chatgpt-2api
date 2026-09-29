@@ -29,11 +29,12 @@
 
 ## 当前版本
 
-- 当前版本是 `0.08`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
+- 当前版本是 `0.09`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
 - 默认 Web/API 端口是 `2080`，默认安装目录是 `/opt/chatgpt-2api`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时结果链接保持相对路径，不使用请求里的 `Host`，只填域名或 IP 会写成 `https://` 地址后写入 `CHATGPT2API_BASE_URL`。
 - 图片同时出图默认 `16`，排队默认 `256`，分别是 `CHATGPT2API_IMAGE_TASK_WORKERS` 和 `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE`。面板任务、OpenAI 出图、聊天生图和超时后续查共用；一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝。`CHATGPT2API_THREAD_TOKENS` 只是接口入口线程容量，不是同时出图数。
-- 对外图片和文件地址带签名，并保持在 `/images/`、`/image-thumbnails/` 或 `/files/`。`public_base_url` 只改主机，不改挂载路径。聊天和 Responses 的用户图片只接受公网地址；上游结果下载只允许 ChatGPT 资产域名，且不跟随跳转。一次多张图时，有图片成功就返回成功的图片。
+- 对外图片和文件地址带签名，并保持在 `/images/`、`/image-thumbnails/` 或 `/files/`。`public_base_url` 只改主机，不改挂载路径。图片存储可切到 `r2`：对象写入 Cloudflare R2，返回的公开地址不签名；关闭 WebDAV 开关不会把 `r2` 改回本地。WebDAV 全量同步成功后删除对应 R2 对象，删除失败保留 tombstone。聊天和 Responses 的用户图片只接受公网地址；上游结果下载只允许 ChatGPT 资产域名，且不跟随跳转。一次多张图时，有图片成功就返回成功的图片。
 - 部分成功单独计数，不折进成功率，小时统计也保留这一列。流式整单没有写出图片时记为失败并返回 SSE 错误，不再记成成功或以 `finish_reason=stop` 结束；已经写出图片后再异常记为部分成功。多张全失败保留真实错误码。续轮询按槽结算配额：下载失败的槽不重复扣，轮询超时的槽只扣一次，其它槽不继承整单已扣标记。账号出图结果落库失败时只释放这一张的槽。客户端断开后停止后续槽位并归还出图名额。OAuth 换 token 默认校验 TLS，只有代理配置跳过证书校验时才关闭。
+- 非流式出图先打开 JSON 响应，用换行保活，完成后再写最终文档；失败仍是 HTTP 200，数字状态放在 `error.status`。file id 和 sediment id 按不同图片计数，用户消息里的参考图不抬高期望张数。
 - 生图轮询空等固定 1 秒，不再提供首次等待、轮询间隔和二次确认设置。没有图片 ID 时先等 1 到 1.2 秒再查会话；已经有 ID 时先等 1 秒再确认一次。图片结果等待上限仍可设置，最短 1 秒时也会留下查询时间，至少查一次；确认等待放不下时返回已经看到的图片。可重试的退避不受这 1 秒限制。
 - 版本检查用 `scripts/check_release_version.py`，发布占用检查用 `scripts/check_unpublished_release.sh`。执行要求见 `.codex/rules/git-and-release.md`。
 

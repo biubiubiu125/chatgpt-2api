@@ -18,7 +18,7 @@
 | 提示词、远程导入和清理协调状态 | 各自领域 Repository | Application Database |
 | Editable File Task 元数据 | `EditableFileTaskService` 的任务 Repository | Application Database |
 | 图片任务 | `ImageTaskService` | `data/image_tasks.json` |
-| 图片索引与删除恢复状态 | `ImageStorageService` | `data/image_index.json`，实际图片可在本地或 WebDAV |
+| 图片索引与删除恢复状态 | `ImageStorageService` | `data/image_index.json`，实际图片可在本地、WebDAV 或 R2 |
 | 图片标签和缩略图 | 图片领域 Module | `data/` 下的图片关联文件 |
 
 ## 数据库选择与切换
@@ -38,7 +38,7 @@
 - 所有领域 Repository 共享一个进程级 Engine，但不共享可变业务状态。
 - SQLite 使用 WAL、外键和 busy timeout；PostgreSQL 使用有界连接池。
 - `ImageStorageService` 统一图片保存、删除、压缩、清理和同步；调用方不能直接改图片索引。
-- 图片删除先记录可恢复的删除状态，再执行本地或 WebDAV 操作，避免中断后旧操作误删新版本。
+- 图片删除先记录可恢复的删除状态，再执行本地、WebDAV 或 R2 操作，避免中断后旧操作误删新版本。
 
 备份需要同时覆盖 Application Database 与图片/文件资产位置。只备份数据库不能
 恢复本地或 WebDAV 图片和生成文件；只备份 `data/` 也不能恢复外部 PostgreSQL。

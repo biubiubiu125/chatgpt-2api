@@ -51,6 +51,7 @@ const settingsOptionLabels: Record<string, Record<string, string>> = {
     local: '仅本地',
     webdav: '仅 WebDAV',
     both: '本地 + WebDAV',
+    r2: '仅 R2',
   },
   'backup.include': {
     image_tasks: '图片任务记录',

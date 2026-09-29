@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.protocol.image_json_result import ImageJsonResult
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -298,6 +299,9 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         result.get("_image_attempts") if isinstance(result.get("_image_attempts"), list) else None,
         result.get("data"),
     )
+    call_status = str(result.get("_call_status") or "")
+    if call_status:
+        response["_call_status"] = call_status
     return response
 
 
@@ -402,7 +406,7 @@ def text_completion_response(model: str, messages: list[dict[str, Any]], thinkin
     return _with_log_metadata(response, _backend_account_email(backend))
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any]) -> dict[str, Any] | ImageJsonResult | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             _require_chat_image_request(body)
@@ -417,7 +421,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
-        return image_chat_response(body)
+        _require_chat_image_request(body)
+        return ImageJsonResult(lambda: image_chat_response(body))
     model, messages = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)

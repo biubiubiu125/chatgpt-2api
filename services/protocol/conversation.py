@@ -198,6 +198,9 @@ def _resolve_image_urls_with_monitor(
         **kwargs: Any,
 ) -> list[str]:
     resolve_started = time.perf_counter()
+    minimum_images = int(kwargs.pop("minimum_images", 0) or 0)
+    if minimum_images > 0:
+        setattr(backend, "_image_expected_count", minimum_images)
     try:
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id,
@@ -512,8 +515,11 @@ def format_image_result(
         if stored_url:
             image_urls.append(stored_url)
         asset: dict[str, Any] = {"revised_prompt": revised_prompt}
+        encoded = base64.b64encode(image_bytes).decode("ascii")
         if response_format == "b64_json":
-            asset["b64_json"] = base64.b64encode(image_bytes).decode("ascii")
+            asset["b64_json"] = encoded
+        elif response_format == "data_url":
+            asset["url"] = f"data:image/png;base64,{encoded}"
         else:
             asset["url"] = stored_url
         dimensions = image_size_from_bytes(image_bytes)
@@ -557,6 +563,7 @@ class ConversationState:
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
+    image_expected_count: int = 0
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
@@ -851,6 +858,47 @@ def _is_user_message_event(event: dict[str, Any]) -> bool:
     return False
 
 
+def _event_message(event: dict[str, Any]) -> dict[str, Any]:
+    value = event.get("v")
+    message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
+    return message if isinstance(message, dict) else {}
+
+
+def _count_image_parts(event: dict[str, Any]) -> int:
+    """Count image parts in one event, including a part that has no file id yet."""
+    content = _event_message(event).get("content") or {}
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        return 0
+    count = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        pointer = str(part.get("asset_pointer") or "")
+        if (
+            part.get("content_type") == "image_asset_pointer"
+            or pointer.startswith(("file-service://", "sediment://"))
+        ):
+            count += 1
+    return count
+
+
+def _image_request_count(text: str, *, role: str, content_type: str) -> int:
+    if not is_image_generation_arguments(text, role=role, content_type=content_type):
+        return 0
+    try:
+        arguments = json.loads(str(text or "").strip())
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(arguments, dict):
+        return 0
+    try:
+        count = int(arguments.get("n") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
+
+
 def update_conversation_state(
         state: ConversationState,
         payload: str,
@@ -949,6 +997,20 @@ def update_conversation_state(
     if image_context or state.tool_invoked is True:
         state.terminal_tool_arguments = None
 
+    # User messages carry reference images for edits. Those parts are not
+    # output pictures, and id extraction already ignores them.
+    if isinstance(event, dict) and not is_user_msg:
+        part_count = _count_image_parts(event)
+        if part_count > state.image_expected_count:
+            state.image_expected_count = part_count
+    argument_count = _image_request_count(
+        message_text,
+        role=str(state.message_facts.get("role") or ""),
+        content_type=str(state.message_facts.get("content_type") or ""),
+    )
+    if argument_count > state.image_expected_count:
+        state.image_expected_count = argument_count
+
     has_image_output = bool(state.file_ids or state.sediment_ids)
     if has_image_output:
         state.failure = None
@@ -989,6 +1051,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "conversation_id": state.conversation_id,
         "file_ids": list(state.file_ids),
         "sediment_ids": list(state.sediment_ids),
+        "image_expected_count": int(state.image_expected_count or 0),
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
@@ -1903,6 +1966,7 @@ def stream_image_outputs(
         file_ids,
         sediment_ids,
         poll_timeout_secs=config.image_poll_timeout_secs,
+        minimum_images=int(last.get("image_expected_count") or 0),
         index=index,
         total=total,
     )
@@ -3357,6 +3421,19 @@ def stream_image_chunks(
         close_iterator(outputs)
 
 
+def _slot_error_record(output: ImageOutput) -> dict[str, Any]:
+    failure = output.failure
+    return {
+        "index": output.index,
+        "error": {
+            "message": output.text or "image generation failed",
+            "type": failure.error_type if failure is not None else "image_generation_error",
+            "code": failure.code if failure is not None else "upstream_error",
+            "param": None,
+        },
+    }
+
+
 def collect_image_outputs(
         outputs: Iterable[ImageOutput],
         result_callback: Callable[[list[dict[str, Any]]], None] | None = None,
@@ -3371,9 +3448,11 @@ def collect_image_outputs(
     image_attempts: list[dict[str, Any]] = []
     failed_output: ImageOutput | None = None
     slot_errors: list[dict[str, Any]] = []
+    requested = 0
     try:
         for output in outputs:
             created = created or output.created
+            requested = max(requested, int(output.total or 0))
             if output.account_email and not account_email:
                 account_email = output.account_email
             if output.conversation_id and not conversation_id:
@@ -3385,19 +3464,12 @@ def collect_image_outputs(
                 progress_parts.append(output.text)
             elif output.kind == "message":
                 message = output.text
-                if output.failure is not None and failed_output is None:
-                    failed_output = output
+                if output.failure is not None:
+                    slot_errors.append(_slot_error_record(output))
+                    if failed_output is None:
+                        failed_output = output
             elif output.kind == "slot_failure":
-                failure = output.failure
-                slot_errors.append({
-                    "index": output.index,
-                    "error": {
-                        "message": output.text or "image generation failed",
-                        "type": failure.error_type if failure is not None else "image_generation_error",
-                        "code": failure.code if failure is not None else "upstream_error",
-                        "param": None,
-                    },
-                })
+                slot_errors.append(_slot_error_record(output))
                 if failed_output is None:
                     failed_output = output
             elif output.kind == "result":
@@ -3431,6 +3503,8 @@ def collect_image_outputs(
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if slot_errors and data:
         result["errors"] = slot_errors
+    if data and (slot_errors or requested > len(data)):
+        result["_call_status"] = "partial_success"
     if not data:
         text = message or "".join(progress_parts).strip()
         if text:

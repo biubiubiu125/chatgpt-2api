@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import os
 import re
+import socket
 import threading
 from time import monotonic
 from pathlib import Path
@@ -49,6 +51,11 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
     "public_base_url": "",
+    "r2_account_id": "",
+    "r2_access_key_id": "",
+    "r2_secret_access_key": "",
+    "r2_bucket": "",
+    "r2_public_base_url": "",
 }
 
 DEFAULT_GENBOX_PUSH = {
@@ -159,17 +166,77 @@ def _normalize_backup_settings(value: object) -> dict[str, object]:
     return normalized
 
 
+def _normalize_r2_public_base_url(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or not parsed.hostname:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _r2_public_host_is_public(hostname: str) -> bool:
+    """Reject loopback, private, and link-local hosts before a probe GET."""
+    host = str(hostname or "").strip().rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return _r2_resolved_host_is_public(host)
+    return bool(address.is_global)
+
+
+def _r2_resolved_host_is_public(host: str) -> bool:
+    """Reject a hostname when DNS already answers with a non-public address.
+
+    A name that cannot be resolved here is left for the bucket probe, which
+    resolves again immediately before connecting. Generation does not fetch
+    this URL.
+    """
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+    addresses = [item[4][0] for item in infos if item and len(item) > 4 and item[4]]
+    if not addresses:
+        return True
+    for address in addresses:
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _reject_unsafe_r2_public_base_url(raw: str) -> None:
+    if not _normalize_r2_public_base_url(raw):
+        raise ValueError("R2 图片公开地址必须是 https，且不能带账号、查询参数或片段")
+    host = urlsplit(str(raw).strip()).hostname or ""
+    if not _r2_public_host_is_public(host):
+        raise ValueError("R2 图片公开地址不能是内网、本机或链路本地地址")
+
+
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
+    if mode not in {"local", "webdav", "both", "r2"}:
         mode = "local"
     enabled = _normalize_bool(source.get("enabled"), False)
-    if not enabled:
+    if not enabled and mode in {"webdav", "both"}:
         mode = "local"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
     normalized = copy.deepcopy(source)
     normalized.pop("has_webdav_password", None)
+    normalized.pop("has_r2_secret_access_key", None)
     normalized.update({
         "enabled": enabled,
         "mode": mode,
@@ -178,6 +245,11 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        "r2_account_id": str(source.get("r2_account_id") or "").strip(),
+        "r2_access_key_id": str(source.get("r2_access_key_id") or "").strip(),
+        "r2_secret_access_key": str(source.get("r2_secret_access_key") or "").strip(),
+        "r2_bucket": str(source.get("r2_bucket") or "").strip(),
+        "r2_public_base_url": _normalize_r2_public_base_url(source.get("r2_public_base_url")),
     })
     return normalized
 
@@ -385,7 +457,31 @@ def _promote_legacy_basic_settings(data: dict[str, object]) -> dict[str, object]
     return next_data
 
 
+def _prepare_image_storage_update(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    raw_public_url = str(source.get("r2_public_base_url") or "").strip()
+    mode = str(source.get("mode") or "local").strip().lower()
+    if mode == "r2" and raw_public_url:
+        _reject_unsafe_r2_public_base_url(raw_public_url)
+    normalized = _normalize_image_storage_settings(value)
+    _validate_image_storage_settings(normalized)
+    return normalized
+
+
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
+    if str(settings.get("mode") or "") == "r2":
+        required = (
+            ("r2_account_id", "Account ID"),
+            ("r2_access_key_id", "Access Key ID"),
+            ("r2_secret_access_key", "Secret Access Key"),
+            ("r2_bucket", "Bucket"),
+            ("r2_public_base_url", "公开地址"),
+        )
+        missing = [label for key, label in required if not str(settings.get(key) or "").strip()]
+        if missing:
+            raise ValueError("R2 图片存储必须填写 " + "、".join(missing))
+        _reject_unsafe_r2_public_base_url(str(settings.get("r2_public_base_url") or ""))
+        return
     if not _normalize_bool(settings.get("enabled"), False):
         return
     if not str(settings.get("webdav_url") or "").strip():
@@ -753,8 +849,7 @@ class ConfigStore:
             if "backup" in updates:
                 updates["backup"] = _normalize_backup_settings(updates.get("backup"))
             if "image_storage" in updates:
-                updates["image_storage"] = _normalize_image_storage_settings(updates.get("image_storage"))
-                _validate_image_storage_settings(updates["image_storage"])
+                updates["image_storage"] = _prepare_image_storage_update(updates.get("image_storage"))
             if "genbox_push" in updates:
                 updates["genbox_push"] = _normalize_genbox_push_settings(updates.get("genbox_push"))
                 _validate_genbox_push_settings(updates["genbox_push"])

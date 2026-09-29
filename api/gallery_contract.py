@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 GalleryMediaType = Literal["image"]
 GalleryMediaFilter = Literal["all", "image"]
-GalleryStorage = Literal["local", "webdav", "both"]
+GalleryStorage = Literal["local", "webdav", "both", "r2"]
 GenBoxPushStatus = Literal["imported", "already-imported", "duplicate-local"]
 
 

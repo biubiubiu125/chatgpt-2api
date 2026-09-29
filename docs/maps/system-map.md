@@ -17,7 +17,7 @@ flowchart LR
     Domain --> Upstream["ChatGPT Web upstream"]
     Domain --> AppDB["Application Database<br/>SQLite or PostgreSQL"]
     Domain --> TaskFiles["Image Task and update-task JSON"]
-    Domain --> Assets["Image and editable-file assets<br/>local filesystem and optional WebDAV"]
+    Domain --> Assets["Image and editable-file assets<br/>local filesystem, optional WebDAV, or R2"]
     Domain --> Live["Process memory<br/>Active Requests and live operations"]
     Nanocat["nanocat-ui package"] --> Browser
 ```
@@ -47,7 +47,7 @@ backend business meaning from raw fields or error text.
 | Upstream Accounts and User Keys | Application Database | Account Repository through `DatabaseStorageBackend` |
 | Settings, Proxy Groups, Account Groups, remote-import configuration, Call Records, dashboard aggregates, Prompt Library snapshots, coordination state, and Editable File Tasks | Separate repositories in the Application Database | Their domain services and repository interfaces |
 | Image Tasks | `data/image_tasks.json` | `ImageTaskService` |
-| Image Assets and gallery catalogue | Local files and optional WebDAV plus `data/image_index.json` | `ImageStorageService` |
+| Image Assets and gallery catalogue | Local files, optional WebDAV, or R2 plus `data/image_index.json` | `ImageStorageService` |
 | Editable File Assets | Published and staging filesystem directories | `EditableFileTaskService` |
 | Active Requests and live operation counters | Process memory | `RealtimeMonitorService` |
 | Online-update task progress | `data/update_task.json` | `UpdateService` |

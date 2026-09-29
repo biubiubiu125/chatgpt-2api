@@ -9,6 +9,7 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from services.protocol.image_json_result import ImageJsonResult
 from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 
@@ -32,7 +33,7 @@ def _stream_generation(
     )
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]] | ImageJsonResult:
     prompt = str(body.get("prompt") or "")
     model = str(body.get("model") or "gpt-image-2")
     n = int(body.get("n") or 1)
@@ -57,9 +58,13 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     ))
     if body.get("stream"):
         return _stream_generation(outputs, body, prompt, model, size, quality)
-    result = collect_image_outputs(outputs, result_callback=body.get("_image_result_callback"))
-    result["usage"] = image_usage(
-        input_text_tokens=count_text_tokens(prompt, model),
-        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
-    )
-    return result
+
+    def produce() -> dict[str, Any]:
+        result = collect_image_outputs(outputs, result_callback=body.get("_image_result_callback"))
+        result["usage"] = image_usage(
+            input_text_tokens=count_text_tokens(prompt, model),
+            output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
+        )
+        return result
+
+    return ImageJsonResult(produce)

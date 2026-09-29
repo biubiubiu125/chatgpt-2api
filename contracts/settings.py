@@ -9,7 +9,7 @@ from contracts.settings_specification import numeric_setting_spec
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 ImageUpscaleEngine = Literal["sharp_lanczos3", "pillow_lanczos"]
-ImageStorageMode = Literal["local", "webdav", "both"]
+ImageStorageMode = Literal["local", "webdav", "both", "r2"]
 ProxyRuntimeClearanceMode = Literal["none", "manual"]
 SettingsFieldSource = Literal["default", "configured", "environment"]
 
@@ -63,6 +63,12 @@ class _ImageStorageFields(_StrictModel):
     webdav_password: str = ""
     webdav_root_path: str = "chatgpt2api/images"
     public_base_url: str = ""
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    has_r2_secret_access_key: bool = False
+    r2_bucket: str = ""
+    r2_public_base_url: str = ""
 
 
 class ImageStorageSettings(_ImageStorageFields):

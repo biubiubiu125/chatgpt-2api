@@ -41,6 +41,7 @@ from services.log_service import (
     log_service,
 )
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol.image_json_result import ImageJsonResult
 from utils.log import logger
 from services.realtime_monitor_service import realtime_monitor_service
 from services.storage.file_lock import interprocess_lock
@@ -1248,6 +1249,8 @@ class ImageTaskService:
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
+            if isinstance(result, ImageJsonResult):
+                result = result.produce()
             perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
@@ -1329,6 +1332,7 @@ class ImageTaskService:
                 base_url=_clean(payload.get("base_url")),
             )
             image_attempts = collect_image_attempts(result)
+            call_status = _kept_call_status(stored_data, requested_count)
             self._log_call(
                 identity,
                 mode,
@@ -1336,7 +1340,8 @@ class ImageTaskService:
                 started,
                 "调用完成",
                 request_preview=request_text(payload.get("prompt")),
-                error=partial_error,
+                status=call_status,
+                error="" if call_status == "success" else partial_error,
                 urls=_collect_image_urls(result),
                 account_email=account_email,
                 call_id=call_id,

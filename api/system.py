@@ -563,7 +563,10 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/image-storage/test")
     async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"result": await run_in_threadpool(image_storage_service.test_webdav)}
+        try:
+            return {"result": await run_in_threadpool(image_storage_service.test_connection)}
+        except (BackupError, ImageStorageError) as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/image-storage/sync")
     async def sync_image_storage_endpoint(authorization: str | None = Header(default=None)):

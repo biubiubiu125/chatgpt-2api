@@ -52,6 +52,8 @@ def _storage(item: Mapping[str, object]) -> tuple[str, bool, bool]:
     local = bool(item.get("local", True))
     webdav = bool(item.get("webdav", False))
     explicit = _text(item.get("storage")).lower()
+    if explicit == "r2" or _text(item.get("r2_key")):
+        return "r2", local, webdav
     if explicit not in {"local", "webdav", "both"}:
         explicit = "both" if local and webdav else ("webdav" if webdav else "local")
     return explicit, local, webdav
@@ -83,18 +85,30 @@ def gallery_row(
     path = _text(item.get("path") or item.get("rel") or item.get("name"))
     filename = _text(item.get("name") or item.get("filename")) or Path(path).name
     storage, local, webdav = _storage(item)
+    remote_url = _text(item.get("remote_url"))
+    # A WebDAV copy can still carry an old R2 key. That remote_url is the
+    # WebDAV address, so the card must keep using the panel file instead.
+    r2_url = (
+        remote_url
+        if storage == "r2" and not webdav and remote_url.startswith("https://")
+        else ""
+    )
+    # A WebDAV copy with no local file can still carry an R2 key so a WebDAV
+    # miss can fall back to the bucket. That key must not make retention
+    # delete the WebDAV image.
+    tracks_retention = local or (storage == "r2" and not webdav)
     expired, expires_at, expires_in_seconds = (
-        _expiry(item, retention_hours) if local else (False, None, None)
+        _expiry(item, retention_hours) if tracks_retention else (False, None, None)
     )
     return {
         "id": path,
         "path": path,
         "filename": filename,
-        "url": with_media_access(
+        "url": r2_url or with_media_access(
             image_media_mount_url(path, "images", base_url=base_url),
             path,
         ),
-        "thumbnail_url": _thumbnail_url(base_url, path),
+        "thumbnail_url": _thumbnail_url(base_url, path) if path else r2_url,
         "size_bytes": _non_negative_int(item.get("size") or item.get("size_bytes")),
         "created_at": _text(item.get("created_at")),
         "date": _text(item.get("date")),
@@ -106,7 +120,7 @@ def gallery_row(
         "storage": storage,
         "local": local,
         "webdav": webdav,
-        "available": local or webdav,
+        "available": local or webdav or storage == "r2",
         "width": _positive_int_or_none(item.get("width")),
         "height": _positive_int_or_none(item.get("height")),
         "genbox_push": genbox_push_state(item.get("genbox_push")),

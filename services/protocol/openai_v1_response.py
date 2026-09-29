@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.protocol.image_json_result import ImageJsonResult
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -500,6 +501,8 @@ def stream_image_response(
             completed["response"]["incomplete_details"] = {
                 "reason": str(error.get("code") or "error"),
             }
+            if image_rows:
+                completed["response"]["_call_status"] = "partial_success"
         _with_log_metadata(completed, account_email, conversation_id, image_urls, image_attempts)
         _with_log_metadata(completed["response"], account_email, conversation_id, image_urls, image_attempts)
         if image_rows:
@@ -563,13 +566,15 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    if body.get("stream") and not is_text_response_request(body):
+def handle(body: dict[str, Any]) -> dict[str, Any] | ImageJsonResult | Iterator[dict[str, Any]]:
+    if not is_text_response_request(body):
         if not extract_response_prompt(body.get("input")):
             raise HTTPException(status_code=400, detail={"error": "input text is required"})
         model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
         ensure_supported_image_model(model)
         response_image_count(body)
+        if not body.get("stream"):
+            return ImageJsonResult(lambda: collect_response(response_events(body)))
     events = response_events(body)
     if body.get("stream"):
         return events

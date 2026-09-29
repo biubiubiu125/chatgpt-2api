@@ -360,6 +360,26 @@ def call_until_image_stop(
     return outcome.get("value")
 
 
+_POW_BOOTSTRAP_TTL_SECS = 600.0
+_pow_bootstrap_cache: dict[str, tuple[float, list[str], str]] = {}
+_STALE_POW_FAILURE_CODES = frozenset({
+    "internal_error",
+    "invalid_image_input",
+    "upstream_error",
+})
+
+
+def _stale_pow_bootstrap_failure(exc: BaseException) -> bool:
+    """缓存的首页脚本只在它自己可能导致失败时才重取。
+
+    账号 401、限流、超时、连接失败和上游 5xx 原样抛出，避免坏账号清掉全进程缓存。
+    本地脚本/证明错误，以及准备接口返回的 400，才重取一次。
+    """
+    failure = classify_image_exception(exc)
+    return failure.code in _STALE_POW_FAILURE_CODES
+_pow_bootstrap_lock = threading.Lock()
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -3169,12 +3189,25 @@ class OpenAIBackendAPI:
     # Leave this much of a short poll budget so the first query can start.
     _IMAGE_POLL_QUERY_RESERVE_SECS = 0.05
 
+    @staticmethod
+    def _known_picture_count(file_ids: list[str], sediment_ids: list[str]) -> int:
+        """Count pictures already named by these ids.
+
+        Ids of one kind are that many pictures. A file id is not an alias of a
+        sediment id, so both lists are already separate pictures and must not
+        keep the poll open while it waits for another id.
+        """
+        if file_ids and sediment_ids:
+            return len(file_ids) + len(sediment_ids)
+        return max(len(file_ids), len(sediment_ids))
+
     def _poll_image_results(
             self,
             conversation_id: str,
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
+            minimum_images: int = 0,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -3189,7 +3222,11 @@ class OpenAIBackendAPI:
         budget, so the minimum 1 second timeout still issues one conversation query.
         If the confirmation wait would leave no time for that recheck, the ids
         already seen are returned instead of being discarded as a timeout.
-        On exhaustion raises ImagePollTimeoutError.
+        A later confirmation query that fails, including a non-retryable 429,
+        also returns ids already seen. minimum_images keeps polling while a
+        stable id set still describes fewer pictures than the turn asked for.
+        When the budget cannot wait for the missing pictures, those ids are
+        still returned. Exhaustion with no ids raises ImagePollTimeoutError.
         """
         self._reset_image_result_timing()
         started_at = time.monotonic()
@@ -3204,6 +3241,19 @@ class OpenAIBackendAPI:
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
+
+        def seen_ids(reason: str) -> tuple[list[str], list[str]] | None:
+            if not file_ids and not sediment_ids:
+                return None
+            logger.info({
+                "event": "image_poll_return_seen_ids",
+                "conversation_id": conversation_id,
+                "reason": reason,
+                "file_ids": file_ids,
+                "sediment_ids": sediment_ids,
+            })
+            return file_ids, sediment_ids
+
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
@@ -3404,6 +3454,9 @@ class OpenAIBackendAPI:
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
                         continue
                     break
+                kept = seen_ids("conversation_query_failed")
+                if kept is not None:
+                    return kept
                 final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
                 final_failure = merge_message_failure(final_failure, failure) or failure
                 _raise_final_failure(
@@ -3421,6 +3474,9 @@ class OpenAIBackendAPI:
                     if _retry_sleep("network", None, str(exc), None):
                         continue
                     break
+                kept = seen_ids("conversation_network_failed")
+                if kept is not None:
+                    return kept
                 final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
                 final_failure = merge_message_failure(final_failure, failure) or failure
                 _raise_final_failure(
@@ -3479,6 +3535,22 @@ class OpenAIBackendAPI:
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
+                picture_count = self._known_picture_count(file_ids, sediment_ids)
+                waiting_for_more = minimum_images > picture_count
+                if last_hit_key == hit_key and waiting_for_more:
+                    logger.info({
+                        "event": "image_poll_waiting_for_images",
+                        "conversation_id": conversation_id,
+                        "file_ids": file_ids,
+                        "sediment_ids": sediment_ids,
+                        "minimum_images": minimum_images,
+                    })
+                    remaining_now = max(0.0, _remaining())
+                    wait = min(self._IMAGE_POLL_IDLE_SECS, remaining_now)
+                    if wait <= 0 or remaining_now - wait < self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                        return file_ids, sediment_ids
+                    self._sleep_for_image_poll(wait)
+                    continue
                 if last_hit_key == hit_key:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
@@ -3487,8 +3559,11 @@ class OpenAIBackendAPI:
                 remaining_now = max(0.0, _remaining())
                 wait = min(self._IMAGE_POLL_IDLE_SECS, remaining_now)
                 # Sleeping out the last of the budget cannot confirm anything.
-                # Keep the ids this query already returned.
+                # Keep the ids this query already returned, even when more
+                # pictures were requested than this set contains.
                 if wait <= 0 or remaining_now - wait < self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                    if waiting_for_more:
+                        return file_ids, sediment_ids
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
@@ -3502,6 +3577,9 @@ class OpenAIBackendAPI:
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
                 self._sleep_for_image_poll(wait)
+        kept = seen_ids("poll_budget_exhausted")
+        if kept is not None:
+            return kept
         timeout_failure = image_failure("image_poll_timeout")
         final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
         final_failure = merge_message_failure(final_failure, conversation_transport_failure)
@@ -3710,6 +3788,7 @@ class OpenAIBackendAPI:
                 return ""
             return ""
 
+        file_urls: list[str] = []
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -3719,26 +3798,60 @@ class OpenAIBackendAPI:
                     "id": file_id,
                 })
                 continue
-            url = resolve_candidate(
+            file_urls.append(resolve_candidate(
                 "file",
                 file_id,
                 lambda file_id=file_id: self._get_file_download_url(file_id),
-            )
-            if url:
-                if url not in urls:
-                    urls.append(url)
+            ) or "")
+        sediment_urls: list[str] = []
         if conversation_id:
             for sediment_id in sediment_ids:
-                url = resolve_candidate(
+                sediment_urls.append(resolve_candidate(
                     "sediment",
                     sediment_id,
                     lambda sediment_id=sediment_id: self._get_attachment_download_url(
                         conversation_id,
                         sediment_id,
                     ),
-                )
-                if url and url not in urls:
-                    urls.append(url)
+                ) or "")
+        # A file id and a sediment id name different pictures. Keep both
+        # download URLs. Without an expected-count signal, an empty pointer is
+        # not a second picture. When the caller already counted both ids, an
+        # empty URL is still missing and must be waited on.
+        slot_count = max(len(file_urls), len(sediment_urls))
+        separate_pictures = (
+            bool(file_ids and sediment_ids)
+            and int(getattr(self, "_image_minimum_count", 0) or 0)
+            >= self._known_picture_count(file_ids, sediment_ids)
+        )
+        missing_images = 0
+        for index in range(slot_count):
+            file_url = file_urls[index] if index < len(file_urls) else ""
+            sediment_url = sediment_urls[index] if index < len(sediment_urls) else ""
+            if separate_pictures:
+                if index < len(file_urls):
+                    if file_url and file_url not in urls:
+                        urls.append(file_url)
+                    elif not file_url:
+                        missing_images += 1
+                if index < len(sediment_urls):
+                    if sediment_url and sediment_url not in urls:
+                        urls.append(sediment_url)
+                    elif not sediment_url:
+                        missing_images += 1
+                continue
+            if file_url and sediment_url and file_url != sediment_url:
+                if file_url not in urls:
+                    urls.append(file_url)
+                if sediment_url not in urls:
+                    urls.append(sediment_url)
+                continue
+            url = file_url or sediment_url
+            if not url:
+                missing_images += 1
+                continue
+            if url not in urls:
+                urls.append(url)
         logger.debug({
             "event": "image_urls_resolved",
             "conversation_id": conversation_id,
@@ -3747,6 +3860,9 @@ class OpenAIBackendAPI:
             "url_count": len(urls),
             "url_hosts": sorted({urlparse(url).netloc for url in urls if urlparse(url).netloc}),
         })
+        self._image_resolve_incomplete = missing_images > 0 or (
+            not separate_pictures and len(urls) < slot_count
+        )
         auth_failed = any(failure.capability == "auth" for failure, _ in resolution_errors)
         if urls:
             if auth_failed:
@@ -3780,6 +3896,55 @@ class OpenAIBackendAPI:
                 (time.perf_counter() - started) * 1000,
             )
 
+    def _wait_for_known_download_urls(
+            self,
+            conversation_id: str,
+            file_ids: list[str],
+            sediment_ids: list[str],
+            deadline: float,
+            seed: list[str] | None = None,
+    ) -> list[str]:
+        """Retry download URLs until every known picture is ready or the budget ends.
+
+        Conversation id stability does not mean the download URL exists. A short
+        list is kept only when the poll budget is exhausted.
+        """
+        last_urls = [url for url in (seed or []) if url]
+        logger.info({
+            "event": "image_download_url_wait",
+            "conversation_id": conversation_id,
+            "file_ids": file_ids,
+            "sediment_ids": sediment_ids,
+            "url_count": len(last_urls),
+        })
+        while True:
+            if self._image_http_stopped():
+                raise TimeoutError("image request deadline exceeded")
+            remaining = deadline - time.monotonic()
+            if remaining <= self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                return last_urls
+            sleep_for = min(self._IMAGE_POLL_IDLE_SECS, remaining)
+            if remaining - sleep_for < self._IMAGE_POLL_QUERY_RESERVE_SECS:
+                sleep_for = max(0.0, remaining - self._IMAGE_POLL_QUERY_RESERVE_SECS)
+            if sleep_for <= 0:
+                return last_urls
+            self._sleep_for_image_poll(sleep_for)
+            self._image_resolve_incomplete = False
+            try:
+                urls = self._resolve_image_urls_with_timing(
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                )
+            except Exception as exc:
+                if self._image_http_stopped() or not self._download_url_not_ready(exc):
+                    raise
+                urls = []
+            if urls:
+                last_urls = urls
+            if urls and not self._image_resolve_incomplete:
+                return urls
+
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,
@@ -3789,11 +3954,30 @@ class OpenAIBackendAPI:
             poll_timeout_secs: float | None = None,
     ) -> list[str]:
         self._reset_image_result_timing()
+        minimum_images = int(getattr(self, "_image_expected_count", 0) or 0)
+        self._image_expected_count = 0
+        self._image_minimum_count = minimum_images
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = self._bounded_image_timeout(
             poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
         )
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        if poll and conversation_id and (file_ids or sediment_ids):
+            known_urls = self._resolve_known_image_urls(conversation_id, file_ids, sediment_ids)
+            pictures = self._known_picture_count(file_ids, sediment_ids)
+            incomplete = bool(getattr(self, "_image_resolve_incomplete", False))
+            needs_more_ids = minimum_images > pictures
+            if known_urls and not incomplete and not needs_more_ids:
+                return known_urls
+            if incomplete and not needs_more_ids:
+                return self._wait_for_known_download_urls(
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                    deadline,
+                    known_urls,
+                )
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",
@@ -3801,13 +3985,15 @@ class OpenAIBackendAPI:
                 "initial_file_ids": file_ids,
                 "initial_sediment_ids": sediment_ids,
                 "poll_timeout_secs": timeout,
+                "minimum_images": minimum_images,
             })
             try:
                 polled_file_ids, polled_sediment_ids = self._poll_image_results(
                     conversation_id,
-                    timeout,
+                    max(0.0, deadline - time.monotonic()),
                     file_ids,
                     sediment_ids,
+                    minimum_images=minimum_images,
                 )
             except ImagePollTimeoutError as exc:
                 if self._image_http_stopped() or (not file_ids and not sediment_ids):
@@ -3835,7 +4021,74 @@ class OpenAIBackendAPI:
             else:
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
-        return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
+        urls = self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
+        if getattr(self, "_image_resolve_incomplete", False) and time.monotonic() < deadline:
+            waited = self._wait_for_known_download_urls(
+                conversation_id,
+                file_ids,
+                sediment_ids,
+                deadline,
+                urls,
+            )
+            if waited:
+                return waited
+        return urls
+
+    _DOWNLOAD_URL_RETRY_SECS = 0.3
+
+    def _download_url_not_ready(self, exc: Exception) -> bool:
+        if isinstance(exc, ImageDownloadError):
+            return True
+        return isinstance(exc, UpstreamHTTPError) and exc.status_code in {404, 429, 500, 502, 503, 504}
+
+    def _sleep_for_download_url_retry(self) -> None:
+        if self._image_http_stopped():
+            raise TimeoutError("image request deadline exceeded")
+        time.sleep(self._DOWNLOAD_URL_RETRY_SECS)
+        if self._image_http_stopped():
+            raise TimeoutError("image request deadline exceeded")
+
+    def _resolve_known_image_urls(
+            self,
+            conversation_id: str,
+            file_ids: list[str],
+            sediment_ids: list[str],
+    ) -> list[str]:
+        """Resolve download URLs when the SSE stream already named the files.
+
+        Skip the idle wait and the tasks/conversation reads when every distinct
+        picture already has a URL. One file id plus one sediment id is the same
+        picture. A shorter URL list means another picture is still missing, so
+        an empty result, a 404, a 429, a transient 5xx, or that partial result
+        waits 300ms and retries once. The partial list is returned with the
+        incomplete flag set; the caller keeps resolving URLs until the poll
+        budget ends. A not-ready error with no URL still returns an empty list
+        so the caller can poll. Auth and other errors are returned as-is.
+        """
+        last_urls: list[str] = []
+        for attempt in range(2):
+            self._image_resolve_incomplete = False
+            try:
+                urls = self._resolve_image_urls_with_timing(
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                )
+            except Exception as exc:
+                if self._image_http_stopped() or not self._download_url_not_ready(exc):
+                    raise
+                urls = []
+            if urls and not self._image_resolve_incomplete:
+                return urls
+            if urls:
+                last_urls = urls
+            if attempt == 0:
+                self._sleep_for_download_url_retry()
+                continue
+            if self._image_resolve_incomplete:
+                return last_urls
+            return []
+        return []
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
@@ -3974,8 +4227,12 @@ class OpenAIBackendAPI:
         finally:
             response.close()
 
-    def _bootstrap(self, timeout_secs: float = 30.0) -> None:
+    def _bootstrap(self, timeout_secs: float = 30.0, *, force: bool = False) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
+        if not force and self._load_pow_bootstrap_cache():
+            self._pow_bootstrap_from_cache = True
+            return
+        self._pow_bootstrap_from_cache = False
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
@@ -3985,8 +4242,75 @@ class OpenAIBackendAPI:
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        self._store_pow_bootstrap_cache()
+
+    def _pow_bootstrap_cache_key(self) -> str:
+        return str(self.base_url or "").rstrip("/")
+
+    def _load_pow_bootstrap_cache(self) -> bool:
+        key = self._pow_bootstrap_cache_key()
+        if not key:
+            return False
+        now = time.monotonic()
+        with _pow_bootstrap_lock:
+            cached = _pow_bootstrap_cache.get(key)
+            if cached is None or cached[0] <= now:
+                if cached is not None:
+                    _pow_bootstrap_cache.pop(key, None)
+                return False
+            _expires_at, sources, data_build = cached
+        self.pow_script_sources = list(sources)
+        self.pow_data_build = data_build
+        return True
+
+    def _store_pow_bootstrap_cache(self) -> None:
+        key = self._pow_bootstrap_cache_key()
+        if not key:
+            return
+        with _pow_bootstrap_lock:
+            _pow_bootstrap_cache[key] = (
+                time.monotonic() + _POW_BOOTSTRAP_TTL_SECS,
+                list(self.pow_script_sources or []),
+                str(self.pow_data_build or ""),
+            )
+
+    def _clear_pow_bootstrap_cache(self) -> None:
+        key = self._pow_bootstrap_cache_key()
+        with _pow_bootstrap_lock:
+            _pow_bootstrap_cache.pop(key, None)
+        self._pow_bootstrap_from_cache = False
 
     def _get_chat_requirements(
+            self,
+            timeout_secs: float = 30.0,
+            *,
+            deadline: float | None = None,
+            timeout_message: str = "web search timed out",
+    ) -> ChatRequirements:
+        self._pow_requirements_refreshed = False
+        try:
+            return self._load_chat_requirements(
+                timeout_secs,
+                deadline=deadline,
+                timeout_message=timeout_message,
+            )
+        except Exception as exc:
+            if (
+                not getattr(self, "_pow_bootstrap_from_cache", False)
+                or getattr(self, "_pow_requirements_refreshed", False)
+                or not _stale_pow_bootstrap_failure(exc)
+            ):
+                raise
+            self._pow_requirements_refreshed = True
+            self._clear_pow_bootstrap_cache()
+            self._bootstrap(force=True)
+            return self._load_chat_requirements(
+                timeout_secs,
+                deadline=deadline,
+                timeout_message=timeout_message,
+            )
+
+    def _load_chat_requirements(
             self,
             timeout_secs: float = 30.0,
             *,

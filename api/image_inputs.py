@@ -279,8 +279,35 @@ def _image_fetch_curl_options(parsed: ParseResult, addresses: tuple[str, ...]):
     return public_image_curl_options(parsed, addresses)
 
 
+def _reject_oversized_image(size: int) -> None:
+    if size > MAX_IMAGE_REFERENCE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+
+
+def _response_content_length(response: requests.Response) -> int | None:
+    headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get("content-length")
+    if raw in (None, ""):
+        raw = headers.get("Content-Length")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_response_content(response: requests.Response) -> bytes:
+    payload = bytes(getattr(response, "content", b"") or b"")
+    _reject_oversized_image(len(payload))
+    return payload
+
+
 def _read_response_limited(response: requests.Response) -> bytes:
     """Read a response without allowing an unbounded body allocation."""
+    declared = _response_content_length(response)
+    if declared is not None:
+        _reject_oversized_image(declared)
     data = bytearray()
     total = 0
     iterator = getattr(response, "iter_content", None)
@@ -292,24 +319,19 @@ def _read_response_limited(response: requests.Response) -> bytes:
                         continue
                     chunk_bytes = bytes(chunk)
                     total += len(chunk_bytes)
-                    if total > MAX_IMAGE_REFERENCE_BYTES:
-                        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+                    _reject_oversized_image(total)
                     data.extend(chunk_bytes)
             except TypeError:
                 # Lightweight response doubles often expose ``content`` but
                 # do not implement an iterable ``iter_content`` method.
-                data = bytearray(bytes(response.content))
+                data = bytearray(_bounded_response_content(response))
             if not data and hasattr(response, "content"):
                 # Preserve compatibility with eager response implementations
                 # that return no chunks even though ``content`` is populated.
-                data = bytearray(bytes(response.content))
-            if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-                raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+                data = bytearray(_bounded_response_content(response))
+            _reject_oversized_image(len(data))
         else:
-            data = bytes(response.content)
-            if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-                raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-            return data
+            return _bounded_response_content(response)
     except HTTPException:
         raise
     except Exception as exc:

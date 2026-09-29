@@ -72,18 +72,68 @@
         />
       </FormField>
 
+      <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+        <FormField label="R2 Account ID">
+          <Input
+            v-model.trim="imageStorage.r2_account_id"
+            block
+            :disabled="fieldReadOnly('image_storage.r2_account_id')"
+          />
+        </FormField>
+        <FormField label="R2 Bucket">
+          <Input
+            v-model.trim="imageStorage.r2_bucket"
+            block
+            :disabled="fieldReadOnly('image_storage.r2_bucket')"
+          />
+        </FormField>
+      </div>
+
+      <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+        <FormField label="R2 Access Key ID">
+          <Input
+            v-model.trim="imageStorage.r2_access_key_id"
+            block
+            :disabled="fieldReadOnly('image_storage.r2_access_key_id')"
+          />
+        </FormField>
+        <FormField label="R2 Secret Access Key">
+          <Input
+            v-model="imageStorage.r2_secret_access_key"
+            type="password"
+            block
+            :disabled="fieldReadOnly('image_storage.r2_secret_access_key')"
+            :placeholder="imageStorage.has_r2_secret_access_key ? '已配置，留空不修改' : '请输入 R2 Secret'"
+          />
+        </FormField>
+      </div>
+
+      <FormField label="R2 公开地址">
+        <Input
+          v-model.trim="imageStorage.r2_public_base_url"
+          block
+          :disabled="fieldReadOnly('image_storage.r2_public_base_url')"
+          placeholder="https://images.example.com"
+        />
+      </FormField>
+
       <div class="flex flex-wrap items-center gap-2">
         <Button size="xs" variant="outline" :disabled="imageStorageBusy === 'test'" @click="$emit('testStorage')">
-          {{ imageStorageBusy === 'test' ? '测试中...' : '测试 WebDAV' }}
+          {{ imageStorageBusy === 'test' ? '测试中...' : `测试 ${storageTargetLabel}` }}
         </Button>
-        <Button size="xs" variant="outline" :disabled="imageStorageBusy === 'sync'" @click="$emit('syncStorage')">
+        <Button
+          size="xs"
+          variant="outline"
+          :disabled="imageStorageBusy === 'sync' || imageStorage.mode === 'r2'"
+          @click="$emit('syncStorage')"
+        >
           {{ imageStorageBusy === 'sync' ? '同步中...' : '全量同步' }}
         </Button>
       </div>
 
       <div v-if="imageStorageTestResult" class="rounded-xl border border-border bg-background px-3 py-2 text-xs">
         <p :class="imageStorageTestResult.ok ? 'text-emerald-600' : 'text-slate-600'">
-          {{ imageStorageTestResult.ok ? 'WebDAV 可用' : 'WebDAV 不可用' }}
+          {{ imageStorageTestResult.ok ? `${storageTargetLabel} 可用` : `${storageTargetLabel} 不可用` }}
           <span v-if="imageStorageTestResult.status"> · HTTP {{ imageStorageTestResult.status }}</span>
         </p>
         <p v-if="imageStorageTestResult.error" class="mt-1 break-all text-slate-600">{{ imageStorageTestResult.error }}</p>
@@ -172,6 +222,7 @@ const fieldReadOnly = (path: string) => settingsFieldReadOnly(props.fields, path
 const imageStorageModeOptions = computed(() => (
   settingsFieldOptions(props.fields, 'image_storage.mode', imageStorage.value.mode)
 ))
+const storageTargetLabel = computed(() => (imageStorage.value.mode === 'r2' ? 'R2' : 'WebDAV'))
 </script>
 
 <style scoped>

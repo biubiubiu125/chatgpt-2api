@@ -130,7 +130,7 @@ class DashboardRangeView(BaseModel):
 
 class DashboardImageStorageView(BaseModel):
     enabled: bool
-    mode: Literal["local", "webdav", "both"]
+    mode: Literal["local", "webdav", "both", "r2"]
     status: Literal["not_checked"]
     available: bool | None
     image_count: int | None

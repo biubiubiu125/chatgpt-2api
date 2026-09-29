@@ -64,7 +64,12 @@ from services.image_failure import (
     is_text_review_failure_code,
     public_image_error_message,
 )
-from services.protocol.error_response import anthropic_error_response, openai_error_response
+from services.protocol.error_response import (
+    anthropic_error_response,
+    openai_error_payload,
+    openai_error_response,
+)
+from services.protocol.image_json_result import ImageJsonResult
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.diagnostics import (
     diagnostic_excerpt,
@@ -496,6 +501,27 @@ def _image_error_response(exc: Exception) -> JSONResponse:
     return openai_error_response(_image_error_payload(exc), failure.status_code)
 
 
+def _image_keepalive_error(exc: Exception) -> dict[str, object]:
+    """JSON error for a response whose HTTP status is already 200.
+
+    ``error.status`` is the numeric status NewAPI restores. ``error.code`` stays
+    the failure reason and is not used as the status.
+    """
+    if isinstance(exc, HTTPException):
+        status = int(exc.status_code)
+        payload = openai_error_payload(exc.detail, status)
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error["status"] = status
+        return payload
+    failure = _final_image_failure(exc)
+    payload = _image_error_payload(exc)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        error["status"] = int(failure.status_code)
+    return payload
+
+
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
     message = str(exc)
     if sse == "anthropic":
@@ -642,6 +668,58 @@ def _undelivered_image_log_fields(image_attempts: list[dict[str, object]]) -> di
     return {"image_attempts": rewritten}
 
 
+def _image_delivery_count_fields(
+    result: dict,
+    requested_n: object,
+    status: str,
+) -> dict[str, object]:
+    """Count delivered images even when the body has no public URL."""
+    data = result.get("data")
+    items = data if isinstance(data, list) else []
+    succeeded = sum(
+        1
+        for item in items
+        if isinstance(item, dict)
+        and (
+            str(item.get("url") or "").strip()
+            or str(item.get("b64_json") or "").strip()
+        )
+    )
+    if succeeded <= 0:
+        # Chat and Responses bodies fold images into text or output items.
+        # Their measured metadata is the delivered count; a bare status must
+        # not turn that into zero successes.
+        metadata = result.get("_image_metadata")
+        if isinstance(metadata, list):
+            succeeded = sum(1 for item in metadata if isinstance(item, dict))
+    errors = result.get("errors")
+    error_count = len(errors) if isinstance(errors, list) else 0
+    try:
+        requested = int(requested_n) if requested_n not in (None, "") else 0
+    except (TypeError, ValueError):
+        requested = 0
+    requested = max(requested, succeeded + error_count, succeeded)
+    if requested <= 0 and succeeded <= 0:
+        return {}
+    if status == "partial_success" or (
+        succeeded > 0 and (error_count > 0 or requested > succeeded)
+    ):
+        result_status = "partial_success"
+        failed = max(error_count, requested - succeeded)
+    elif status == "failed" or succeeded <= 0:
+        result_status = "failed"
+        failed = max(error_count, requested - succeeded)
+    else:
+        result_status = "success"
+        failed = 0
+    return {
+        "image_requested_count": max(requested, succeeded + failed),
+        "image_succeeded_count": succeeded,
+        "image_failed_count": failed,
+        "image_result_status": result_status,
+    }
+
+
 @dataclass
 class LoggedCall:
     identity: dict[str, object]
@@ -741,23 +819,26 @@ class LoggedCall:
                 return _protocol_error_response(exc, 502, sse)
 
             if isinstance(result, dict):
-                projected_status = str(result.get("_call_status") or "success").strip().lower()
-                if projected_status not in {"success", "failed", "text_review"}:
-                    projected_status = "success"
-                projected_error = str(result.get("_call_error") or "").strip()
-                projected_extra: dict[str, object] = {}
-                if projected_status != "success" and result.get("error_code"):
-                    projected_extra["error_code"] = result["error_code"]
-                self.log(
-                    "调用失败" if projected_status == "failed" else "调用完成",
-                    result,
-                    status=projected_status,
-                    error=projected_error,
-                    account_email=str(result.get("_account_email") or ""),
-                    conversation_id=str(result.get("_conversation_id") or ""),
-                    extra=projected_extra or None,
-                )
+                self._log_projected_image_result(result)
                 return _strip_internal_response_fields(result)
+
+            if isinstance(result, ImageJsonResult):
+                self._image_json_keepalive = True
+                self._image_keepalive_admission = admission
+                self._image_keepalive_token = admission_token
+                self._image_keepalive_limiter = image_limiter
+                body = self._iterate_image_json_keepalive(result.produce, image_limiter)
+                response = _ClosingStreamingResponse(
+                    body,
+                    on_close=self._close_image_keepalive_response,
+                    media_type="application/json",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                cleanup_deferred = True
+                return response
 
             if self.endpoint.startswith("/v1/images"):
                 sender = lambda items: image_sse_stream(items, error_builder=_image_error_payload)
@@ -893,6 +974,132 @@ class LoggedCall:
         event = getattr(admission, "abandoned", None)
         if event is not None:
             event.set()
+
+    def _log_image_json_failure(self, exc: Exception) -> None:
+        if isinstance(exc, HTTPException):
+            self.log("调用失败", status="failed", error=str(exc.detail))
+            return
+        self.log(
+            "调用失败",
+            status="failed",
+            error=_public_image_exception_message(exc),
+            account_email=getattr(exc, "account_email", ""),
+            conversation_id=getattr(exc, "conversation_id", ""),
+            extra=_exception_log_fields(exc, image=True),
+        )
+
+    def _log_projected_image_result(self, result: dict) -> None:
+        projected_status = str(result.get("_call_status") or "success").strip().lower()
+        if projected_status not in {"success", "failed", "text_review", "partial_success"}:
+            projected_status = "success"
+        projected_error = str(result.get("_call_error") or "").strip()
+        projected_extra: dict[str, object] = {}
+        if projected_status != "success" and result.get("error_code"):
+            projected_extra["error_code"] = result["error_code"]
+        has_images = isinstance(result.get("data"), list) and bool(result.get("data"))
+        if self._is_image_request() and (
+            projected_status == "partial_success" or has_images or result.get("errors")
+        ):
+            projected_extra.update(
+                _image_delivery_count_fields(
+                    result,
+                    self.trace_metadata.get("n"),
+                    projected_status,
+                )
+            )
+        self.log(
+            "调用失败" if projected_status == "failed" else "调用完成",
+            result,
+            status=projected_status,
+            error=projected_error,
+            account_email=str(result.get("_account_email") or ""),
+            conversation_id=str(result.get("_conversation_id") or ""),
+            extra=projected_extra or None,
+        )
+
+    def _log_image_json_undelivered(self) -> None:
+        result = getattr(self, "_image_json_pending_result", None)
+        attempts = collect_image_attempts(result) if isinstance(result, dict) else []
+        extra = _undelivered_image_log_fields(attempts)
+        email = ""
+        conversation_id = ""
+        if isinstance(result, dict):
+            email = str(result.get("_account_email") or "")
+            conversation_id = str(result.get("_conversation_id") or "")
+        self._log_image_client_disconnected(
+            account_email=email,
+            conversation_id=conversation_id,
+            extra=extra or None,
+        )
+
+    async def _iterate_image_json_keepalive(self, produce, limiter):
+        """Keep a non-stream image response alive, then write one JSON document.
+
+        Leading newlines are JSON whitespace. The HTTP status stays 200, so a
+        failure document carries ``error.status`` for the relay to restore.
+        """
+        pending: asyncio.Task | None = asyncio.create_task(
+            self._run_on_limiter(produce, limiter)
+        )
+        try:
+            try:
+                while True:
+                    done, _waiting = await asyncio.wait(
+                        {pending},
+                        timeout=_image_stream_keepalive_secs(),
+                    )
+                    if pending not in done:
+                        yield "\n"
+                        continue
+                    try:
+                        result = pending.result()
+                    except Exception as exc:
+                        self._log_image_json_failure(exc)
+                        self._image_json_result_logged = True
+                        yield json.dumps(_image_keepalive_error(exc), ensure_ascii=False)
+                        return
+                    if not isinstance(result, dict):
+                        raise TypeError("image json result must be an object")
+                    body = json.dumps(
+                        _strip_internal_response_fields(result),
+                        ensure_ascii=False,
+                    )
+                    self._image_json_pending_result = result
+                    yield body
+                    self._log_projected_image_result(result)
+                    self._image_json_result_logged = True
+                    return
+            except (GeneratorExit, asyncio.CancelledError):
+                self._image_client_closed = True
+                raise
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    if (
+                        getattr(self, "_image_client_closed", False)
+                        and not getattr(self, "_image_json_result_logged", False)
+                    ):
+                        self._image_delivery_abandoned = True
+                    if pending is not None and not pending.done():
+                        self._abandon_open_image_request()
+                        try:
+                            await pending
+                        except Exception:
+                            pass
+                    if (
+                        pending is not None
+                        and pending.done()
+                        and not pending.cancelled()
+                        and not getattr(self, "_image_json_result_logged", False)
+                    ):
+                        try:
+                            finished = pending.result()
+                        except Exception:
+                            finished = None
+                        if isinstance(finished, dict):
+                            self._image_json_pending_result = finished
+                finally:
+                    await self._ensure_image_keepalive_closed()
 
     async def _iterate_image_stream_keepalive(self, items, image_generator, admission, admission_token):
         iterator = iter(items)
@@ -1134,9 +1341,14 @@ class LoggedCall:
                 getattr(self, "_image_keepalive_admission", None),
                 getattr(self, "_image_keepalive_token", None),
             )
+            if getattr(self, "_image_json_result_logged", False):
+                return
             if not getattr(self, "_stream_started", False):
                 if getattr(self, "_image_delivery_abandoned", False):
-                    self._log_image_client_disconnected()
+                    if getattr(self, "_image_json_keepalive", False):
+                        self._log_image_json_undelivered()
+                    else:
+                        self._log_image_client_disconnected()
                 else:
                     self.log("流式调用结束")
 

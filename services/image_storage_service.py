@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -362,14 +363,226 @@ class ImageStorageService:
         generation: str,
         scope: str,
         remote: bool,
+        r2_key: str = "",
+        webdav: bool = False,
     ) -> dict[str, object]:
-        return {
+        tombstone: dict[str, object] = {
             "op_id": uuid4().hex,
             "generation": generation,
             "scope": scope,
             "remote": remote,
             "requested_at": _now_iso(),
         }
+        if r2_key:
+            tombstone["r2_key"] = r2_key
+        if webdav:
+            tombstone["webdav"] = True
+        return tombstone
+
+    @staticmethod
+    def _tombstone_r2_key(item: dict[str, object] | None) -> str:
+        if not isinstance(item, dict):
+            return ""
+        return _clean(item.get("r2_key"))
+
+    @classmethod
+    def _tombstone_needs_webdav(cls, tombstone: dict[str, object]) -> bool:
+        if tombstone.get("webdav"):
+            return True
+        return bool(tombstone.get("remote")) and not cls._tombstone_r2_key(tombstone)
+
+    @staticmethod
+    def _orphan_r2_rel(r2_key: str) -> str:
+        digest = hashlib.sha256(r2_key.encode("utf-8")).hexdigest()
+        return f"r2-orphans/{digest}.png"
+
+    def _detach_pending_r2_key_locked(
+        self,
+        pending: dict[str, dict[str, object]],
+        rel: str,
+        new_key: str,
+    ) -> str:
+        """Move a different pending key off this image path.
+
+        The caller holds the index lock and must save ``pending`` in the same
+        transaction as the new catalog row. The object is not deleted here.
+        """
+        existing = pending.get(rel)
+        if not isinstance(existing, dict):
+            return ""
+        old_key = self._tombstone_r2_key(existing)
+        if old_key and old_key != new_key:
+            self._stage_orphan_r2_locked(
+                pending,
+                old_key,
+                _clean(existing.get("generation")) or self._new_generation(),
+            )
+        pending.pop(rel, None)
+        return old_key if old_key != new_key else ""
+
+    def _pending_r2_key_is_stale(
+        self,
+        item: dict[str, object],
+        tombstone: dict[str, object],
+    ) -> bool:
+        """A tombstone for a replaced object must not delete the current row."""
+        key = self._tombstone_r2_key(tombstone)
+        if not key:
+            return False
+        if not self._asset_generation_matches(item, tombstone, allow_missing=False):
+            return True
+        item_key = self._tombstone_r2_key(item)
+        return bool(item_key) and item_key != key
+
+    def _stage_orphan_r2_locked(
+        self,
+        pending: dict[str, dict[str, object]],
+        r2_key: str,
+        generation: str,
+    ) -> None:
+        key = _clean(r2_key)
+        if not key:
+            return
+        orphan_rel = self._orphan_r2_rel(key)
+        current = pending.get(orphan_rel)
+        if not isinstance(current, dict) or self._tombstone_r2_key(current) != key:
+            pending[orphan_rel] = self._delete_tombstone(
+                generation=_clean(generation),
+                scope="asset",
+                remote=True,
+                r2_key=key,
+            )
+
+    def _remember_orphan_r2(self, r2_key: str, generation: str) -> None:
+        key = _clean(r2_key)
+        if not key:
+            return
+        with self._index_guard():
+            pending = self._load_remote_delete_pending()
+            self._stage_orphan_r2_locked(pending, key, generation)
+            self._save_remote_delete_pending(pending)
+
+    def _stage_detached_r2_key(
+        self,
+        pending: dict[str, dict[str, object]],
+        item: dict[str, object],
+        generation: str,
+    ) -> str:
+        """Remove an R2 key from a row that is now a WebDAV copy.
+
+        The caller holds the index lock and must save ``pending``. The key is
+        tombstoned first so a failed bucket delete can be retried without
+        leaving the WebDAV URL labeled as R2.
+        """
+        key = self._tombstone_r2_key(item)
+        item.pop("r2_key", None)
+        if not key:
+            return ""
+        self._stage_orphan_r2_locked(pending, key, generation)
+        return key
+
+    def _finish_detached_r2_keys(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        from services.image_r2 import delete_image_object
+
+        settings = self.settings()
+        for key in keys:
+            try:
+                delete_image_object(settings, key)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "failed to delete replaced r2 object %s",
+                    key,
+                )
+                continue
+            orphan_rel = self._orphan_r2_rel(key)
+            with self._index_guard():
+                pending = self._load_remote_delete_pending()
+                if self._tombstone_r2_key(pending.get(orphan_rel)) != key:
+                    continue
+                pending.pop(orphan_rel, None)
+                self._save_remote_delete_pending(pending)
+
+    def _replaced_catalog_r2_key(
+        self,
+        item: dict[str, object] | None,
+        new_key: str,
+    ) -> str:
+        key = self._tombstone_r2_key(item)
+        if not key or key == new_key:
+            return ""
+        return key
+
+    def _stage_replaced_r2_keys_locked(
+        self,
+        pending: dict[str, dict[str, object]],
+        rel: str,
+        previous: dict[str, object] | None,
+        new_key: str,
+    ) -> list[str]:
+        """Tombstone R2 objects this catalog row is about to stop naming.
+
+        The caller holds the index lock and must save ``pending`` before
+        returning. Objects are deleted only after that save.
+        """
+        keys: list[str] = []
+        previous_key = self._replaced_catalog_r2_key(previous, new_key)
+        if previous_key:
+            generation = ""
+            if isinstance(previous, dict):
+                generation = self._item_generation(previous)
+            self._stage_orphan_r2_locked(
+                pending,
+                previous_key,
+                generation or self._new_generation(),
+            )
+            keys.append(previous_key)
+        if rel in pending:
+            pending_key = self._detach_pending_r2_key_locked(pending, rel, new_key)
+            if pending_key and pending_key not in keys:
+                keys.append(pending_key)
+        return keys
+
+    def _preserve_replaced_r2_key(self, rel: str, previous_key: str) -> None:
+        """Keep a catalog key that was overwritten if the pending save failed.
+
+        The new row is already committed, so the replaced object must be
+        tombstoned and deleted. A key the catalog still names is left alone.
+        An unreadable index is also left alone.
+        """
+        key = _clean(previous_key)
+        if not key:
+            return
+        try:
+            with self._index_guard():
+                current = self._tombstone_r2_key(self._load_clean_index().get(rel))
+                if current == key:
+                    return
+                try:
+                    pending = self._load_remote_delete_pending()
+                    orphan_rel = self._orphan_r2_rel(key)
+                    if self._tombstone_r2_key(pending.get(orphan_rel)) != key:
+                        self._stage_orphan_r2_locked(pending, key, self._new_generation())
+                        self._save_remote_delete_pending(pending)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "failed to record replaced r2 object %s",
+                        key,
+                    )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "failed to read image index for replaced r2 object %s",
+                key,
+            )
+            return
+        try:
+            self._finish_detached_r2_keys([key])
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "failed to delete replaced r2 object %s",
+                key,
+            )
 
     def _load_remote_delete_pending(self) -> dict[str, dict[str, object]]:
         raw = _read_json_object(self._remote_delete_file)
@@ -388,13 +601,19 @@ class ImageStorageService:
             scope = _clean(tombstone.get("scope"))
             if not op_id or scope not in {"asset", "remote"}:
                 continue
-            pending[safe_rel] = {
+            loaded = {
                 "op_id": op_id,
                 "generation": _clean(tombstone.get("generation")),
                 "scope": scope,
                 "remote": bool(tombstone.get("remote")),
                 "requested_at": _clean(tombstone.get("requested_at")),
             }
+            r2_key = _clean(tombstone.get("r2_key"))
+            if r2_key:
+                loaded["r2_key"] = r2_key
+            if tombstone.get("webdav"):
+                loaded["webdav"] = True
+            pending[safe_rel] = loaded
         return pending
 
     def _save_remote_delete_pending(self, items: dict[str, dict[str, object]]) -> None:
@@ -462,6 +681,8 @@ class ImageStorageService:
             # deadline cannot leave an unindexed local or remote asset behind.
             _raise_if_save_deadline_elapsed(deadline_monotonic)
             mode = self.mode()
+            if mode == "r2":
+                return self._save_r2_image(image_data, rel, base_url)
             if mode not in {"local", "webdav", "both"}:
                 mode = "local"
             stored_local = False
@@ -498,14 +719,33 @@ class ImageStorageService:
             }
             if dimensions:
                 item["width"], item["height"] = dimensions
-            with self._index_guard():
-                items = self._load_clean_index()
-                items[rel] = item
-                self._save_index(items)
-                pending = self._load_remote_delete_pending()
-                if rel in pending:
-                    pending.pop(rel, None)
-                    self._save_remote_delete_pending(pending)
+            previous_key = ""
+            old_keys: list[str] = []
+            try:
+                with self._index_guard():
+                    items = self._load_clean_index()
+                    previous = items.get(rel)
+                    previous_key = self._replaced_catalog_r2_key(
+                        previous if isinstance(previous, dict) else None,
+                        "",
+                    )
+                    items[rel] = item
+                    self._save_index(items)
+                    pending = self._load_remote_delete_pending()
+                    had_pending = rel in pending
+                    old_keys = self._stage_replaced_r2_keys_locked(
+                        pending,
+                        rel,
+                        previous if isinstance(previous, dict) else None,
+                        "",
+                    )
+                    if previous_key or had_pending:
+                        self._save_remote_delete_pending(pending)
+            except Exception:
+                self._preserve_replaced_r2_key(rel, previous_key)
+                raise
+            if old_keys:
+                self._finish_detached_r2_keys(old_keys)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -524,9 +764,26 @@ class ImageStorageService:
         if bool(item.get("webdav")):
             client = WebDAVClient(self.settings())
             try:
-                return client.get(safe_rel)
+                try:
+                    return client.get(safe_rel)
+                except Exception:
+                    # An older sync could leave both a WebDAV copy and an R2
+                    # key. A WebDAV miss must not hide the bucket object.
+                    if not self._tombstone_r2_key(item):
+                        raise
             finally:
                 client.session.close()
+        r2_key = self._tombstone_r2_key(item)
+        if r2_key:
+            from services.backup_service import BackupError
+            from services.image_r2 import ImageObjectNotFound, read_image_object
+
+            try:
+                return read_image_object(self.settings(), r2_key)
+            except ImageObjectNotFound as exc:
+                raise HTTPException(status_code=404, detail="image not found") from exc
+            except BackupError as exc:
+                raise HTTPException(status_code=502, detail="image storage is unavailable") from exc
         raise HTTPException(status_code=404, detail="image not found")
 
     def record_genbox_push(self, rel: str, *, status: str, sha256: str, updated_at: str) -> dict[str, str]:
@@ -586,6 +843,7 @@ class ImageStorageService:
             safe_rel
             for safe_rel in remote_rels
             if items.get(safe_rel, {}).get("webdav")
+            or self._tombstone_r2_key(items.get(safe_rel))
         )
         return existing
 
@@ -611,6 +869,7 @@ class ImageStorageService:
         *,
         required_bytes: int | None = None,
         dry_run: bool = False,
+        disk_target: bool = False,
     ) -> list[LocalCopyRemoval]:
         safe_rels = list(dict.fromkeys(
             safe_rel
@@ -636,14 +895,21 @@ class ImageStorageService:
                     if target is not None and reclaimed >= target:
                         break
                     item = snapshot.get(safe_rel, {})
-                    if item.get("remote_sync_pending"):
+                    # Disk-target cleanup is explicitly freeing the oldest
+                    # files. A pending sync or a stale catalog size must not
+                    # keep that file and push the delete onto a newer one.
+                    if not disk_target and item.get("remote_sync_pending"):
+                        continue
+                    # R2 objects are removed by delete_many. Dropping only the
+                    # local file here would leave the bucket object with no key.
+                    if not dry_run and self._tombstone_r2_key(item):
                         continue
                     path = image_local_path(safe_rel)
                     try:
                         local_size = path.stat().st_size
                     except OSError:
                         continue
-                    if not self._catalog_size_matches_local(item, local_size):
+                    if not disk_target and not self._catalog_size_matches_local(item, local_size):
                         continue
                     if not dry_run:
                         try:
@@ -676,11 +942,17 @@ class ImageStorageService:
                         if item is None:
                             continue
                         if remote_remains:
-                            items[rel] = {
+                            # The local bytes that still needed uploading are
+                            # gone. Keeping the flag would make the next sync
+                            # look unfinished even though only the WebDAV copy
+                            # remains.
+                            kept = {
                                 **item,
                                 "local": False,
                                 "storage": "webdav",
                             }
+                            kept.pop("remote_sync_pending", None)
+                            items[rel] = kept
                         else:
                             items.pop(rel, None)
                         changed = True
@@ -700,11 +972,13 @@ class ImageStorageService:
         required_bytes: int,
         *,
         dry_run: bool = False,
+        disk_target: bool = False,
     ) -> list[LocalCopyRemoval]:
         return self._delete_local_copies(
             rels,
             required_bytes=required_bytes,
             dry_run=dry_run,
+            disk_target=disk_target,
         )
 
     def list_items(
@@ -761,19 +1035,23 @@ class ImageStorageService:
                     local_path = image_local_path(rel)
                     local = local_path.is_file()
                     webdav = bool(item.get("webdav"))
-                    if not local and not webdav:
+                    r2_key = self._tombstone_r2_key(item)
+                    if not local and not webdav and not r2_key:
                         indexed.pop(rel, None)
                         changed = True
                         continue
-                    storage = "both" if local and webdav else ("webdav" if webdav else "local")
+                    if r2_key:
+                        storage = "r2"
+                    else:
+                        storage = "both" if local and webdav else ("webdav" if webdav else "local")
                     local_size: int | None = None
                     if local:
                         try:
                             local_size = local_path.stat().st_size
                         except OSError:
                             local = False
-                            storage = "webdav" if webdav else "local"
-                    if not local and not webdav:
+                            storage = "r2" if r2_key else ("webdav" if webdav else "local")
+                    if not local and not webdav and not r2_key:
                         indexed.pop(rel, None)
                         changed = True
                         continue
@@ -847,13 +1125,21 @@ class ImageStorageService:
                         catalog_changed = True
                     if item is None and existing is not None:
                         generation = _clean(existing.get("generation"))
+                    r2_key = self._tombstone_r2_key(item) or self._tombstone_r2_key(existing)
+                    has_webdav = bool(
+                        (isinstance(item, dict) and item.get("webdav"))
+                        or (isinstance(existing, dict) and existing.get("webdav"))
+                    )
                     tombstone = self._delete_tombstone(
                         generation=generation,
                         scope="asset",
                         remote=bool(
-                            (item and item.get("webdav"))
+                            (item and (item.get("webdav") or r2_key))
                             or (existing and existing.get("remote"))
+                            or r2_key
                         ),
+                        r2_key=r2_key,
+                        webdav=has_webdav,
                     )
                     pending[rel] = tombstone
                     planned[rel] = tombstone
@@ -892,7 +1178,23 @@ class ImageStorageService:
                         return DeleteMutationResult(completed=False, removed=False), exc
                 removed = True
 
-            if tombstone.get("remote"):
+            r2_key = self._tombstone_r2_key(tombstone)
+            if r2_key:
+                try:
+                    from services.image_r2 import delete_image_object
+
+                    delete_image_object(self.settings(), r2_key)
+                    removed = True
+                except Exception as exc:
+                    return (
+                        DeleteMutationResult(
+                            completed=removed,
+                            removed=removed,
+                            retry_remote=True,
+                        ),
+                        None if removed else exc,
+                    )
+            if self._tombstone_needs_webdav(tombstone):
                 if client is None:
                     return (
                         DeleteMutationResult(
@@ -947,6 +1249,18 @@ class ImageStorageService:
                         or not generation_matches
                         or not result.retry_remote
                     ):
+                        stale_key = self._tombstone_r2_key(tombstone)
+                        if (
+                            not generation_matches
+                            and isinstance(current, dict)
+                            and stale_key
+                            and stale_key != self._tombstone_r2_key(current)
+                        ):
+                            self._stage_orphan_r2_locked(
+                                pending,
+                                stale_key,
+                                _clean(tombstone.get("generation")) or self._new_generation(),
+                            )
                         pending.pop(rel, None)
                         pending_changed = True
                 if catalog_changed:
@@ -973,14 +1287,27 @@ class ImageStorageService:
                     break
                 results: dict[str, DeleteMutationResult] = {}
                 batch_error: Exception | None = None
-                if client is None and any(bool(item.get("remote")) for item in planned.values()):
+                webdav_error: Exception | None = None
+                if client is None and any(self._tombstone_needs_webdav(item) for item in planned.values()):
                     try:
                         client = WebDAVClient(self.settings())
                     except Exception as exc:
-                        batch_error = exc
+                        webdav_error = exc
+                if webdav_error is not None and all(
+                    self._tombstone_needs_webdav(item) for item in planned.values()
+                ):
+                    batch_error = webdav_error
 
                 if batch_error is None:
                     for safe_rel, tombstone in planned.items():
+                        if webdav_error is not None and self._tombstone_needs_webdav(tombstone):
+                            results[safe_rel] = DeleteMutationResult(
+                                completed=False,
+                                removed=False,
+                                retry_remote=True,
+                            )
+                            batch_error = webdav_error
+                            continue
                         try:
                             result, error = self._mutate_delete_tombstone(
                                 safe_rel,
@@ -1021,6 +1348,59 @@ class ImageStorageService:
             raise ImageBatchDeleteError(terminal_error, completed_rels) from terminal_error
         return removed_rels
 
+    def rels_with_r2_key(self, rels: list[str]) -> set[str]:
+        wanted: list[str] = []
+        for rel in rels:
+            try:
+                safe_rel = normalize_image_relative_path(rel)
+            except HTTPException:
+                continue
+            if _is_image_rel(safe_rel):
+                wanted.append(safe_rel)
+        if not wanted:
+            return set()
+        with self._index_guard():
+            items = self._load_clean_index()
+        return {rel for rel in wanted if self._tombstone_r2_key(items.get(rel))}
+
+    def retry_pending_r2_deletes(self) -> set[str]:
+        """Replay tombstones that already have an R2 object key.
+
+        WebDAV sync does not invent keys, and R2 mode does not run that sync.
+        Retention and disk cleanup call this so a failed object delete is not
+        left in the bucket.
+        """
+        with self._index_guard():
+            pending = self._load_remote_delete_pending()
+            items = self._load_clean_index()
+            delete_rels: list[str] = []
+            changed = False
+            seen = set(pending)
+            for rel, tombstone in list(pending.items()):
+                key = self._tombstone_r2_key(tombstone)
+                if not key:
+                    continue
+                item = items.get(rel)
+                if isinstance(item, dict) and self._pending_r2_key_is_stale(item, tombstone):
+                    self._stage_orphan_r2_locked(
+                        pending,
+                        key,
+                        _clean(tombstone.get("generation")) or self._new_generation(),
+                    )
+                    pending.pop(rel, None)
+                    changed = True
+                    continue
+                delete_rels.append(rel)
+            if changed:
+                delete_rels.extend(rel for rel in pending if rel not in seen)
+                self._save_remote_delete_pending(pending)
+        if not delete_rels:
+            return set()
+        try:
+            return set(self.delete_many(delete_rels))
+        except ImageBatchDeleteError as exc:
+            return set(exc.completed_rels)
+
     @staticmethod
     def _compress_png(payload: bytes) -> bytes:
         output = io.BytesIO()
@@ -1028,6 +1408,20 @@ class ImageStorageService:
             image = ImageOps.exif_transpose(image)
             image.save(output, format="PNG", optimize=True)
         return output.getvalue()
+
+    def _store_thumbnail(self, rel: str, image_data: bytes) -> None:
+        safe_rel = normalize_image_relative_path(rel)
+        target = config.image_thumbnails_dir / f"{safe_rel}.png"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(io.BytesIO(image_data)) as image:
+                image = ImageOps.exif_transpose(image)
+                if image.mode not in {"RGB", "RGBA"}:
+                    image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+                image.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                image.save(target, format="PNG", optimize=True)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to store image thumbnail for %s", rel)
 
     @staticmethod
     def _remove_thumbnail(rel: str) -> None:
@@ -1042,9 +1436,140 @@ class ImageStorageService:
                 except OSError:
                     pass
 
+    def _replace_compressed_r2(
+        self,
+        rel: str,
+        path: Path,
+        original: bytes,
+        compressed: bytes,
+    ) -> int | None:
+        """Republish a smaller R2 object. None means this row is not R2."""
+        from services.image_r2 import delete_image_object, public_image_url, publish_image_bytes
+
+        with self._index_guard():
+            current = dict(self._load_clean_index().get(rel) or {})
+        old_key = self._tombstone_r2_key(current)
+        if not old_key:
+            return None
+
+        settings = self.settings()
+        try:
+            new_key = publish_image_bytes(settings, compressed)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "failed to publish compressed r2 object for %s",
+                rel,
+            )
+            return 0
+        new_url = public_image_url(settings, new_key)
+        retired_key = old_key
+        old_pending_key = ""
+        had_local = path.is_file()
+        temp_path = path.with_name(f".{path.name}.compress.tmp")
+        try:
+            if had_local:
+                temp_path.write_bytes(compressed)
+                temp_path.replace(path)
+                stat = path.stat()
+                if stat.st_size != len(compressed):
+                    raise OSError("compressed image size changed")
+            dimensions = _image_dimensions(compressed)
+            self._remove_thumbnail(rel)
+            with self._index_guard():
+                items = self._load_clean_index()
+                latest = items.get(rel, {})
+                retired_key = self._tombstone_r2_key(latest) or old_key
+                item = {
+                    **latest,
+                    "rel": rel,
+                    "path": rel,
+                    "name": path.name,
+                    "date": str(
+                        latest.get("date")
+                        or current.get("date")
+                        or (
+                            "-".join(rel.split("/")[:3])
+                            if len(rel.split("/")) >= 4
+                            else _mtime_date(path)
+                        )
+                    ),
+                    "size": len(compressed),
+                    "created_at": str(
+                        latest.get("created_at")
+                        or current.get("created_at")
+                        or _mtime_datetime(path)
+                    ),
+                    "storage": "r2",
+                    "local": bool(had_local and path.is_file()),
+                    "webdav": False,
+                    "r2_key": new_key,
+                    "remote_url": new_url,
+                    "generation": self._new_generation(),
+                }
+                item.pop("remote_sync_pending", None)
+                if dimensions:
+                    item["width"], item["height"] = dimensions
+                items[rel] = item
+                self._save_index(items)
+                pending = self._load_remote_delete_pending()
+                if rel in pending:
+                    old_pending_key = self._detach_pending_r2_key_locked(pending, rel, new_key)
+                    self._save_remote_delete_pending(pending)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to commit compressed r2 image %s", rel)
+            owns_new_key = False
+            index_known = False
+            try:
+                with self._index_guard():
+                    owns_new_key = self._tombstone_r2_key(self._load_clean_index().get(rel)) == new_key
+                index_known = True
+            except Exception:
+                logging.getLogger(__name__).exception("failed to read image index for %s", rel)
+            if not index_known:
+                return 0
+            if owns_new_key:
+                if retired_key and retired_key != new_key:
+                    self._preserve_replaced_r2_key(rel, retired_key)
+                return len(original) - len(compressed)
+            if had_local:
+                try:
+                    path.write_bytes(original)
+                except OSError:
+                    pass
+            try:
+                delete_image_object(settings, new_key)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "failed to roll back compressed r2 object %s",
+                    new_key,
+                )
+                self._remember_orphan_r2(new_key, self._item_generation(current))
+            return 0
+        finally:
+            if temp_path.is_file():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+        if old_pending_key:
+            self._finish_detached_r2_keys([old_pending_key])
+        if retired_key and retired_key != new_key and retired_key != old_pending_key:
+            try:
+                delete_image_object(settings, retired_key)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "failed to delete replaced r2 object %s",
+                    retired_key,
+                )
+                self._remember_orphan_r2(retired_key, self._item_generation(current))
+        return len(original) - len(compressed)
+
     def compress_local_images(self, quality: int = 60) -> dict[str, int]:
         del quality  # Kept for the existing API contract; PNG optimization has no quality level.
         updates: dict[str, dict[str, object]] = {}
+        r2_compressed = 0
+        r2_saved = 0
         image_root = config.images_dir
         for path in sorted(image_root.rglob("*.png")):
             if not path.is_file():
@@ -1056,6 +1581,12 @@ class ImageStorageService:
                     original = path.read_bytes()
                     compressed = self._compress_png(original)
                     if len(compressed) >= len(original):
+                        continue
+                    replaced = self._replace_compressed_r2(rel, path, original, compressed)
+                    if replaced is not None:
+                        if replaced > 0:
+                            r2_compressed += 1
+                            r2_saved += replaced
                         continue
                     temp_path.write_bytes(compressed)
                     temp_path.replace(path)
@@ -1136,9 +1667,9 @@ class ImageStorageService:
                     self._save_index(items)
             committed.update(batch_committed)
 
-        saved = sum(int(update["saved_bytes"]) for update in committed.values())
+        saved = sum(int(update["saved_bytes"]) for update in committed.values()) + r2_saved
         return {
-            "compressed": len(committed),
+            "compressed": len(committed) + r2_compressed,
             "saved_bytes": saved,
             "saved_mb": saved // (1024 * 1024),
         }
@@ -1156,6 +1687,8 @@ class ImageStorageService:
             path = image_local_path(rel)
             if not path.is_file():
                 return False, True, False
+            retired_key = ""
+            pending_saved = True
             try:
                 payload = path.read_bytes()
                 with self._index_guard():
@@ -1178,10 +1711,24 @@ class ImageStorageService:
                         ),
                     }
                     merged.pop("remote_sync_pending", None)
+                    remote_pending = self._load_remote_delete_pending()
+                    retired_key = self._stage_detached_r2_key(
+                        remote_pending,
+                        merged,
+                        str(merged.get("generation") or ""),
+                    )
                     items[rel] = merged
                     self._save_index(items)
+                    if retired_key:
+                        pending_saved = False
+                        self._save_remote_delete_pending(remote_pending)
+                        pending_saved = True
+                if retired_key:
+                    self._finish_detached_r2_keys([retired_key])
                 return True, False, False
             except Exception:
+                if not pending_saved:
+                    self._preserve_replaced_r2_key(rel, retired_key)
                 return False, False, True
 
     def _commit_sync_batch(
@@ -1192,6 +1739,9 @@ class ImageStorageService:
         merged_rels: set[str] = set()
         cleanup_remote: set[str] = set()
         stale_rels: set[str] = set()
+        retired_keys: list[str] = []
+        retired_pairs: list[tuple[str, str]] = []
+        pending_error: Exception | None = None
         with self._item_guards(updates):
             current_payloads: dict[str, bytes] = {}
             for rel in updates:
@@ -1206,6 +1756,7 @@ class ImageStorageService:
 
             with self._index_guard():
                 items = self._load_clean_index()
+                remote_pending = self._load_remote_delete_pending()
                 changed = False
                 for rel, update in updates.items():
                     if rel in cleanup_remote:
@@ -1238,6 +1789,14 @@ class ImageStorageService:
                             ),
                         }
                         items[rel] = pending
+                        retired = self._stage_detached_r2_key(
+                            remote_pending,
+                            pending,
+                            str(pending.get("generation") or ""),
+                        )
+                        if retired:
+                            retired_keys.append(retired)
+                            retired_pairs.append((rel, retired))
                         stale_rels.add(rel)
                         changed = True
                         continue
@@ -1254,12 +1813,34 @@ class ImageStorageService:
                         ),
                     }
                     merged.pop("remote_sync_pending", None)
+                    retired = self._stage_detached_r2_key(
+                        remote_pending,
+                        merged,
+                        str(merged.get("generation") or ""),
+                    )
+                    if retired:
+                        retired_keys.append(retired)
+                        retired_pairs.append((rel, retired))
                     items[rel] = merged
                     merged_rels.add(rel)
                     changed = True
-                if changed:
-                    self._save_index(items)
+                index_saved = False
+                try:
+                    if changed:
+                        self._save_index(items)
+                        index_saved = True
+                    if retired_keys:
+                        self._save_remote_delete_pending(remote_pending)
+                except Exception as exc:
+                    if not index_saved or not retired_keys:
+                        raise
+                    pending_error = exc
 
+        if pending_error is not None:
+            for rel, key in retired_pairs:
+                self._preserve_replaced_r2_key(rel, key)
+            raise pending_error
+        self._finish_detached_r2_keys(retired_keys)
         failed = 0
         for rel in stale_rels:
             repaired, needs_cleanup, repair_failed = self._repair_stale_sync_item(client, rel)
@@ -1306,6 +1887,11 @@ class ImageStorageService:
                     current = self._load_clean_index().get(rel)
                     tombstone = self._load_remote_delete_pending().get(rel)
                 if tombstone is None:
+                    continue
+                # R2 tombstones are retried by delete_many. A WebDAV 404 is
+                # success here, so treating remote=true as a WebDAV delete
+                # would drop the object key and the gallery row.
+                if self._tombstone_r2_key(tombstone):
                     continue
                 local_exists = image_local_path(rel).is_file()
 
@@ -1360,7 +1946,81 @@ class ImageStorageService:
                     self._save_remote_delete_pending(durable)
         return failed
 
+    def _clear_pending_without_local(self) -> None:
+        """Drop a sync flag whose local file is already gone.
+
+        Disk cleanup can remove the only bytes that still needed uploading.
+        The WebDAV object stays; the flag must not keep claiming a newer copy.
+        """
+        with self._index_guard():
+            items = self._load_clean_index()
+            changed = False
+            for rel, item in items.items():
+                if not isinstance(item, dict) or not item.get("remote_sync_pending"):
+                    continue
+                if image_local_path(rel).is_file():
+                    continue
+                updated = {**item, "local": False}
+                updated.pop("remote_sync_pending", None)
+                if updated.get("webdav"):
+                    updated["storage"] = "webdav"
+                items[rel] = updated
+                changed = True
+            if changed:
+                self._save_index(items)
+
+    def _detach_indexed_r2_copies(self, rels: list[str]) -> None:
+        """Remove leftover R2 keys from rows that are already WebDAV copies.
+
+        A size-matched WebDAV row used to be skipped forever, so the bucket
+        object and the R2 gallery label stayed. The file is not uploaded again.
+        """
+        if not rels:
+            return
+        retired: list[tuple[str, str]] = []
+        pending_error: Exception | None = None
+        with self._item_guards(rels):
+            with self._index_guard():
+                items = self._load_clean_index()
+                pending = self._load_remote_delete_pending()
+                changed = False
+                for rel in rels:
+                    current = items.get(rel)
+                    if not isinstance(current, dict) or not current.get("webdav"):
+                        continue
+                    if not self._tombstone_r2_key(current):
+                        continue
+                    key = self._stage_detached_r2_key(
+                        pending,
+                        current,
+                        str(current.get("generation") or ""),
+                    )
+                    current["local"] = bool(current.get("local")) or image_local_path(rel).is_file()
+                    current["storage"] = "both" if current.get("local") else "webdav"
+                    current.pop("remote_sync_pending", None)
+                    items[rel] = current
+                    if key:
+                        retired.append((rel, key))
+                    changed = True
+                index_saved = False
+                try:
+                    if changed:
+                        self._save_index(items)
+                        index_saved = True
+                        if retired:
+                            self._save_remote_delete_pending(pending)
+                except Exception as exc:
+                    if not index_saved or not retired:
+                        raise
+                    pending_error = exc
+        if pending_error is not None:
+            for rel, key in retired:
+                self._preserve_replaced_r2_key(rel, key)
+            raise pending_error
+        self._finish_detached_r2_keys([key for _rel, key in retired])
+
     def _sync_all_locked(self, settings: dict[str, object]) -> dict[str, int]:
+        self._clear_pending_without_local()
         with self._index_guard():
             snapshot = self._load_clean_index()
             pending_remote_deletes = self._load_remote_delete_pending()
@@ -1369,6 +2029,7 @@ class ImageStorageService:
         failed = 0
         updates: dict[str, dict[str, object]] = {}
         uncertain_remote: set[str] = set()
+        detach_r2: list[str] = []
         client = WebDAVClient(settings)
         image_root = config.images_dir
         try:
@@ -1398,6 +2059,8 @@ class ImageStorageService:
                     and not item.get("remote_sync_pending")
                     and catalog_matches_local
                 ):
+                    if self._tombstone_r2_key(item if isinstance(item, dict) else None):
+                        detach_r2.append(rel)
                     skipped += 1
                     continue
                 try:
@@ -1420,6 +2083,7 @@ class ImageStorageService:
                 cleanup_remote.update(batch_cleanup)
                 failed += batch_failed
 
+            self._detach_indexed_r2_copies(detach_r2)
             failed += self._cleanup_remote_candidates(
                 client,
                 cleanup_remote | uncertain_remote,
@@ -1438,6 +2102,113 @@ class ImageStorageService:
 
     def test_webdav(self) -> dict[str, object]:
         return WebDAVClient(self.settings()).test()
+
+    def test_connection(self) -> dict[str, object]:
+        if self.mode() == "r2":
+            from services.image_r2 import test_image_bucket
+
+            return test_image_bucket(self.settings())
+        return self.test_webdav()
+
+    def _save_r2_image(self, image_data: bytes, rel: str, base_url: str) -> StoredImage:
+        from services.image_r2 import public_image_url, publish_image_bytes
+
+        settings = self.settings()
+        r2_key = publish_image_bytes(settings, image_data)
+        path = image_local_path(rel)
+        remote_url = public_image_url(settings, r2_key)
+        previous_key = ""
+        old_keys: list[str] = []
+        index_saved = False
+        try:
+            # The bucket object is the copy. A second full file on disk fills
+            # the volume the R2 mode was meant to free.
+            dimensions = _image_dimensions(image_data)
+            item = {
+                "rel": rel,
+                "path": rel,
+                "name": Path(rel).name,
+                "date": "-".join(rel.split("/")[:3]),
+                "size": len(image_data),
+                "created_at": _now_iso(),
+                "storage": "r2",
+                "local": False,
+                "webdav": False,
+                "r2_key": r2_key,
+                "remote_url": remote_url,
+                "generation": self._new_generation(),
+            }
+            if dimensions:
+                item["width"], item["height"] = dimensions
+            with self._index_guard():
+                items = self._load_clean_index()
+                previous = items.get(rel)
+                previous_key = self._replaced_catalog_r2_key(
+                    previous if isinstance(previous, dict) else None,
+                    r2_key,
+                )
+                items[rel] = item
+                self._save_index(items)
+                index_saved = True
+                pending = self._load_remote_delete_pending()
+                had_pending = rel in pending
+                old_keys = self._stage_replaced_r2_keys_locked(
+                    pending,
+                    rel,
+                    previous if isinstance(previous, dict) else None,
+                    r2_key,
+                )
+                if previous_key or had_pending:
+                    self._save_remote_delete_pending(pending)
+        except Exception:
+            self._rollback_uncommitted_r2(
+                path,
+                rel,
+                settings,
+                r2_key,
+                index_saved=index_saved,
+            )
+            self._preserve_replaced_r2_key(rel, previous_key)
+            raise
+        if old_keys:
+            self._finish_detached_r2_keys(old_keys)
+        self._store_thumbnail(rel, image_data)
+        return StoredImage(rel=rel, url=remote_url, storage="r2", size=len(image_data))
+
+    def _rollback_uncommitted_r2(
+        self,
+        path: Path,
+        rel: str,
+        settings: dict[str, object],
+        r2_key: str,
+        *,
+        index_saved: bool = False,
+    ) -> None:
+        """Drop a new object only when this save did not commit it."""
+        from services.image_r2 import delete_image_object
+
+        owns_new_key = False
+        index_known = False
+        try:
+            with self._index_guard():
+                owns_new_key = self._tombstone_r2_key(self._load_clean_index().get(rel)) == r2_key
+            index_known = True
+        except Exception:
+            logging.getLogger(__name__).exception("failed to read image index for %s", rel)
+        # A committed row must survive an unreadable index. A row this call
+        # never saved is still uncommitted, so the new object can be deleted.
+        if owns_new_key or (not index_known and index_saved):
+            return
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            delete_image_object(settings, r2_key)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to roll back r2 object %s", r2_key)
+            self._remember_orphan_r2(r2_key, self._new_generation())
 
 
 image_storage_service = ImageStorageService()

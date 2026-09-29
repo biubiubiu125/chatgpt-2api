@@ -2,7 +2,7 @@ import apiClient from './client'
 
 export type GalleryMediaType = 'all' | 'image'
 export type GalleryFileMediaType = Exclude<GalleryMediaType, 'all'>
-export type GalleryStorage = 'local' | 'webdav' | 'both'
+export type GalleryStorage = 'local' | 'webdav' | 'both' | 'r2'
 
 export type GalleryGenBoxPushStatus = 'imported' | 'already-imported' | 'duplicate-local'
 

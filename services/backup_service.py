@@ -213,8 +213,18 @@ class CloudflareR2Client:
             raise BackupError(f"连接 R2 失败：HTTP {response.status_code}")
         return {"ok": True, "status": int(response.status_code)}
 
-    def upload_bytes(self, key: str, payload: bytes, *, content_type: str, metadata: dict[str, str] | None = None) -> dict[str, object]:
+    def upload_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
         headers = {"content-type": content_type}
+        if extra_headers:
+            headers.update({str(item_key).lower(): str(item_value) for item_key, item_value in extra_headers.items()})
         if metadata:
             for item_key, item_value in metadata.items():
                 headers[f"x-amz-meta-{item_key}"] = str(item_value)

@@ -31,6 +31,17 @@ def _cleanup_empty_dirs(root: Path) -> None:
             pass
 
 
+def _drop_image_sidecars(rel: str, *, remote_remains: bool) -> None:
+    for thumbnail in (
+        _thumbnail_path(rel),
+        config.image_thumbnails_dir / normalize_image_relative_path(rel),
+    ):
+        if thumbnail.is_file():
+            thumbnail.unlink()
+    if not remote_remains:
+        remove_tags(rel)
+
+
 def get_image_response(relative_path: str) -> FileResponse | Response:
     headers = {
         "Access-Control-Allow-Origin": "*",
@@ -170,7 +181,7 @@ def _retention_cleanup_targets(retention_hours: int) -> list[tuple[str, int]]:
     return [
         (str(item["path"]), int(item["size_bytes"]))
         for item in projection["items"]
-        if item["expired"] and item["local"]
+        if item["expired"] and (item["local"] or item["storage"] == "r2")
     ]
 
 
@@ -191,19 +202,32 @@ def cleanup_image_retention(retention_hours: int | None = None) -> dict[str, int
     removed = 0
     removed_size_bytes = 0
     target_sizes = dict(targets)
-    removed_local = image_storage_service.delete_local_copies(list(target_sizes))
+    rels = list(target_sizes)
+    r2_rels = image_storage_service.rels_with_r2_key(rels)
+    local_rels = [rel for rel in rels if rel not in r2_rels]
+    removed_r2: set[str] = set()
+    if r2_rels:
+        try:
+            removed_r2 = image_storage_service.delete_many(list(r2_rels))
+        except ImageBatchDeleteError as exc:
+            removed_r2 = set(exc.completed_rels)
+    for rel in removed_r2:
+        removed += 1
+        removed_size_bytes += target_sizes.get(rel, 0)
+        _drop_image_sidecars(rel, remote_remains=False)
+    removed_local = image_storage_service.delete_local_copies(local_rels)
     for rel, remote_remains in removed_local.items():
         removed += 1
         removed_size_bytes += target_sizes.get(rel, 0)
-        if remote_remains:
+        _drop_image_sidecars(rel, remote_remains=remote_remains)
+    for rel in image_storage_service.retry_pending_r2_deletes():
+        if rel in removed_r2:
             continue
-        for thumbnail in (
-            _thumbnail_path(rel),
-            config.image_thumbnails_dir / normalize_image_relative_path(rel),
-        ):
-            if thumbnail.is_file():
-                thumbnail.unlink()
-        remove_tags(rel)
+        _drop_image_sidecars(rel, remote_remains=False)
+        if rel not in target_sizes:
+            continue
+        removed += 1
+        removed_size_bytes += target_sizes.get(rel, 0)
     cleanup_image_thumbnails()
     _cleanup_empty_dirs(config.images_dir)
     _cleanup_empty_dirs(config.image_thumbnails_dir)
@@ -379,36 +403,79 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
         (p for p in config.images_dir.rglob("*.png") if p.is_file()),
         key=lambda p: p.stat().st_mtime,
     )
-    removals = image_storage_service.delete_local_copies_until(
-        [p.relative_to(config.images_dir).as_posix() for p in files],
-        max(0, target_free_bytes - current_free_bytes),
-        dry_run=dry_run,
-    )
-    freed = sum(removal.size for removal in removals)
-    for removal in removals:
-        if dry_run:
+    ordered = [p.relative_to(config.images_dir).as_posix() for p in files]
+    # Preview and the real delete use this same oldest prefix. Skipping a
+    # pending or size-mismatched file here used to make the preview count a
+    # newer image, or let the real run delete an R2 object the preview kept.
+    need = max(0, target_free_bytes - current_free_bytes)
+    planned: list[tuple[str, int]] = []
+    running = 0
+    for path, rel in zip(files, ordered):
+        if running >= need:
+            break
+        try:
+            size = path.stat().st_size
+        except OSError:
             continue
-        rel = removal.rel
-        for thumbnail in (
-            _thumbnail_path(rel),
-            config.image_thumbnails_dir / normalize_image_relative_path(rel),
-        ):
-            if thumbnail.is_file():
-                thumbnail.unlink()
-        if not removal.remote_remains:
-            remove_tags(rel)
+        planned.append((rel, size))
+        running += size
+    sizes = dict(planned)
+    if dry_run:
+        freed = sum(sizes.values())
+        return {
+            "removed": len(sizes),
+            "freed_mb": freed // mebibyte,
+            "target_free_mb": target_free_mb,
+            "current_free_mb": (current_free_bytes + freed) // mebibyte,
+            "done": current_free_bytes + freed >= target_free_bytes,
+            "dry_run": True,
+        }
 
-    if not dry_run:
-        _cleanup_empty_dirs(config.images_dir)
-        _cleanup_empty_dirs(config.image_thumbnails_dir)
+    r2_rels = image_storage_service.rels_with_r2_key(list(sizes))
+    local_rels = [rel for rel in sizes if rel not in r2_rels]
+    # planned is already the oldest prefix that meets the byte target. Delete
+    # that whole prefix. Removing every R2 object first used to meet the
+    # target by itself and leave the older local files in place.
+    local_target = sum(sizes.get(rel, 0) for rel in local_rels)
+    local_removals = (
+        image_storage_service.delete_local_copies_until(
+            local_rels,
+            local_target,
+            disk_target=True,
+        )
+        if local_target
+        else []
+    )
+    for removal in local_removals:
+        _drop_image_sidecars(removal.rel, remote_remains=removal.remote_remains)
+    freed = sum(removal.size for removal in local_removals)
+    removed_r2: set[str] = set()
+    if r2_rels:
+        try:
+            removed_r2 = image_storage_service.delete_many(list(r2_rels))
+        except ImageBatchDeleteError as exc:
+            removed_r2 = set(exc.completed_rels)
+    for rel in removed_r2:
+        _drop_image_sidecars(rel, remote_remains=False)
+    freed += sum(sizes.get(rel, 0) for rel in removed_r2)
+    removed_count = len(removed_r2) + len(local_removals)
+    for rel in image_storage_service.retry_pending_r2_deletes():
+        _drop_image_sidecars(rel, remote_remains=False)
+        if rel in removed_r2 or rel not in sizes:
+            continue
+        freed += sizes[rel]
+        removed_count += 1
+
+    _cleanup_empty_dirs(config.images_dir)
+    _cleanup_empty_dirs(config.image_thumbnails_dir)
 
     return {
-        "removed": len(removals),
+        "removed": removed_count,
         "freed_mb": freed // mebibyte,
         "target_free_mb": target_free_mb,
         "current_free_mb": (current_free_bytes + freed) // mebibyte,
         "done": current_free_bytes + freed >= target_free_bytes,
-        "dry_run": dry_run,
+        "dry_run": False,
     }
 
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:

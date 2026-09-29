@@ -93,13 +93,19 @@ export interface Settings {
   }
   image_storage: {
     enabled: boolean
-    mode: 'local' | 'webdav' | 'both'
+    mode: 'local' | 'webdav' | 'both' | 'r2'
     webdav_url: string
     webdav_username: string
     webdav_password: string
     has_webdav_password: boolean
     webdav_root_path: string
     public_base_url: string
+    r2_account_id: string
+    r2_access_key_id: string
+    r2_secret_access_key: string
+    has_r2_secret_access_key: boolean
+    r2_bucket: string
+    r2_public_base_url: string
   }
   genbox_push: SettingsGenBoxPush
   backup: {
@@ -393,7 +399,7 @@ export interface DashboardResponse {
     application_database: Record<string, unknown>
     image_storage: {
       enabled: boolean
-      mode: 'local' | 'webdav' | 'both'
+      mode: 'local' | 'webdav' | 'both' | 'r2'
       status: 'not_checked'
       available: boolean | null
       image_count: number | null
