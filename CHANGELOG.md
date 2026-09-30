@@ -1,5 +1,6 @@
 ## 0.09 - 2026-09-30
 
+- [优化] 概览运行信息去掉应用版本和实例名称，其余项两列自动上移，并显示容器网卡累计出站和入站流量。
 - [新增] 图片存储增加仅 R2 模式。生成结果上传到 Cloudflare R2 并返回公开地址；本机 `/images/`、`/image-thumbnails/` 和 `/files/` 仍带签名。
 - [新增] 非流式出图先返回已打开的 JSON 响应，用换行保活，结束后再写最终 JSON。失败仍是 HTTP 200，数字状态放在 `error.status`。
 - [新增] `response_format=data_url` 时，结果 `url` 使用 `data:image/png;base64,...`。

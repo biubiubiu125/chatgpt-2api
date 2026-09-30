@@ -305,6 +305,8 @@ export interface DashboardRuntime {
   storage_percent: number | null
   network_rx_bytes_per_sec: number | null
   network_tx_bytes_per_sec: number | null
+  network_rx_bytes: number | null
+  network_tx_bytes: number | null
 }
 
 export interface DashboardOperations {

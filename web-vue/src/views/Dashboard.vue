@@ -244,7 +244,6 @@ const {
   dashboardDataReady,
   dashboardLoadError,
   dashboardDataWarning,
-  dashboardVersion,
   retryDashboard,
   modelTimeRange,
   trendTimeRange,
@@ -376,12 +375,6 @@ const runtimeDetails = computed(() => {
         : '--',
       icon: 'lucide:server-cog',
     },
-    { label: '应用版本', value: dashboardVersion.value, icon: 'lucide:tag' },
-    {
-      label: '实例名称',
-      value: runtime?.instance_name || '--',
-      icon: 'lucide:hard-drive',
-    },
     {
       label: '系统发行版',
       value: runtime?.distribution || '--',
@@ -416,6 +409,16 @@ const runtimeDetails = computed(() => {
       label: '出站速率',
       value: formatRate(runtime?.network_tx_bytes_per_sec),
       icon: 'lucide:arrow-up-from-line',
+    },
+    {
+      label: '总出站流量',
+      value: formatBytes(runtime?.network_tx_bytes),
+      icon: 'lucide:arrow-up-from-line',
+    },
+    {
+      label: '总入站流量',
+      value: formatBytes(runtime?.network_rx_bytes),
+      icon: 'lucide:arrow-down-to-line',
     },
   ]
 })

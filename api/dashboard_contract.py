@@ -45,6 +45,8 @@ class DashboardRuntimeView(BaseModel):
     storage_percent: float | None = Field(default=None, ge=0, le=100)
     network_rx_bytes_per_sec: float | None = Field(default=None, ge=0)
     network_tx_bytes_per_sec: float | None = Field(default=None, ge=0)
+    network_rx_bytes: int | None = Field(default=None, ge=0)
+    network_tx_bytes: int | None = Field(default=None, ge=0)
 
 
 class DashboardOperationsView(BaseModel):

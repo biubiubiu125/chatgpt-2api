@@ -167,6 +167,12 @@ function validateRuntime(value: unknown) {
   if (runtime.process_memory_bytes !== null && Number(runtime.process_memory_bytes) < 0) {
     contractError('response.runtime.process_memory_bytes', 'non-negative integer')
   }
+  ;['network_rx_bytes', 'network_tx_bytes'].forEach((field) => {
+    expectNullableInteger(runtime[field], `response.runtime.${field}`)
+    if (runtime[field] !== null && Number(runtime[field]) < 0) {
+      contractError(`response.runtime.${field}`, 'non-negative integer')
+    }
+  })
 }
 
 function validateOperations(value: unknown) {

@@ -388,24 +388,27 @@ def _read_network_bytes() -> tuple[int, int] | None:
     return _read_windows_network_bytes() if os.name == "nt" else _read_linux_network_bytes()
 
 
-def _network_rates() -> tuple[float | None, float | None]:
+def _network_rates() -> tuple[float | None, float | None, int | None, int | None]:
     global _NETWORK_SAMPLE
     counters = _read_network_bytes()
     if counters is None:
-        return None, None
+        return None, None, None, None
     now = time.monotonic()
     previous = _NETWORK_SAMPLE
-    _NETWORK_SAMPLE = (now, counters[0], counters[1])
+    received_total = int(counters[0])
+    transmitted_total = int(counters[1])
+    _NETWORK_SAMPLE = (now, received_total, transmitted_total)
     if previous is None:
-        return None, None
+        return None, None, received_total, transmitted_total
     elapsed = now - previous[0]
     if elapsed <= 0:
-        return None, None
-    received_delta = counters[0] - previous[1]
-    transmitted_delta = counters[1] - previous[2]
+        return None, None, received_total, transmitted_total
+    received_delta = received_total - previous[1]
+    transmitted_delta = transmitted_total - previous[2]
     if os.name == "nt":
         # GetIfTable exposes 32-bit interface counters. Account for a single
-        # counter rollover between two dashboard samples.
+        # counter rollover between two dashboard samples. Totals stay on the
+        # current raw counter and are not reconstructed across wraps.
         if received_delta < 0:
             received_delta += 1 << 32
         if transmitted_delta < 0:
@@ -413,6 +416,8 @@ def _network_rates() -> tuple[float | None, float | None]:
     return (
         round(max(0.0, received_delta / elapsed), 1),
         round(max(0.0, transmitted_delta / elapsed), 1),
+        received_total,
+        transmitted_total,
     )
 
 
@@ -438,7 +443,7 @@ def _percentage(used: int | None, total: int | None) -> float | None:
 
 def _capture_snapshot() -> dict[str, Any]:
     containerized = is_containerized()
-    rx_bytes_per_sec, tx_bytes_per_sec = _network_rates()
+    rx_bytes_per_sec, tx_bytes_per_sec, rx_bytes, tx_bytes = _network_rates()
     memory_total_bytes, memory_used_bytes, memory_scope = _read_memory(
         containerized=containerized
     )
@@ -467,6 +472,8 @@ def _capture_snapshot() -> dict[str, Any]:
         "storage_percent": storage_percent,
         "network_rx_bytes_per_sec": _nullable_round(rx_bytes_per_sec),
         "network_tx_bytes_per_sec": _nullable_round(tx_bytes_per_sec),
+        "network_rx_bytes": None if rx_bytes is None else int(rx_bytes),
+        "network_tx_bytes": None if tx_bytes is None else int(tx_bytes),
     }
 
 
