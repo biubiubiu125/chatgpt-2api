@@ -810,6 +810,29 @@ class OpenAIBackendAPI:
         })
         return default_account
 
+    def get_image_limits(self) -> Dict[str, Any]:
+        """读取图片额度和套餐，供生图选号预检使用。不请求个人资料。"""
+        if not self.access_token:
+            raise RuntimeError("access_token is required")
+        payload = self._get_conversation_init()
+        default_account = self._get_default_account()
+        if not isinstance(default_account, dict):
+            default_account = {}
+        limits_progress = payload.get("limits_progress") if isinstance(payload, dict) else None
+        limits_progress = limits_progress if isinstance(limits_progress, list) else []
+        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        result = {
+            "quota": quota,
+            "image_quota_unknown": image_quota_unknown,
+            "limits_progress": limits_progress,
+            "restore_at": restore_at,
+            "status": "正常" if image_quota_unknown or quota > 0 else "限流",
+        }
+        plan_type = account_service._normalize_account_type(default_account.get("plan_type"))
+        if plan_type:
+            result["type"] = plan_type
+        return result
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:

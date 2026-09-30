@@ -128,6 +128,7 @@ class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+    _IMAGE_SELECTION_PREFLIGHT_TTL_SECONDS = 120
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _POOL_HEALTH_REFRESH_BATCH_SIZE = 10
     _IMAGE_FAILURE_REFRESH_DEDUP_SECONDS = 30
@@ -845,6 +846,40 @@ class AccountService:
             allow_image_pending
             and account.get("pending_auth_scope") == "image"
         )
+
+    def _image_selection_preflight_fresh(self, account: dict, access_token: str) -> bool:
+        """120 秒内刚确认可用、且本地额度仍能覆盖当前占槽时，跳过远程额度预检。
+
+        额度未知的普通套餐必须重新询问。只有 Pro / ProLite 这种没有数字额度的账号可以跳过。
+        """
+        if not isinstance(account, dict):
+            return False
+        if str(account.get("last_remote_check_result") or "") != "ok":
+            return False
+        checked_at = self._parse_time(account.get("last_remote_checked_at"))
+        if checked_at is None:
+            return False
+        age_seconds = (datetime.now(timezone.utc) - checked_at).total_seconds()
+        if age_seconds < 0 or age_seconds > self._IMAGE_SELECTION_PREFLIGHT_TTL_SECONDS:
+            return False
+        if str(account.get("status") or "") != "正常":
+            return False
+        token = str(access_token or "").strip()
+        if not token or self._token_needs_refresh(token):
+            return False
+        emptied_at = self._parse_time(account.get("last_quota_estimated_empty_at"))
+        if emptied_at is not None and emptied_at >= checked_at:
+            return False
+        if bool(account.get("image_quota_unknown")):
+            # 未知只说明这次没读到数字额度，不能当成还能继续出图。
+            # Pro / ProLite 没有数字额度，确认过套餐后可以跳过。
+            return self._is_unlimited_image_quota_account(account)
+        try:
+            quota = int(account.get("quota") or 0)
+        except (TypeError, ValueError):
+            return False
+        inflight = int(self._image_inflight.get(token, 0))
+        return quota >= inflight
 
     @classmethod
     def _is_image_account_available(cls, account: dict) -> bool:
@@ -2249,10 +2284,12 @@ class AccountService:
             excluded_tokens: set[str] | None = None,
             deadline_monotonic: float | None = None,
             stop_event: Event | None = None,
+            *,
+            timing: dict[str, Any] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
-        基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
+        基于本地缓存做初筛。120 秒内刚确认可用的账号不再重复远程额度预检。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         self._refresh_accounts_snapshot_if_stale()
@@ -2268,6 +2305,10 @@ class AccountService:
         # 只要出现过非额度类失败，就说明不能断言全部账号都耗尽，应返回可重试的 unavailable。
         saw_remote_quota_exhausted = False
         saw_unavailable_failure = False
+        refresh_ms = 0
+        remote_check_ms = 0
+        attempt_count = 0
+        preflight_skipped = False
         for _attempt in range(max_attempts):
             try:
                 access_token = self._acquire_next_candidate_token(
@@ -2285,6 +2326,8 @@ class AccountService:
                     break
                 raise
             attempted_tokens.add(access_token)
+            attempt_count += 1
+            refresh_started = time.perf_counter()
             try:
                 _raise_if_image_selection_stopped(
                     deadline_monotonic,
@@ -2297,9 +2340,11 @@ class AccountService:
                     deadline_monotonic=deadline_monotonic,
                 )
             except ImageAccountSelectionError:
+                refresh_ms += max(0, int((time.perf_counter() - refresh_started) * 1000))
                 self.release_image_slot(access_token)
                 raise
             except Exception as exc:
+                refresh_ms += max(0, int((time.perf_counter() - refresh_started) * 1000))
                 self.release_image_slot(access_token)
                 _raise_if_image_selection_stopped(
                     deadline_monotonic,
@@ -2309,31 +2354,43 @@ class AccountService:
                 saw_unavailable_failure = True
                 self._log_image_preflight_refresh_failure(exc)
                 continue
+            refresh_ms += max(0, int((time.perf_counter() - refresh_started) * 1000))
             if refreshed != access_token:
                 attempted_tokens.add(refreshed)
             access_token = refreshed
-            try:
-                account = self.fetch_remote_info(
-                    access_token,
-                    "get_available_access_token",
-                    image_scope=True,
-                    stop_event=stop_event,
-                    deadline_monotonic=deadline_monotonic,
-                )
-            except ImageAccountSelectionError:
-                self.release_image_slot(access_token)
-                raise
-            except Exception:
-                # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
-                # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
-                self.release_image_slot(access_token)
-                _raise_if_image_selection_stopped(
-                    deadline_monotonic,
-                    stop_event,
-                    "image request deadline exceeded during remote account validation",
-                )
-                saw_unavailable_failure = True
-                continue
+            local_account = self.get_account(access_token) or {}
+            preflight_skipped = self._image_selection_preflight_fresh(local_account, access_token)
+            if preflight_skipped:
+                account = local_account
+            else:
+                remote_started = time.perf_counter()
+                try:
+                    account = self.fetch_remote_info(
+                        access_token,
+                        "get_available_access_token",
+                        image_scope=True,
+                        allow_refresh_token_exchange=False,
+                        preflight_refresh=False,
+                        stop_event=stop_event,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                except ImageAccountSelectionError:
+                    remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
+                    self.release_image_slot(access_token)
+                    raise
+                except Exception:
+                    # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
+                    # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
+                    remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
+                    self.release_image_slot(access_token)
+                    _raise_if_image_selection_stopped(
+                        deadline_monotonic,
+                        stop_event,
+                        "image request deadline exceeded during remote account validation",
+                    )
+                    saw_unavailable_failure = True
+                    continue
+                remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
             try:
                 _raise_if_image_selection_stopped(
                     deadline_monotonic,
@@ -2354,6 +2411,14 @@ class AccountService:
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
             ):
+                if timing is not None:
+                    timing.clear()
+                    timing.update({
+                        "refresh_ms": refresh_ms,
+                        "remote_check_ms": remote_check_ms,
+                        "preflight_skipped": preflight_skipped,
+                        "attempts": attempt_count,
+                    })
                 return str((account or {}).get("access_token") or access_token)
             if str((account or {}).get("status") or "") == "限流":
                 saw_remote_quota_exhausted = True
@@ -4373,7 +4438,7 @@ class AccountService:
                         next_item["quota"] = max(0, current_quota - 1)
                         if current_quota <= 1:
                             # 本地扣减到 0 只能说明“展示值需要远程刷新”，不能直接证明账号已限流。
-                            # 下一次调度会进入远程预检，由 get_user_info 的结果决定是否写入“限流”。
+                            # 下一次调度会进入远程额度预检，由预检结果决定是否写入“限流”。
                             next_item["image_quota_unknown"] = True
                             next_item["last_quota_estimated_empty_at"] = now.isoformat()
                     if next_item.get("status") == "限流":
@@ -4471,6 +4536,8 @@ class AccountService:
                 ) as backend:
                     if stop_event is not None:
                         backend.bind_image_stop(stop_event)
+                    if image_scope and event == "get_available_access_token":
+                        return backend.get_image_limits()
                     return backend.get_user_info()
 
         request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)

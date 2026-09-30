@@ -25,6 +25,15 @@ class ImageTaskAsset(BaseModel):
     revised_prompt: str = ""
     width: int | None = Field(default=None, ge=1)
     height: int | None = Field(default=None, ge=1)
+    slot_index: int | None = Field(default=None, ge=1)
+
+
+class ImageTaskSlotFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=1)
+    message: str
+    code: str
 
 
 class ImageTaskActions(BaseModel):
@@ -55,6 +64,7 @@ class ImageTaskRow(BaseModel):
     elapsed_ms: int | None = Field(default=None, ge=0)
     error_code: str
     public_error: str
+    slot_failures: list[ImageTaskSlotFailure] = Field(default_factory=list)
     results: list[ImageTaskAsset] = Field(default_factory=list)
     actions: ImageTaskActions
 

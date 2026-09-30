@@ -2239,6 +2239,7 @@ def _generate_single_image(
             pause_worker()
         request.monitor_attempt = len(image_attempts) + 1
         account_wait_started = time.perf_counter()
+        selection_timing: dict[str, Any] = {}
         stream_started = 0.0
         try:
             if retry_token:
@@ -2263,6 +2264,7 @@ def _generate_single_image(
                     excluded_tokens=attempted_tokens,
                     deadline_monotonic=request.deadline_monotonic or None,
                     stop_event=request.abandoned,
+                    timing=selection_timing,
                 )
                 attempted_tokens.add(token)
                 account_attempt_started = account_wait_started
@@ -2458,6 +2460,14 @@ def _generate_single_image(
                 )
             pending_switch_attempt_index = None
         retry_error = None
+        selection_detail: dict[str, Any] = {}
+        if selection_timing:
+            selection_detail = {
+                "refresh_ms": int(selection_timing.get("refresh_ms") or 0),
+                "remote_check_ms": int(selection_timing.get("remote_check_ms") or 0),
+                "preflight_skipped": bool(selection_timing.get("preflight_skipped")),
+                "attempts": int(selection_timing.get("attempts") or 0),
+            }
         _monitor_image_stage(
             request,
             "image_account_lookup",
@@ -2467,6 +2477,7 @@ def _generate_single_image(
             max_account_attempts=max_account_attempts,
             index=index,
             total=total,
+            **selection_detail,
         )
         if account_wait_ms >= 5000:
             logger.warning({
@@ -2475,6 +2486,7 @@ def _generate_single_image(
                 "account_wait_ms": account_wait_ms,
                 "account_email": account_email,
                 "index": index,
+                **selection_detail,
             })
         logger.debug({
             "event": "image_account_lookup",
@@ -2484,6 +2496,7 @@ def _generate_single_image(
             "account_found": bool(account),
             "account_wait_ms": account_wait_ms,
             "index": index,
+            **selection_detail,
         })
         if hold_worker is not None:
             try:
