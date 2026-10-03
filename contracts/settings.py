@@ -8,7 +8,6 @@ from contracts.settings_specification import numeric_setting_spec
 
 
 LogLevel = Literal["debug", "info", "warning", "error"]
-ImageUpscaleEngine = Literal["sharp_lanczos3", "pillow_lanczos"]
 ImageStorageMode = Literal["local", "webdav", "both", "r2"]
 ProxyRuntimeClearanceMode = Literal["none", "manual"]
 SettingsFieldSource = Literal["default", "configured", "environment"]
@@ -196,8 +195,6 @@ class _SettingsEditableFields(_StrictModel):
     image_account_concurrency: int = _numeric_field("image_account_concurrency")
     account_processing_concurrency: int = _numeric_field("account_processing_concurrency")
     image_account_retry_enabled: bool = True
-    image_upscale_enabled: bool = False
-    image_upscale_engine: ImageUpscaleEngine = "sharp_lanczos3"
     image_max_account_attempts: int = _numeric_field("image_max_account_attempts")
     image_remove_conversation_after_result: bool = False
     auto_remove_invalid_accounts: bool = True

@@ -36,7 +36,7 @@ _TIMELINE_STEPS = (
     ("conversation_stream_ms", "上游生成", "upstream", "ChatGPT 会话流"),
     ("stream_error_ms", "上游断流", "upstream", "HTTP2 / SSE"),
     ("poll_wait_ms", "等待结果", "resolve", "首次等待 / 轮询间隔 / 退避"),
-    ("poll_request_ms", "查询结果", "resolve", "task / conversation"),
+    ("poll_request_ms", "查询结果", "resolve", "conversation / task"),
     ("resolve_ms", "解析结果", "resolve", "file ID / 下载地址"),
     ("response_ms", "响应整理", "resolve", "Codex 响应"),
     ("download_ms", "下载图片", "download", "图片文件下载"),
@@ -67,6 +67,9 @@ _TIMELINE_WARNING_THRESHOLDS_MS = {
     "handler_queue_ms": 1_000,
     "stream_first_queue_ms": 1_000,
     "account_wait_ms": 10_000,
+    "account_slot_wait_ms": 5_000,
+    "account_refresh_ms": 3_000,
+    "account_remote_check_ms": 5_000,
     "egress_wait_ms": 10_000,
     "egress_acquire_ms": 10_000,
     "upload_ms": 60_000,
@@ -98,6 +101,17 @@ def _int(value: object) -> int:
         return max(0, int(float(value or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _timeline_attempt_count(events: object) -> int:
+    if not isinstance(events, (list, tuple)):
+        return 0
+    best = 0
+    for event in events:
+        if not isinstance(event, Mapping) or event.get("event") != "image_account_lookup":
+            continue
+        best = max(best, _int(event.get("attempts")))
+    return best
 
 
 def _clean(value: object) -> str:
@@ -339,13 +353,32 @@ def build_request_timeline_presentation(
         if value_ms <= 0:
             continue
         description_parts = [description]
+        tone = _timeline_metric_tone(key, value_ms)
+        if key == "account_wait_ms":
+            attempts = _timeline_attempt_count(events)
+            if attempts > 0:
+                description_parts.append(f"尝试 {attempts} 次")
+            part_tones = [tone]
+            for part_key, part_label in (
+                ("account_slot_wait_ms", "等槽"),
+                ("account_refresh_ms", "刷新令牌"),
+                ("account_remote_check_ms", "远程预检"),
+            ):
+                part_ms = _int(timings.get(part_key))
+                if part_ms <= 0:
+                    continue
+                description_parts.append(f"{part_label} {format_request_duration(part_ms)}")
+                part_tones.append(_timeline_metric_tone(part_key, part_ms))
+            if "danger" in part_tones:
+                tone = "danger"
+            elif "warning" in part_tones:
+                tone = "warning"
         if key == "upload_ms":
             description_parts.append(_request_shape_image_summary(request_shape))
         if key == "resolve_ms" and image_count > 0:
             description_parts.append(f"结果图 {image_count}")
         if key == "download_ms" and image_count > 0:
             description_parts.append(f"下载 {image_count} 张")
-        tone = _timeline_metric_tone(key, value_ms)
         steps_by_category.setdefault(category, []).append({
             "key": key,
             "label": label,

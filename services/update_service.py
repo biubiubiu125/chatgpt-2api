@@ -43,7 +43,6 @@ UPDATE_TARGETS = (
     "contracts",
     "services",
     "utils",
-    "scripts/image_upscale/upscale.mjs",
     "pyproject.toml",
     "uv.lock",
     "web_dist",

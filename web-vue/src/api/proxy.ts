@@ -4,7 +4,7 @@ import type { ClearanceTestResult, ProxyRuntimeSettings, ProxyRuntimeStatus } fr
 export interface ProxyTestResult {
   ok: boolean
   status: number
-  latency_ms: number
+  latency_ms: number | null
   error?: string | null
   proxy_source?: string
   has_proxy?: boolean
@@ -14,6 +14,7 @@ export interface ProxyHealth {
   state: 'unknown' | 'healthy' | 'unhealthy'
   checked_at: string | null
   latency_ms: number | null
+  status_code?: number | null
   error: string | null
 }
 
@@ -32,6 +33,11 @@ export interface ProxyGroup {
   name: string
   strategy: 'request_random' | 'time_window' | 'round_robin'
   rotation_interval_minutes: number
+  source?: 'manual' | 'subscription'
+  subscription_url?: string
+  refresh_interval_minutes?: number
+  image_concurrency_limit?: number
+  subscription_error?: string
   enabled: boolean
   notes: string
   nodes: ProxyNode[]
@@ -55,6 +61,10 @@ export type ProxyGroupPayload = {
   name?: string
   strategy?: ProxyGroup['strategy']
   rotation_interval_minutes?: number
+  source?: 'manual' | 'subscription'
+  subscription_url?: string
+  refresh_interval_minutes?: number
+  image_concurrency_limit?: number
   enabled?: boolean
   notes?: string
   nodes?: ProxyNodePayload[]

@@ -342,6 +342,7 @@ const confirmDialog = useConfirmDialog()
 const { listLayoutMode, isWorkspaceLayout } = useListLayoutPreference()
 
 const storageStats = ref<ImageStorageStats | null>(null)
+const originalImageFallbackPaths = ref(new Set<string>())
 
 const pageRuntime = usePageRuntime('gallery')
 const galleryQueryRuntime = useGalleryQueryRuntime({
@@ -451,8 +452,19 @@ function getFileUrl(url: string) {
   return resolveGalleryFileUrl(url)
 }
 
+function galleryOriginalImageUrl(file: GalleryFile) {
+  return getFileUrl(file.url || '')
+}
+
+function galleryThumbnailImageUrl(file: GalleryFile) {
+  return getFileUrl(file.thumbnail_url || '')
+}
+
 function galleryCardImageUrl(file: GalleryFile) {
-  return getFileUrl(file.thumbnail_url || file.url)
+  const thumbnail = galleryThumbnailImageUrl(file)
+  const original = galleryOriginalImageUrl(file)
+  if (originalImageFallbackPaths.value.has(file.path) && original) return original
+  return thumbnail || original
 }
 
 function galleryCardTimeRemaining(file: GalleryFile) {
@@ -479,11 +491,23 @@ function handleCardSelect(file: GalleryFile, checked: boolean) {
 }
 
 function handleCardImageError(event: Event, file: GalleryFile) {
+  const thumbnail = galleryThumbnailImageUrl(file)
+  const original = galleryOriginalImageUrl(file)
+  if (
+    thumbnail
+    && original
+    && thumbnail !== original
+    && !originalImageFallbackPaths.value.has(file.path)
+  ) {
+    originalImageFallbackPaths.value = new Set([...originalImageFallbackPaths.value, file.path])
+    return
+  }
   handleImageError(event, file.path)
 }
 
 function handleGalleryApplied() {
   clearBrokenImages()
+  originalImageFallbackPaths.value = new Set()
   pruneSelection()
   void refreshStorageStats({ lock: false, silent: true })
 }

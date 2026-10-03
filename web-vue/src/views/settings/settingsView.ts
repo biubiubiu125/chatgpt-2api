@@ -43,10 +43,6 @@ export const settingsTabs: SettingsSelectOption[] = [
 ]
 
 const settingsOptionLabels: Record<string, Record<string, string>> = {
-  image_upscale_engine: {
-    sharp_lanczos3: 'Sharp / Lanczos3',
-    pillow_lanczos: 'Pillow / Lanczos',
-  },
   'image_storage.mode': {
     local: '仅本地',
     webdav: '仅 WebDAV',

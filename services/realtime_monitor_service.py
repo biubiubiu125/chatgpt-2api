@@ -80,6 +80,7 @@ STAGE_LABELS = {
     "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "切换备用出口",
+    "image_subscription_sibling_retry": "切换节点",
     "image_stream_resolve_start": "等待图片结果",
     "image_resolve_done": "图片地址就绪",
     "image_resolve_failed": "结果获取失败",
@@ -115,6 +116,7 @@ ACTIVE_STAGE_GROUPS = {
     "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "等待出口",
+    "image_subscription_sibling_retry": "切换节点",
     "image_stream_resolve_start": "等待图片结果",
     "image_resolve_done": "获取图片地址",
     "image_resolve_failed": "获取图片地址",
@@ -129,6 +131,9 @@ METRIC_LABELS = {
     "handler_queue_ms": "等待入口",
     "stream_first_queue_ms": "首包线程等待",
     "account_wait_ms": "等待账号",
+    "account_slot_wait_ms": "等槽",
+    "account_refresh_ms": "刷新令牌",
+    "account_remote_check_ms": "远程预检",
     "egress_wait_ms": "等待出口",
     "egress_acquire_ms": "出口租约",
     "upload_ms": "图片上传",
@@ -509,12 +514,17 @@ class RealtimeMonitorService:
                 image["account_email"] = _mask_email(data.get("account_email"))
             if data.get("previous_account_email"):
                 image["previous_account_email"] = _mask_email(data.get("previous_account_email"))
-            if _int_ms(data.get("attempt")) > 0:
-                image["account_attempt"] = _int_ms(data.get("attempt"))
+            account_attempt = _int_ms(data.get("account_attempt"))
+            if account_attempt <= 0:
+                account_attempt = _int_ms(data.get("attempt"))
+            if account_attempt > 0:
+                image["account_attempt"] = account_attempt
             if _int_ms(data.get("max_account_attempts")) > 0:
                 image["max_account_attempts"] = _int_ms(data.get("max_account_attempts"))
             if "account_switch_count" in data:
                 image["account_switch_count"] = _int_ms(data.get("account_switch_count"))
+            if "node_switch_count" in data:
+                image["node_switch_count"] = _int_ms(data.get("node_switch_count"))
             if data.get("returned_result") is not None:
                 image["returned_result"] = bool(data.get("returned_result"))
             if data.get("returned_message") is not None:
@@ -560,6 +570,9 @@ class RealtimeMonitorService:
         )
         record["image_account_switch_count"] = sum(
             _int_ms(item.get("account_switch_count")) for item in image_items
+        )
+        record["image_node_switch_count"] = sum(
+            _int_ms(item.get("node_switch_count")) for item in image_items
         )
 
     @staticmethod
@@ -623,8 +636,11 @@ class RealtimeMonitorService:
             compact_event = {
                 key: value
                 for key, value in event.items()
-                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS}
-                or key in {"public_error", "account_failure", "switched_account"}
+                if key in {"time", "event", "label", "status", "attempts", *CANONICAL_FAILURE_FIELDS}
+                or key in {
+                    "public_error", "account_failure", "switched_account",
+                    "proxy_group_id", "proxy_node_id", "proxy_node_name",
+                }
                 or (str(key).endswith("_ms") and _int_ms(value) > 0)
             }
             if compact_event:
@@ -872,9 +888,12 @@ class RealtimeMonitorService:
                 {
                     key: value
                     for key, value in event.items()
-                    if key in {"time", "event", "label", "index", "total", "attempt", "status"}
+                    if key in {"time", "event", "label", "index", "total", "attempt", "attempts", "status"}
                     or key in CANONICAL_FAILURE_FIELDS
-                    or key in {"public_error", "account_failure", "switched_account"}
+                    or key in {
+                        "public_error", "account_failure", "switched_account",
+                        "proxy_group_id", "proxy_node_id", "proxy_node_name",
+                    }
                     or key in RAW_DIAGNOSTIC_FIELDS
                     or (str(key).endswith("_ms") and _int_ms(value) > 0)
                 }
@@ -927,9 +946,15 @@ class RealtimeMonitorService:
                 "account_email",
                 "previous_account_email",
                 "account_switch_count",
+                "account_attempt",
+                "node_switch_count",
                 "max_account_attempts",
                 "status",
                 "account_wait_ms",
+                "account_slot_wait_ms",
+                "account_refresh_ms",
+                "account_remote_check_ms",
+                "attempts",
                 "egress_wait_ms",
                 "upload_ms",
                 "bootstrap_ms",

@@ -30,6 +30,10 @@ export type ProxyGroupNodeForm = {
 export type ProxyGroupForm = {
   id: string
   name: string
+  source: 'manual' | 'subscription'
+  subscription_url: string
+  refresh_interval_minutes: number
+  image_concurrency_limit: number
   enabled: boolean
   notes: string
   nodes: ProxyGroupNodeForm[]
@@ -77,10 +81,20 @@ function createDefaultGroupForm(): ProxyGroupForm {
   return {
     id: '',
     name: '',
+    source: 'manual',
+    subscription_url: '',
+    refresh_interval_minutes: 10,
+    image_concurrency_limit: 0,
     enabled: true,
     notes: '',
     nodes: [createDefaultNode(0)],
   }
+}
+
+function clampRefreshMinutes(value: unknown) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return 10
+  return Math.max(1, Math.min(1440, Math.floor(parsed)))
 }
 
 function normalizeGroupNode(item: ProxyGroupNodeForm | ProxyNode, index: number): ProxyGroupNodeForm {
@@ -99,6 +113,12 @@ function groupFormSignature(form: ProxyGroupForm) {
   return JSON.stringify({
     id: cleanProxyGroupDraftId(form.id),
     name: form.name.trim(),
+    source: form.source === 'subscription' ? 'subscription' : 'manual',
+    subscription_url: form.subscription_url.trim(),
+    refresh_interval_minutes: clampRefreshMinutes(form.refresh_interval_minutes),
+    image_concurrency_limit: form.source === 'subscription'
+      ? normalizeImageConcurrencyLimit(form.image_concurrency_limit)
+      : 0,
     enabled: form.enabled !== false,
     notes: form.notes.trim(),
     nodes: form.nodes.map((node) => ({
@@ -221,9 +241,16 @@ export function useProxyGroupRuntime() {
 
   function openEditGroupModal(group: ProxyGroup) {
     editingGroupId.value = group.id
+    const source = group.source === 'subscription' ? 'subscription' : 'manual'
     Object.assign(groupForm, {
       id: group.id,
       name: group.name || group.id,
+      source,
+      subscription_url: group.subscription_url || '',
+      refresh_interval_minutes: clampRefreshMinutes(group.refresh_interval_minutes),
+      image_concurrency_limit: source === 'subscription'
+        ? normalizeImageConcurrencyLimit(group.image_concurrency_limit)
+        : 0,
       enabled: group.enabled !== false,
       notes: group.notes || '',
       nodes: group.nodes.length ? group.nodes.map((node, index) => normalizeGroupNode(node, index)) : [createDefaultNode(0)],
@@ -264,6 +291,16 @@ export function useProxyGroupRuntime() {
     showNodeImportModal.value = false
   }
 
+  function setGroupSource(value: string | string[]) {
+    const raw = Array.isArray(value) ? value[0] : value
+    groupForm.source = raw === 'subscription' ? 'subscription' : 'manual'
+    if (groupForm.source === 'manual') groupForm.image_concurrency_limit = 0
+  }
+
+  function setGroupRefreshMinutes(value: string) {
+    groupForm.refresh_interval_minutes = clampRefreshMinutes(value)
+  }
+
   function addGroupNode() {
     groupForm.nodes.push(createDefaultNode(groupForm.nodes.length))
   }
@@ -289,11 +326,16 @@ export function useProxyGroupRuntime() {
       return
     }
     const id = cleanProxyGroupDraftId(editingGroupId.value || groupForm.id) || createGeneratedId('pg')
+    const source = groupForm.source === 'subscription' ? 'subscription' : 'manual'
     const nodes = groupForm.nodes
       .map((node, index) => normalizeGroupNode(node, index))
       .filter((node) => node.url)
-    if (!nodes.length) {
+    if (source !== 'subscription' && !nodes.length) {
       toast.warning('请至少填写一个代理节点地址')
+      return
+    }
+    if (source === 'subscription' && !groupForm.subscription_url.trim() && !nodes.length) {
+      toast.warning('请填写订阅地址')
       return
     }
     savingGroupId.value = FORM_TEST_KEY
@@ -302,9 +344,15 @@ export function useProxyGroupRuntime() {
       const response = await proxyApi.saveGroup({
         id,
         name: groupName,
+        source,
+        subscription_url: groupForm.subscription_url.trim(),
+        refresh_interval_minutes: clampRefreshMinutes(groupForm.refresh_interval_minutes),
+        image_concurrency_limit: source === 'subscription'
+          ? normalizeImageConcurrencyLimit(groupForm.image_concurrency_limit)
+          : 0,
         enabled: groupForm.enabled,
         notes: groupForm.notes.trim(),
-        nodes,
+        ...(nodes.length ? { nodes } : {}),
         create_only: !editingGroupId.value,
       })
       upsertGroup(response.group)
@@ -401,7 +449,7 @@ export function useProxyGroupRuntime() {
       testResults[key] = {
         ok: false,
         status: 0,
-        latency_ms: 0,
+        latency_ms: null,
         error: message,
       }
       toast.error(message)
@@ -480,6 +528,8 @@ export function useProxyGroupRuntime() {
     openNodeImportModal,
     closeNodeImportModal,
     addGroupNode,
+    setGroupSource,
+    setGroupRefreshMinutes,
     removeGroupNode,
     applyNodeImport,
     saveProxyGroup,

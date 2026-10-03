@@ -136,14 +136,18 @@ class ModelCatalogService:
         high_resolution_models = [
             model
             for model in image_models
-            if model == CODEX_IMAGE_MODEL or model.endswith(f"-{CODEX_IMAGE_MODEL}")
+            if (
+                model in WEB_IMAGE_MODELS
+                or model == CODEX_IMAGE_MODEL
+                or model.endswith(f"-{CODEX_IMAGE_MODEL}")
+            )
         ]
         defaults = {
             "chat_model": "auto" if "auto" in chat_models else chat_models[0],
             "image_model": "gpt-image-2" if "gpt-image-2" in image_models else image_models[0],
         }
         capabilities = {
-            "image_upscale": bool(settings.get("image_upscale_enabled")),
+            "image_upscale": False,
             "high_resolution_image_models": high_resolution_models,
         }
         source = {"chat": chat_source, "image": image_source}

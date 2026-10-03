@@ -306,7 +306,7 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
       defaultTestResult.value = {
         ok: false,
         status: 0,
-        latency_ms: 0,
+        latency_ms: null,
         error: message,
       }
       toast.error(message)

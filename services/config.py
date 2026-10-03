@@ -33,6 +33,8 @@ _REMOVED_TOP_LEVEL_SETTINGS = (
     "auto_relogin_after_refresh",
     "image_auth_refresh_concurrency",
     "image_preflight_token_refresh_enabled",
+    "image_upscale_enabled",
+    "image_upscale_engine",
 )
 
 DEFAULT_BACKUP_INCLUDE = {
@@ -638,17 +640,6 @@ class ConfigStore:
         return _normalize_bool(self.data.get("image_account_retry_enabled"), True)
 
     @property
-    def image_upscale_enabled(self) -> bool:
-        self.reload_if_changed()
-        return _normalize_bool(self.data.get("image_upscale_enabled"), False)
-
-    @property
-    def image_upscale_engine(self) -> str:
-        self.reload_if_changed()
-        value = str(self.data.get("image_upscale_engine") or "sharp_lanczos3").strip().lower()
-        return value if value in {"sharp_lanczos3", "pillow_lanczos"} else "sharp_lanczos3"
-
-    @property
     def account_processing_concurrency(self) -> int:
         self.reload_if_changed()
         return normalize_integer_setting(
@@ -754,8 +745,6 @@ class ConfigStore:
             data["image_account_concurrency"] = self.image_account_concurrency
             data["account_processing_concurrency"] = self.account_processing_concurrency
             data["image_account_retry_enabled"] = self.image_account_retry_enabled
-            data["image_upscale_enabled"] = self.image_upscale_enabled
-            data["image_upscale_engine"] = self.image_upscale_engine
             data["image_max_account_attempts"] = self.image_max_account_attempts
             data["image_parallel_generation"] = self.image_parallel_generation
             data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result

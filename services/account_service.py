@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from contextlib import nullcontext
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -129,6 +130,7 @@ class AccountService:
 
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
     _IMAGE_SELECTION_PREFLIGHT_TTL_SECONDS = 120
+    _IMAGE_SELECTION_WARM_INTERVAL_SECONDS = 90
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _POOL_HEALTH_REFRESH_BATCH_SIZE = 10
     _IMAGE_FAILURE_REFRESH_DEDUP_SECONDS = 30
@@ -847,7 +849,13 @@ class AccountService:
             and account.get("pending_auth_scope") == "image"
         )
 
-    def _image_selection_preflight_fresh(self, account: dict, access_token: str) -> bool:
+    def _image_selection_preflight_fresh(
+            self,
+            account: dict,
+            access_token: str,
+            *,
+            pending_slot: bool = False,
+    ) -> bool:
         """120 秒内刚确认可用、且本地额度仍能覆盖当前占槽时，跳过远程额度预检。
 
         额度未知的普通套餐必须重新询问。只有 Pro / ProLite 这种没有数字额度的账号可以跳过。
@@ -878,7 +886,11 @@ class AccountService:
             quota = int(account.get("quota") or 0)
         except (TypeError, ValueError):
             return False
+        if quota <= 0:
+            return False
         inflight = int(self._image_inflight.get(token, 0))
+        if pending_slot:
+            inflight += 1
         return quota >= inflight
 
     @classmethod
@@ -2076,7 +2088,34 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline_monotonic: float | None = None,
             stop_event: Event | None = None,
-    ) -> str:
+            timing: dict[str, Any] | None = None,
+            hot_only: bool = False,
+    ) -> str | None:
+        started = time.perf_counter()
+        try:
+            return self._acquire_next_candidate_token_body(
+                excluded_tokens=excluded_tokens,
+                plan_type=plan_type,
+                source_type=source_type,
+                plan_types=plan_types,
+                deadline_monotonic=deadline_monotonic,
+                stop_event=stop_event,
+                hot_only=hot_only,
+            )
+        finally:
+            if timing is not None:
+                timing["slot_wait_ms"] = max(0, int((time.perf_counter() - started) * 1000))
+
+    def _acquire_next_candidate_token_body(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline_monotonic: float | None = None,
+            stop_event: Event | None = None,
+            hot_only: bool = False,
+    ) -> str | None:
         while True:
             with self._image_slot_condition:
                 _raise_if_image_selection_stopped(
@@ -2120,10 +2159,23 @@ class AccountService:
                     plan_types,
                 )
                 if tokens:
+                    if hot_only:
+                        tokens = [
+                            token for token in tokens
+                            if self._image_selection_preflight_fresh(
+                                self._accounts.get(token) or {},
+                                token,
+                                pending_slot=True,
+                            )
+                        ]
+                        if not tokens:
+                            return None
                     access_token = self._pick_ranked_image_token_locked(tokens)
                     self._record_image_slot_start_locked(access_token)
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
+                if hot_only:
+                    return None
                 self._image_slot_condition.wait(timeout=slice_timeout)
             # The wait can outlive the account snapshot TTL. Refresh outside the
             # account lock before considering another candidate so a remote delete
@@ -2304,12 +2356,18 @@ class AccountService:
         # 控制流只保留两个出口，但最终是否能说“额度耗尽”必须谨慎：
         # 只要出现过非额度类失败，就说明不能断言全部账号都耗尽，应返回可重试的 unavailable。
         saw_remote_quota_exhausted = False
+        from services.proxy_service import ImageEgressCapacityError
+
         saw_unavailable_failure = False
         refresh_ms = 0
         remote_check_ms = 0
+        slot_wait_ms = 0
         attempt_count = 0
         preflight_skipped = False
+        prefer_hot = True
         for _attempt in range(max_attempts):
+            selection_wait: dict[str, Any] = {}
+            hot_pick = prefer_hot
             try:
                 access_token = self._acquire_next_candidate_token(
                     excluded_tokens=externally_excluded | attempted_tokens,
@@ -2318,13 +2376,20 @@ class AccountService:
                     plan_types=plan_types,
                     deadline_monotonic=deadline_monotonic,
                     stop_event=stop_event,
+                    timing=selection_wait,
+                    hot_only=prefer_hot,
                 )
             except ImageAccountSelectionError as exc:
+                slot_wait_ms += int(selection_wait.get("slot_wait_ms") or 0)
                 if exc.kind == "deadline_exceeded":
                     raise
                 if attempted_tokens:
                     break
                 raise
+            slot_wait_ms += int(selection_wait.get("slot_wait_ms") or 0)
+            if not access_token:
+                prefer_hot = False
+                continue
             attempted_tokens.add(access_token)
             attempt_count += 1
             refresh_started = time.perf_counter()
@@ -2353,6 +2418,8 @@ class AccountService:
                 )
                 saw_unavailable_failure = True
                 self._log_image_preflight_refresh_failure(exc)
+                if hot_pick:
+                    prefer_hot = False
                 continue
             refresh_ms += max(0, int((time.perf_counter() - refresh_started) * 1000))
             if refreshed != access_token:
@@ -2374,6 +2441,9 @@ class AccountService:
                         stop_event=stop_event,
                         deadline_monotonic=deadline_monotonic,
                     )
+                except ImageEgressCapacityError:
+                    remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
+                    account = local_account
                 except ImageAccountSelectionError:
                     remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
                     self.release_image_slot(access_token)
@@ -2389,6 +2459,8 @@ class AccountService:
                         "image request deadline exceeded during remote account validation",
                     )
                     saw_unavailable_failure = True
+                    if hot_pick:
+                        prefer_hot = False
                     continue
                 remote_check_ms += max(0, int((time.perf_counter() - remote_started) * 1000))
             try:
@@ -2416,10 +2488,13 @@ class AccountService:
                     timing.update({
                         "refresh_ms": refresh_ms,
                         "remote_check_ms": remote_check_ms,
+                        "slot_wait_ms": slot_wait_ms,
                         "preflight_skipped": preflight_skipped,
                         "attempts": attempt_count,
                     })
                 return str((account or {}).get("access_token") or access_token)
+            if hot_pick:
+                prefer_hot = False
             if str((account or {}).get("status") or "") == "限流":
                 saw_remote_quota_exhausted = True
             else:
@@ -2434,6 +2509,74 @@ class AccountService:
             "unavailable",
             f"no image account available after {len(attempted_tokens)} attempts",
         )
+
+    def warm_image_selection_accounts(self, *, batch_size: int | None = None) -> int:
+        """后台提前做图片选号预检。不占图片生成槽，也不因为已有热号就停。"""
+        from services.proxy_service import ImageEgressCapacityError
+
+        limit = self._POOL_HEALTH_REFRESH_BATCH_SIZE if batch_size is None else max(0, int(batch_size))
+        warmed = 0
+        for token in self._image_warm_candidate_tokens()[:limit]:
+            try:
+                active = self._refresh_image_access_token(token)
+                self.fetch_remote_info(
+                    active,
+                    "image_selection_warm",
+                    image_scope=True,
+                    allow_refresh_token_exchange=False,
+                    preflight_refresh=False,
+                )
+            except ImageEgressCapacityError:
+                continue
+            except Exception as exc:
+                self._log_image_preflight_refresh_failure(exc)
+                continue
+            warmed += 1
+        return warmed
+
+    def _image_warm_candidate_tokens(self) -> list[str]:
+        with self._lock:
+            snapshots = [
+                dict(account)
+                for account in self._accounts.values()
+                if isinstance(account, dict)
+            ]
+        ranked: list[tuple[tuple[int, float], str]] = []
+        for account in snapshots:
+            if not self._is_image_account_available(account):
+                continue
+            token = str(account.get("access_token") or "").strip()
+            if not token:
+                continue
+            if self._image_selection_preflight_fresh(account, token):
+                checked = self._parse_time(account.get("last_remote_checked_at"))
+                if checked is None or not self._image_warm_refresh_due(checked):
+                    continue
+            ranked.append((self._image_warm_rank(account), token))
+        ranked.sort(key=lambda item: item[0])
+        return [token for _, token in ranked]
+
+    def _image_warm_refresh_due(self, checked: datetime) -> bool:
+        age = (datetime.now(timezone.utc) - checked).total_seconds()
+        lead = max(
+            0,
+            self._IMAGE_SELECTION_PREFLIGHT_TTL_SECONDS - self._IMAGE_SELECTION_WARM_INTERVAL_SECONDS,
+        )
+        return age >= lead
+
+    def _image_warm_rank(self, account: dict) -> tuple[int, float]:
+        checked = self._parse_time(account.get("last_remote_checked_at"))
+        if checked is None:
+            return (2, 0.0)
+        age = (datetime.now(timezone.utc) - checked).total_seconds()
+        ttl = self._IMAGE_SELECTION_PREFLIGHT_TTL_SECONDS
+        recent_limit = ttl + self._IMAGE_SELECTION_WARM_INTERVAL_SECONDS
+        token = str(account.get("access_token") or "").strip()
+        if token and self._image_selection_preflight_fresh(account, token):
+            return (0, ttl - age)
+        if ttl < age <= recent_limit and str(account.get("last_remote_check_result") or "") == "ok":
+            return (1, age - ttl)
+        return (3, checked.timestamp())
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         self._refresh_accounts_snapshot_if_stale()
@@ -4526,19 +4669,39 @@ class AccountService:
         else:
             active_token = self.resolve_access_token(access_token) or access_token
         from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+        from services.proxy_service import ImageEgressCapacityError, proxy_settings
 
         def request_user_info(token: str) -> dict[str, Any]:
-            with account_processing_slot():
+            image_selection_remote = image_scope and event in {
+                "get_available_access_token",
+                "image_selection_warm",
+            }
+            slot = nullcontext() if image_selection_remote else account_processing_slot()
+            with slot:
                 with OpenAIBackendAPI(
                     token,
                     use_global_proxy=True,
                     deadline_monotonic=deadline_monotonic,
+                    reserve_image_egress=image_selection_remote,
+                    wait_for_image_egress=not image_selection_remote,
                 ) as backend:
-                    if stop_event is not None:
-                        backend.bind_image_stop(stop_event)
-                    if image_scope and event == "get_available_access_token":
-                        return backend.get_image_limits()
-                    return backend.get_user_info()
+                    try:
+                        if stop_event is not None:
+                            backend.bind_image_stop(stop_event)
+                        if image_selection_remote:
+                            return backend.get_image_limits()
+                        return backend.get_user_info()
+                    finally:
+                        # 选号预检和预热只是短请求。正式出图会自己持有并释放出口，
+                        # 这里必须在客户端关闭前归还，否则并发上限会被预检占满。
+                        if image_selection_remote:
+                            profile = getattr(backend, "proxy_profile", None)
+                            if profile is not None and getattr(profile, "image_egress_reserved", False):
+                                proxy_settings.release_image_egress(profile)
+                                try:
+                                    setattr(profile, "image_egress_reserved", False)
+                                except Exception:
+                                    pass
 
         request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)
         if not request_account:
@@ -4564,6 +4727,8 @@ class AccountService:
                     rejected_snapshot = current_snapshot
                     rejected_remote_check_marker = current_remote_check_marker
                 except Exception as current_exc:
+                    if isinstance(current_exc, ImageEgressCapacityError):
+                        raise
                     self._record_remote_check_error(
                         current_token,
                         event,
@@ -4685,6 +4850,8 @@ class AccountService:
                     )
                     raise
                 except Exception as retry_exc:
+                    if isinstance(retry_exc, ImageEgressCapacityError):
+                        raise
                     self._record_remote_check_error(
                         verification_token,
                         event,
@@ -4698,6 +4865,8 @@ class AccountService:
                 successful_snapshot = (verification_token, verification_refresh_token)
                 successful_remote_check_marker = verification_remote_check_marker
         except Exception as exc:
+            if isinstance(exc, ImageEgressCapacityError):
+                raise
             self._record_remote_check_error(
                 request_token,
                 event,

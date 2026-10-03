@@ -746,6 +746,7 @@ class ImageStorageService:
                 raise
             if old_keys:
                 self._finish_detached_r2_keys(old_keys)
+            self._store_thumbnail(rel, image_data)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -1411,7 +1412,8 @@ class ImageStorageService:
 
     def _store_thumbnail(self, rel: str, image_data: bytes) -> None:
         safe_rel = normalize_image_relative_path(rel)
-        target = config.image_thumbnails_dir / f"{safe_rel}.png"
+        target = config.image_thumbnails_dir / safe_rel
+        legacy = config.image_thumbnails_dir / f"{safe_rel}.png"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             with Image.open(io.BytesIO(image_data)) as image:
@@ -1420,6 +1422,8 @@ class ImageStorageService:
                     image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
                 image.thumbnail((320, 320), Image.Resampling.LANCZOS)
                 image.save(target, format="PNG", optimize=True)
+            if legacy != target and legacy.is_file():
+                legacy.unlink()
         except Exception:
             logging.getLogger(__name__).exception("failed to store image thumbnail for %s", rel)
 

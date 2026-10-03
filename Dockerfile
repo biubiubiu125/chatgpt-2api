@@ -15,14 +15,6 @@ COPY web-vue ./
 RUN npm run build
 
 
-FROM node:22-bookworm-slim AS image-upscale-build
-
-WORKDIR /app/scripts/image_upscale
-
-COPY scripts/image_upscale/package.json scripts/image_upscale/package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
-
-
 FROM python:3.13-slim AS app
 
 ARG TARGETARCH
@@ -61,8 +53,6 @@ COPY contracts ./contracts
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
-COPY --from=image-upscale-build /usr/local/bin/node /usr/local/bin/node
-COPY --from=image-upscale-build /app/scripts/image_upscale/node_modules ./scripts/image_upscale/node_modules
 COPY --from=web-build /app/web-vue/dist ./web_dist
 COPY deploy/docker-entrypoint.sh /usr/local/bin/chatgpt-2api-entrypoint
 RUN chmod 0755 /usr/local/bin/chatgpt-2api-entrypoint

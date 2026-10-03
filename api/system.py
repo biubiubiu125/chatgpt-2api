@@ -527,6 +527,14 @@ def create_router(app_version: str) -> APIRouter:
             (node.id, await run_in_threadpool(test_proxy, node.url))
             for node in nodes
         ]
+        try:
+            await run_in_threadpool(
+                proxy_management_service.record_group_probe_results,
+                group_id,
+                results,
+            )
+        except Exception:
+            pass
         return proxy_management_service.group_test_response(results)
 
     @router.get("/api/proxy/runtime")

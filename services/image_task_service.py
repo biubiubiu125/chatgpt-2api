@@ -1801,10 +1801,15 @@ class ImageTaskService:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
+            extra_wait = max(float(extra_timeout_secs or 0), 1.0)
+            download_wait_reserve = float(
+                getattr(OpenAIBackendAPI, "_IMAGE_DOWNLOAD_WAIT_RESERVE_SECS", 2.0) or 0
+            )
+
             try:
                 held_token = account_service.acquire_image_slot(
                     access_token,
-                    deadline_monotonic=time.monotonic() + max(float(extra_timeout_secs or 0), 1.0),
+                    deadline_monotonic=time.monotonic() + extra_wait + download_wait_reserve,
                 )
             except TimeoutError:
                 failure = image_failure("image_generation_busy")
@@ -1881,7 +1886,7 @@ class ImageTaskService:
                 access_token=access_token,
                 use_global_proxy=True,
                 reserve_image_egress=True,
-                deadline_monotonic=time.monotonic() + max(float(extra_timeout_secs or 0), 1.0),
+                deadline_monotonic=time.monotonic() + extra_wait + download_wait_reserve,
             )
             egress_reserved = bool(getattr(getattr(backend, "proxy_profile", None), "image_egress_reserved", False))
             file_ids, sediment_ids = backend._poll_image_results(

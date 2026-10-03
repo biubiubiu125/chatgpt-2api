@@ -218,13 +218,19 @@ def _attempt_items(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         attempt["attempt"] = max(1, _int(attempt.get("attempt")))
         if "switched_account" in attempt:
             attempt["switched_account"] = _optional_bool(attempt.get("switched_account"))
+        if "switched_node" in attempt:
+            attempt["switched_node"] = _optional_bool(attempt.get("switched_node"))
         normalized.append(attempt)
     return normalized
 
 
 def call_switch_count(item: Mapping[str, Any]) -> int:
     attempts = _attempt_items(item)
-    attempt_count = sum(1 for attempt in attempts if attempt.get("switched_account") is True)
+    attempt_count = sum(
+        1
+        for attempt in attempts
+        if attempt.get("switched_account") is True or attempt.get("switched_node") is True
+    )
     explicit_count = max(
         _int(_value(item, "switch_count")),
         _int(_value(item, "image_account_switch_count")),
@@ -455,9 +461,20 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
             or attempt.get("upstream_message_preview")
         ),
         "switched_account": _optional_bool(attempt.get("switched_account")),
+        "switched_node": _optional_bool(attempt.get("switched_node")),
+        "proxy_group_id": _clean(attempt.get("proxy_group_id")),
+        "proxy_node_id": _clean(attempt.get("proxy_node_id")),
+        "proxy_node_name": _clean(attempt.get("proxy_node_name")),
         "timings_ms": timings,
         "monitor": monitor,
     }
+    node_label = summary["proxy_node_name"] or summary["proxy_node_id"]
+    if summary["switched_node"] is True:
+        switch_label = f"切换节点 · {node_label}" if node_label else "切换节点"
+    elif summary["switched_account"] is True:
+        switch_label = "切换账号"
+    else:
+        switch_label = ""
     summary["presentation"] = {
         "status": status_presentation,
         "failure_label": error_label or (
@@ -466,7 +483,7 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
             else "生成失败"
         ),
         "marker_tone": "success" if result_status == "success" else "danger",
-        "switch_label": "切换账号" if summary["switched_account"] is True else "",
+        "switch_label": switch_label,
         "error_code_text": error_code,
         "status_code_text": f"HTTP {summary['status_code']}" if summary["status_code"] else "",
         "show_failure": result_status != "success",
@@ -660,7 +677,11 @@ def _attempt_group_presentations(
     for slot in range(1, slot_count + 1):
         slot_attempts = grouped.get(slot, [])
         attempt_count = len(slot_attempts)
-        switch_count = sum(1 for attempt in slot_attempts if attempt.get("switched_account") is True)
+        switch_count = sum(
+            1
+            for attempt in slot_attempts
+            if attempt.get("switched_account") is True or attempt.get("switched_node") is True
+        )
         succeeded = any(_clean(attempt.get("result_status")) == "success" for attempt in slot_attempts)
         delivery_failed = any(
             _clean(attempt.get("result_status")) == "generated_but_delivery_failed"

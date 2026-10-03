@@ -7,6 +7,7 @@ from typing import Any
 
 from curl_cffi.requests import exceptions as curl_exceptions
 
+from services.proxy_service import ImageEgressDeadlineError, ProxyReferenceUnavailableError
 from utils.helper import UpstreamHTTPError
 
 
@@ -662,6 +663,10 @@ def classify_image_exception(exc: BaseException, *, code: str | None = None) -> 
             pass
         return resolved
 
+    if isinstance(exc, ImageEgressDeadlineError):
+        return remember(image_failure("task_interrupted", raw_detail=str(exc)))
+    if isinstance(exc, ProxyReferenceUnavailableError):
+        return remember(image_failure("upstream_unavailable", raw_detail=str(exc)))
     if isinstance(exc, UpstreamHTTPError):
         return remember(classify_upstream_http_error(exc))
     structured_code = code or getattr(exc, "code", None)

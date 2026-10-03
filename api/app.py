@@ -11,7 +11,12 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, prompts, register, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_account_lifecycle_watcher
+from api.support import (
+    resolve_web_asset,
+    start_account_lifecycle_watcher,
+    start_image_selection_warmer,
+    start_proxy_subscription_refresher,
+)
 from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
@@ -89,6 +94,8 @@ def create_app() -> FastAPI:
         account_service.cleanup_auto_remove_accounts()
         stop_event = Event()
         thread = start_account_lifecycle_watcher(stop_event)
+        image_warmer_thread = start_image_selection_warmer(stop_event)
+        proxy_subscription_thread = start_proxy_subscription_refresher(stop_event)
         cleanup_thread = start_retention_cleanup_scheduler(stop_event)
         dashboard_metrics_thread = dashboard_metrics_service.start_refresh_scheduler(
             log_service,
@@ -101,6 +108,8 @@ def create_app() -> FastAPI:
         finally:
             stop_event.set()
             thread.join(timeout=1)
+            image_warmer_thread.join(timeout=1)
+            proxy_subscription_thread.join(timeout=1)
             dashboard_metrics_thread.join(timeout=1)
             await run_in_threadpool(cleanup_thread.join, RETENTION_SHUTDOWN_TIMEOUT_SECS)
             await run_in_threadpool(image_task_service.shutdown_cancel_pending_and_wait)

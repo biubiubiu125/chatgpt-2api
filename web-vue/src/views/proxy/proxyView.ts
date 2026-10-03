@@ -25,6 +25,11 @@ export const fallbackProxyModeOptions = [
   { label: '自定义代理', value: 'custom' },
 ] as const
 
+export const proxyGroupSourceOptions = [
+  { label: '手工填写', value: 'manual' },
+  { label: '订阅', value: 'subscription' },
+] as const
+
 const defaultProxyModes = new Set<string>(defaultProxyModeOptions.map((item) => item.value))
 const fallbackProxyModes = new Set<string>(fallbackProxyModeOptions.map((item) => item.value))
 
@@ -61,6 +66,7 @@ function proxyNodeSignature(node: ProxyNode) {
     node.image_concurrency_limit,
     node.health.state,
     node.health.latency_ms,
+    node.health.status_code,
     boundedSignatureText(node.health.error),
     node.health.checked_at,
     boundedSignatureText(node.notes),
@@ -77,6 +83,10 @@ export function proxyGroupRowSignature(group: ProxyGroup, testingKey: string, sa
     group.id,
     group.name,
     group.enabled !== false ? 1 : 0,
+    group.source,
+    group.subscription_error,
+    group.image_concurrency_limit,
+    group.health?.latency_ms,
     group.strategy,
     group.rotation_interval_minutes,
     boundedSignatureText(group.notes),
@@ -168,6 +178,21 @@ export function isProxyNodeTesting(group: Pick<ProxyGroup, 'id'>, node: Pick<Pro
   return testingKey === `group:${group.id}:all` || testingKey === proxyNodeTestKey(group, node)
 }
 
+function proxyLatencyLabel(latency: number | null | undefined) {
+  return latency == null ? '' : `${latency}ms`
+}
+
+export function proxyDefaultTestMetric(result: {
+  status?: number | null
+  latency_ms?: number | null
+  error?: string | null
+}) {
+  const status = result.status ? `HTTP ${result.status}` : 'HTTP -'
+  if (result.error === '超时') return `${status} · 超时`
+  if (result.latency_ms == null) return status
+  return `${status} · ${result.latency_ms}ms`
+}
+
 export function proxyNodeTestSummary(
   group: Pick<ProxyGroup, 'id'>,
   node: ProxyNode,
@@ -176,10 +201,21 @@ export function proxyNodeTestSummary(
 ) {
   if (isProxyNodeTesting(group, node, testingKey)) return '检测中...'
   const result = testResults[proxyNodeTestKey(group, node)]
-  if (result?.ok) return `HTTP ${result.status || '-'} · ${result.latency_ms || 0}ms`
+  if (result?.error === '超时') return '超时'
+  if (result?.ok) {
+    const latency = proxyLatencyLabel(result.latency_ms)
+    return latency ? `HTTP ${result.status || '-'} · ${latency}` : `HTTP ${result.status || '-'}`
+  }
   if (result && !result.ok) return result.error || '检测失败'
+  if (node.health.error === '超时') return '超时'
   if (node.health.state === 'unhealthy') return node.health.error || '检测失败'
-  if (node.health.state === 'healthy') return `${node.health.latency_ms || 0}ms`
+  if (node.health.state === 'healthy') {
+    const latency = proxyLatencyLabel(node.health.latency_ms)
+    if (node.health.status_code) {
+      return latency ? `HTTP ${node.health.status_code} · ${latency}` : `HTTP ${node.health.status_code} · 可用`
+    }
+    return latency || '可用'
+  }
   return '尚未测试'
 }
 

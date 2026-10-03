@@ -32,10 +32,7 @@ def _cleanup_empty_dirs(root: Path) -> None:
 
 
 def _drop_image_sidecars(rel: str, *, remote_remains: bool) -> None:
-    for thumbnail in (
-        _thumbnail_path(rel),
-        config.image_thumbnails_dir / normalize_image_relative_path(rel),
-    ):
+    for thumbnail in (_thumbnail_path(rel), _legacy_thumbnail_path(rel)):
         if thumbnail.is_file():
             thumbnail.unlink()
     if not remote_remains:
@@ -58,7 +55,24 @@ def get_image_response(relative_path: str) -> FileResponse | Response:
 
 def _thumbnail_path(relative_path: str) -> Path:
     rel = normalize_image_relative_path(relative_path)
+    return config.image_thumbnails_dir / rel
+
+
+def _legacy_thumbnail_path(relative_path: str) -> Path:
+    rel = normalize_image_relative_path(relative_path)
     return config.image_thumbnails_dir / f"{rel}.png"
+
+
+def _adopt_legacy_thumbnail(relative_path: str) -> None:
+    target = _thumbnail_path(relative_path)
+    legacy = _legacy_thumbnail_path(relative_path)
+    if target.is_file() or not legacy.is_file() or legacy == target:
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(target)
+    except OSError:
+        return
 
 
 def thumbnail_url(base_url: str, relative_path: str) -> str:
@@ -80,6 +94,7 @@ def _image_dimensions(path: Path) -> tuple[int, int] | None:
 
 
 def ensure_thumbnail(relative_path: str) -> Path:
+    _adopt_legacy_thumbnail(relative_path)
     target = _thumbnail_path(relative_path)
     source_mtime = 0.0
     source: Path | None = None
@@ -139,7 +154,7 @@ def get_image_download_response(relative_path: str) -> FileResponse:
 def cleanup_image_thumbnails() -> int:
     thumbnails_root = config.image_thumbnails_dir
     removed = 0
-    candidates: dict[Path, str] = {}
+    candidates: list[tuple[Path, str, bool]] = []
     for path in thumbnails_root.rglob("*"):
         if not path.is_file():
             continue
@@ -148,13 +163,28 @@ def cleanup_image_thumbnails() -> int:
             path.unlink()
             removed += 1
             continue
-        candidates[path] = rel[:-4]
+        legacy = rel.endswith(".png.png")
+        image_rel = rel[:-4] if legacy else rel
+        candidates.append((path, image_rel, legacy))
 
-    existing = image_storage_service.existing_paths(list(candidates.values()))
-    for path, rel in candidates.items():
-        if rel not in existing:
+    existing = image_storage_service.existing_paths([image_rel for _path, image_rel, _legacy in candidates])
+    for path, image_rel, legacy in candidates:
+        if image_rel not in existing:
             path.unlink()
             removed += 1
+            continue
+        if not legacy:
+            continue
+        target = thumbnails_root / image_rel
+        if target.is_file():
+            path.unlink()
+            removed += 1
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(target)
+        except OSError:
+            continue
     _cleanup_empty_dirs(thumbnails_root)
     return removed
 
@@ -312,10 +342,7 @@ def delete_images(paths: list[str] | None = None, start_date: str = "", end_date
         terminal_error = exc.cause
 
     for item in completed_targets:
-        for thumbnail in (
-            _thumbnail_path(item),
-            config.image_thumbnails_dir / normalize_image_relative_path(item),
-        ):
+        for thumbnail in (_thumbnail_path(item), _legacy_thumbnail_path(item)):
             if thumbnail.is_file():
                 thumbnail.unlink()
         remove_tags(item)

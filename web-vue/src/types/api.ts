@@ -74,8 +74,6 @@ export interface Settings {
   image_account_concurrency: number
   account_processing_concurrency: number
   image_account_retry_enabled: boolean
-  image_upscale_enabled: boolean
-  image_upscale_engine: 'sharp_lanczos3' | 'pillow_lanczos'
   image_max_account_attempts: number
   image_remove_conversation_after_result: boolean
   auto_remove_invalid_accounts: boolean

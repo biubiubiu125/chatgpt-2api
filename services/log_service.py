@@ -189,6 +189,10 @@ IMAGE_ATTEMPT_KEYS = {
     "raw_upstream_message",
     "account_failure",
     "switched_account",
+    "switched_node",
+    "proxy_group_id",
+    "proxy_node_id",
+    "proxy_node_name",
     "conversation_id",
     "duration_ms",
     "monitor",
@@ -198,6 +202,7 @@ IMAGE_ATTEMPT_INTEGER_KEYS = {
 }
 IMAGE_ATTEMPT_BOOLEAN_KEYS = {
     "failure_retryable", "failure_account_failure", "account_failure", "switched_account",
+    "switched_node",
 }
 
 
@@ -258,6 +263,12 @@ def _normalize_image_attempt_monitor(value: object) -> dict[str, object] | None:
                     parsed = _normalize_image_attempt_int(key, item)
                     if parsed is not None:
                         event[key] = parsed
+                elif key == "attempts":
+                    try:
+                        parsed_attempts = max(0, int(item))
+                    except (TypeError, ValueError):
+                        continue
+                    event[key] = parsed_attempts
                 elif key in IMAGE_ATTEMPT_BOOLEAN_KEYS:
                     parsed = _normalize_image_attempt_bool(item)
                     if parsed is not None:
@@ -266,6 +277,7 @@ def _normalize_image_attempt_monitor(value: object) -> dict[str, object] | None:
                     "time", "event", "label", "status",
                     "failure_code", "failure_scope", "failure_capability",
                     "error_type", "public_error",
+                    "proxy_group_id", "proxy_node_id", "proxy_node_name",
                 }:
                     text = str(item or "").strip()
                     if text:

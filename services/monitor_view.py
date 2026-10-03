@@ -14,6 +14,9 @@ DIGEST_METRIC_PAIRS = (
     ("等待入口", "handler_queue_ms"),
     ("首包", "stream_first_queue_ms"),
     ("等待账号", "account_wait_ms"),
+    ("等槽", "account_slot_wait_ms"),
+    ("刷新令牌", "account_refresh_ms"),
+    ("远程预检", "account_remote_check_ms"),
     ("等待出口", "egress_wait_ms"),
     ("出口租约", "egress_acquire_ms"),
     ("上传", "upload_ms"),
@@ -37,6 +40,9 @@ SLOW_METRIC_PAIRS = (
     ("handler_queue_ms", "等待入口"),
     ("stream_first_queue_ms", "首包"),
     ("account_wait_ms", "等待账号"),
+    ("account_slot_wait_ms", "等槽"),
+    ("account_refresh_ms", "刷新令牌"),
+    ("account_remote_check_ms", "远程预检"),
     ("egress_wait_ms", "等待出口"),
     ("egress_acquire_ms", "出口租约"),
     ("upload_ms", "上传"),
@@ -65,6 +71,9 @@ EVENT_METRIC_PAIRS = (
     ("等待入口", "handler_queue_ms"),
     ("首包", "stream_first_queue_ms"),
     ("等待账号", "account_wait_ms"),
+    ("等槽", "account_slot_wait_ms"),
+    ("刷新令牌", "account_refresh_ms"),
+    ("远程预检", "account_remote_check_ms"),
     ("等待出口", "egress_wait_ms"),
     ("上传", "upload_ms"),
     ("初始化", "bootstrap_ms"),
@@ -123,6 +132,7 @@ RECORD_FIELDS = {
     "image_account_attempt",
     "image_account_max_attempts",
     "image_account_switch_count",
+    "image_node_switch_count",
     "attempt_count",
     "switch_count",
     "image_requested_count",
@@ -168,6 +178,7 @@ IMAGE_FIELDS = {
     "account_attempt",
     "max_account_attempts",
     "account_switch_count",
+    "node_switch_count",
     "stage",
     "stage_label",
     "updated_at",
@@ -214,6 +225,8 @@ EVENT_FIELDS = {
     "account_email",
     "previous_account_email",
     "account_switch_count",
+    "account_attempt",
+    "node_switch_count",
     "max_account_attempts",
     "status",
     "sse_event_count",
@@ -261,6 +274,7 @@ INTEGER_FIELDS = {
     "image_account_attempt",
     "image_account_max_attempts",
     "image_account_switch_count",
+    "image_node_switch_count",
     "attempt_count",
     "switch_count",
     "image_requested_count",
@@ -275,6 +289,7 @@ INTEGER_FIELDS = {
     "account_attempt",
     "max_account_attempts",
     "account_switch_count",
+    "node_switch_count",
     "attempt",
     "sse_event_count",
 }
@@ -390,18 +405,24 @@ def _build_account_attempt(record: Mapping[str, Any]) -> dict[str, Any]:
     attempt = _int(record.get("image_account_attempt"))
     max_attempts = max(attempt, _int(record.get("image_account_max_attempts")))
     switch_count = _int(record.get("image_account_switch_count"))
+    node_switch_count = _int(record.get("image_node_switch_count"))
     images = _mapping(record.get("images"))
     image_count = max((_int(_mapping(item).get("total")) for item in images.values()), default=0)
     parts: list[str] = []
     if attempt and max_attempts:
         prefix = "最高第 " if image_count > 1 else "第 "
         parts.append(f"{prefix}{attempt}/{max_attempts} 次")
-    if attempt or max_attempts or switch_count:
-        parts.append(f"已切换 {switch_count} 次" if switch_count else "未切换")
+    if switch_count:
+        parts.append(f"已切换账号 {switch_count} 次")
+    if node_switch_count:
+        parts.append(f"已换节点 {node_switch_count} 次")
+    if not switch_count and not node_switch_count and (attempt or max_attempts):
+        parts.append("未切换")
     return {
         "attempt": attempt,
         "max_attempts": max_attempts,
         "switch_count": switch_count,
+        "node_switch_count": node_switch_count,
         "image_count": image_count,
         "display": " · ".join(parts),
     }
@@ -784,7 +805,7 @@ def _build_diagnostic_groups(
                 _diagnostic_item("average", "平均总耗时", _format_ms(summary.get("avg_duration_ms")), "窗口均值", "info"),
                 _diagnostic_item("p95", "P95 总耗时", _format_ms(summary.get("p95_duration_ms")), "慢请求参考", "info"),
                 _diagnostic_item("poll_wait_ms", "等待结果", _format_ms(p95.get("poll_wait_ms")), "间隔 / 退避", "warning"),
-                _diagnostic_item("poll_request_ms", "查询结果", _format_ms(p95.get("poll_request_ms")), "task / conversation", "info"),
+                _diagnostic_item("poll_request_ms", "查询结果", _format_ms(p95.get("poll_request_ms")), "conversation / task", "info"),
                 _diagnostic_item("resolve_ms", "结果处理", _format_ms(p95.get("resolve_ms")), "file ID / 下载地址", "warning"),
                 _diagnostic_item("download_ms", "图片下载", _format_ms(p95.get("download_ms")), "下载并返回"),
                 _diagnostic_item("response_ms", "响应整理", _format_ms(p95.get("response_ms")), "整理 API 响应"),

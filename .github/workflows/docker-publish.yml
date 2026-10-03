@@ -111,10 +111,9 @@ jobs:
           npm --prefix web-vue run build
 
           bundle="release/chatgpt-2api-app"
-          mkdir -p "${bundle}/scripts/image_upscale"
+          mkdir -p "${bundle}"
           cp main.py VERSION pyproject.toml uv.lock "${bundle}/"
           cp -R api contracts services utils "${bundle}/"
-          cp scripts/image_upscale/upscale.mjs "${bundle}/scripts/image_upscale/"
           cp -R web-vue/dist "${bundle}/web_dist"
 
           version="$(tr -d '\r\n' < VERSION)"
@@ -129,7 +128,6 @@ jobs:
               "contracts",
               "services",
               "utils",
-              "scripts/image_upscale/upscale.mjs",
               "pyproject.toml",
               "uv.lock",
               "web_dist"
