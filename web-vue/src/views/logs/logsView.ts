@@ -4,6 +4,9 @@ import type {
   SystemLogsResponse,
   SystemLogRow,
 } from '@/api/logs'
+import { buildLogPreviewImages } from './logPreviewImages'
+
+export { buildLogPreviewImages }
 
 export type LogFilterOption = { label: string; value: string }
 export type LogGroupedSelectOption = LogFilterOption & { disabled?: boolean }
@@ -243,23 +246,6 @@ export function filenameFromUrl(url: string): string {
   } catch {
     return decodeURIComponent(value.split(/[/?#]/)[0]?.split('/').pop() || value)
   }
-}
-
-export function buildLogPreviewImages(
-  item: SystemLogRow | null | undefined,
-  isPreviewBroken: (url: string) => boolean,
-): LogPreviewImage[] {
-  if (!item) return []
-  return item.imageUrls.map((url, index) => {
-    const sourceUrl = item.urls[index] || url
-    return {
-      url,
-      title: sourceUrl,
-      filename: filenameFromUrl(sourceUrl),
-      alt: `日志结果图片 ${index + 1}`,
-      broken: isPreviewBroken(url),
-    }
-  })
 }
 
 export function buildLogPreviewGalleryFile(image: LogPreviewImage | null | undefined): GalleryFile | null {

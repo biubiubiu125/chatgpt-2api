@@ -38,11 +38,13 @@ from services.image_failure import (
     classify_image_exception,
     classify_upstream_message,
     classify_task_failure,
+    client_text_for_failure,
     image_failure,
     is_terminal_message_status,
     merge_message_failure,
     structured_upstream_codes,
     terminal_assistant_text,
+    upstream_text_for_failure,
 )
 from services.protocol.reasoning import normalize_thinking_effort
 from services.provider_asset_url import ProviderAssetUrlError, resolve_provider_asset_url
@@ -788,22 +790,49 @@ class OpenAIBackendAPI:
         return session
 
     @staticmethod
+    def _cookie_name_values(jar: Any) -> list[tuple[str, str]]:
+        inner = getattr(jar, "jar", None)
+        source = inner if inner is not None else jar
+        if inner is None:
+            try:
+                items = list(jar.items())
+            except Exception:
+                items = None
+            if items is not None:
+                source = items
+        try:
+            cookies = list(source)
+        except Exception:
+            return []
+        records: list[tuple[str, str]] = []
+        for cookie in cookies:
+            if isinstance(cookie, str):
+                continue
+            if isinstance(cookie, tuple) and len(cookie) == 2:
+                name, value = cookie
+            else:
+                name = getattr(cookie, "name", "")
+                value = getattr(cookie, "value", "")
+            name_text = str(name or "").strip()
+            value_text = str(value or "").strip()
+            if name_text and value_text:
+                records.append((name_text, value_text))
+        return records
+
+    @staticmethod
     def _copy_session_cookies(source: Any, target: Any) -> None:
         jar = getattr(source, "cookies", None)
         setter = getattr(getattr(target, "cookies", None), "set", None)
         if jar is None or not callable(setter):
             return
-        try:
-            pairs = list(jar.items())
-        except Exception:
-            return
-        for name, value in pairs:
-            name_text = str(name or "").strip()
-            value_text = str(value or "").strip()
-            if not name_text or not value_text:
+        grouped: dict[str, set[str]] = {}
+        for name, value in OpenAIBackendAPI._cookie_name_values(jar):
+            grouped.setdefault(name, set()).add(value)
+        for name, values in grouped.items():
+            if len(values) != 1:
                 continue
             try:
-                setter(name_text, value_text)
+                setter(name, next(iter(values)))
             except Exception:
                 continue
 
@@ -904,6 +933,25 @@ class OpenAIBackendAPI:
             "status": "正常" if image_quota_unknown or quota > 0 else "限流",
         }
         plan_type = account_service._normalize_account_type(default_account.get("plan_type"))
+        if plan_type:
+            result["type"] = plan_type
+        return result
+
+    def get_registered_profile(self) -> Dict[str, Any]:
+        """注册收口只读身份和套餐，不发起 conversation/init。"""
+        me = self._get_me()
+        default_account = self._get_default_account()
+        if not isinstance(me, dict):
+            me = {}
+        if not isinstance(default_account, dict):
+            default_account = {}
+        plan_type = account_service._normalize_account_type(default_account.get("plan_type"))
+        result: Dict[str, Any] = {
+            "email": me.get("email"),
+            "user_id": me.get("id"),
+            "image_quota_unknown": True,
+            "status": "正常",
+        }
         if plan_type:
             result["type"] = plan_type
         return result
@@ -3286,6 +3334,9 @@ class OpenAIBackendAPI:
     _IMAGE_POLL_IDLE_SECS = 1.0
     # Leave this much of a short poll budget so the first query can start.
     _IMAGE_POLL_QUERY_RESERVE_SECS = 0.05
+    # Match the SSE/Codex task probe: the account-side sentence can land in the
+    # conversation document before quota or policy is visible on /backend-api/tasks.
+    _IMAGE_ACCOUNT_SIDE_TASK_WAIT_SECS = 2.0
     # After file ids exist, keep this much request time for download URL waits.
     _IMAGE_DOWNLOAD_WAIT_RESERVE_SECS = 2.0
 
@@ -3347,6 +3398,7 @@ class OpenAIBackendAPI:
         started_at = time.monotonic()
         attempt = 0
         empty_rounds = 0
+        account_side_task_waited = False
         interval = self._IMAGE_POLL_IDLE_SECS
         initial_wait = self._IMAGE_POLL_IDLE_SECS
         file_ids: list[str] = []
@@ -3441,6 +3493,14 @@ class OpenAIBackendAPI:
             raw_upstream_message: str = "",
         ) -> None:
             resolved_detail: Any = raw_detail or failure.raw_detail
+            if isinstance(resolved_detail, str):
+                visible_detail = client_text_for_failure(
+                    failure.with_raw_detail(resolved_detail),
+                    "",
+                )
+                if visible_detail != resolved_detail.strip():
+                    resolved_detail = visible_detail
+            raw_upstream_message = upstream_text_for_failure(failure, raw_upstream_message)
             resolved = failure.with_raw_detail(resolved_detail)
             if source_error is not None:
                 exc = source_error
@@ -3451,7 +3511,10 @@ class OpenAIBackendAPI:
                     if resolved.code == "image_poll_timeout"
                     else ImageFailureError
                 )
-                exc = error_class(raw_detail, failure=resolved)
+                exc = error_class(
+                    resolved_detail if isinstance(resolved_detail, str) else raw_detail,
+                    failure=resolved,
+                )
             setattr(exc, "conversation_id", conversation_id or "")
             setattr(exc, "poll_attempts", attempt)
             setattr(exc, "poll_timeout_secs", timeout_secs)
@@ -3586,6 +3649,16 @@ class OpenAIBackendAPI:
                 empty_rounds=empty_rounds,
                 conversation_failure=conversation_failure,
             ):
+                if (
+                    not account_side_task_waited
+                    and conversation_failure is not None
+                    and conversation_failure.code == "image_account_side_fault"
+                ):
+                    account_side_task_waited = True
+                    remaining = _remaining()
+                    wait_for = min(self._IMAGE_ACCOUNT_SIDE_TASK_WAIT_SECS, remaining)
+                    if wait_for > 0:
+                        self._sleep_for_image_poll(wait_for)
                 task_query_started = time.perf_counter()
                 try:
                     tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)

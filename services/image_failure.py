@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -33,6 +34,7 @@ class ImageFailure:
     verify_account: bool = False
     raw_detail: Any = field(default=None, compare=False, repr=False)
     public_detail: str = field(default="", compare=False, repr=False)
+    suppress_account_removal: bool = field(default=False, compare=False)
 
     @property
     def outcome(self) -> str:
@@ -107,6 +109,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
     "image_tool_error": FailurePolicy(
         "account", "image_generation", False, 502, "server_error",
         verify_account=True,
+    ),
+    "image_account_side_fault": FailurePolicy(
+        "account", "image_generation", False, 502, "server_error",
     ),
     "image_quota_exhausted": FailurePolicy(
         "account", "image_generation", False, 429, "insufficient_quota",
@@ -245,6 +250,7 @@ IMAGE_BUSY_PUBLIC_MESSAGE = "Image generation is busy. Please try again later."
 
 _PUBLIC_RAW_DETAIL_CODES = frozenset({
     "content_policy_violation",
+    "image_account_side_fault",
     "image_quota_exhausted",
     "invalid_image_input",
     "no_image_generated",
@@ -255,6 +261,7 @@ _PUBLIC_RAW_DETAIL_CODES = frozenset({
 
 _DIRECT_PUBLIC_TEXT_CODES = frozenset({
     "content_policy_violation",
+    "image_account_side_fault",
     "invalid_image_input",
     "upstream_text_reply",
     "unsupported_model",
@@ -324,9 +331,15 @@ def _public_upstream_text(
         candidates.append(getattr(error, "raw_upstream_message", None))
     if failure.code in _PUBLIC_RAW_DETAIL_CODES:
         candidates.append(failure.raw_detail)
+    hide_account_side_sentence = _hides_account_side_sentence(failure.code)
     for candidate in candidates:
-        if text := _safe_public_text(candidate):
-            return text
+        text = _safe_public_text(candidate)
+        if not text:
+            continue
+        # 额度、审查、鉴权或下载已经胜出时，不能再把账号侧原句当成公开文案。
+        if hide_account_side_sentence and _account_side_image_fault_source(text):
+            continue
+        return text
     return ""
 
 
@@ -350,6 +363,36 @@ def public_image_error_message(
     if failure.code in {"image_quota_exhausted", "insufficient_quota"}:
         return IMAGE_QUOTA_PUBLIC_MESSAGE
     return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
+
+
+def client_text_for_failure(failure: ImageFailure | None, fallback: str = "") -> str:
+    """Text shown for a failure. Keep-codes never display the account-side sentence."""
+    if failure is None:
+        return str(fallback or "").strip()
+    raw_detail = failure.raw_detail if isinstance(failure.raw_detail, str) else ""
+    for candidate in (raw_detail, fallback):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if _hides_account_side_sentence(failure.code) and _account_side_image_fault_source(text):
+            continue
+        return text
+    if _hides_account_side_sentence(failure.code):
+        return public_image_error_message(failure)
+    return str(fallback or "").strip()
+
+
+def upstream_text_for_failure(failure: ImageFailure | None, text: Any) -> str:
+    """Assistant text attached to an exception, without the sentence on a keep-code."""
+    cleaned = str(text or "").strip() if isinstance(text, str) else ""
+    if (
+        failure is not None
+        and cleaned
+        and _hides_account_side_sentence(failure.code)
+        and _account_side_image_fault_source(cleaned)
+    ):
+        return ""
+    return cleaned
 
 
 class ImageFailureError(RuntimeError):
@@ -428,6 +471,7 @@ class ImageGenerationError(ImageFailureError):
                 "type": self.error_type,
                 "param": self.param,
                 "code": self.code,
+                "status": int(self.status_code),
             }
         }
 
@@ -475,7 +519,7 @@ def _failure_priority(code: str) -> int:
     normalized = FAILURE_CODE_ALIASES.get(str(code or "").strip().lower(), str(code or "").strip().lower())
     if normalized == "auth_invalid":
         return 8
-    if normalized in {"image_quota_exhausted", "insufficient_quota"}:
+    if normalized in {"image_account_side_fault", "image_quota_exhausted", "insufficient_quota"}:
         return 7
     if normalized in {"file_upload_throttled", "upstream_rate_limited"}:
         return 6
@@ -537,6 +581,193 @@ def _classify_structured_failure_codes(
     return None
 
 
+_ACCOUNT_SIDE_IMAGE_FAULT_TEXT = (
+    "\u7531\u4e8e\u6211\u8fd9\u8fb9\u53d1\u751f\u4e86\u9519\u8bef\u6211\u672a\u80fd\u751f\u6210\u56fe\u7247",
+    "duetoanerroronmysideiwasunabletogeneratetheimage",
+)
+_ACCOUNT_SIDE_FAULT_KEEP_CODES = frozenset({
+    "auth_invalid",
+    "content_policy_violation",
+    "image_download_failed",
+    "image_quota_exhausted",
+    "insufficient_quota",
+})
+# Generic HTTP classifications, including a sentence promoted too early, lose
+# to a keep-code that is also present in the same body.
+_ACCOUNT_SIDE_HTTP_FALLBACK_CODES = frozenset({
+    "image_account_side_fault",
+    "internal_error",
+    "upstream_connection_failed",
+    "upstream_connection_timeout",
+    "upstream_error",
+    "upstream_rate_limited",
+    "upstream_unavailable",
+})
+_ACCOUNT_SIDE_FAULT_TEXT_KEYS = ("message", "detail", "error", "error_description")
+
+
+def _hides_account_side_sentence(code: str) -> bool:
+    normalized = str(code or "").strip().lower()
+    normalized = FAILURE_CODE_ALIASES.get(normalized, normalized)
+    return normalized in _ACCOUNT_SIDE_FAULT_KEEP_CODES or code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+
+
+def _account_side_fault_separator(char: str) -> bool:
+    return char.isspace() or unicodedata.category(char).startswith(("P", "Z"))
+
+
+def _account_side_image_fault_text_matches(value: str) -> bool:
+    """Match the exact sentence after dropping separators.
+
+    Extra text is allowed only when punctuation or whitespace separates it from
+    the sentence. A suffix glued onto the last word, such as "images", does not
+    match.
+    """
+    text = unicodedata.normalize("NFKC", value).casefold()
+    collapsed: list[str] = []
+    starts: set[int] = set()
+    ends: set[int] = set()
+    in_token = False
+    for char in text:
+        if _account_side_fault_separator(char):
+            if in_token:
+                ends.add(len(collapsed))
+                in_token = False
+            continue
+        if not in_token:
+            starts.add(len(collapsed))
+            in_token = True
+        collapsed.append(char)
+    if in_token:
+        ends.add(len(collapsed))
+    normalized = "".join(collapsed)
+    for needle in _ACCOUNT_SIDE_IMAGE_FAULT_TEXT:
+        start = 0
+        while True:
+            index = normalized.find(needle, start)
+            if index < 0:
+                break
+            if index in starts and index + len(needle) in ends:
+                return True
+            start = index + 1
+    return False
+
+
+def _http_body_dump(text: str) -> bool:
+    """True for UpstreamHTTPError text, which includes the whole body."""
+    return "failed: status=" in text and "body=" in text
+
+
+def _embedded_json_values(text: str) -> list[Any]:
+    """JSON objects or arrays embedded in a diagnostic string."""
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    start = 0
+    while start < len(text):
+        brace = text.find("{", start)
+        bracket = text.find("[", start)
+        indexes = [index for index in (brace, bracket) if index >= 0]
+        if not indexes:
+            break
+        index = min(indexes)
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            start = index + 1
+            continue
+        values.append(value)
+        start = end
+    return values
+
+
+def _json_document(text: str) -> Any | None:
+    """A string that is only one JSON object or array."""
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        value, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if stripped[end:].strip():
+        return None
+    return value
+
+
+def _iter_account_side_fault_texts(value: Any):
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if not current.strip():
+                continue
+            # Stringified HTTP bodies and raw JSON still contain prompt and
+            # other non-text fields. Only message/detail/error/error_description
+            # can match. A truncated dump is ignored instead of scanned raw.
+            document = _json_document(current)
+            if document is not None:
+                pending.append(document)
+                continue
+            if _http_body_dump(current):
+                pending.extend(_embedded_json_values(current))
+                continue
+            yield current
+            continue
+        if not isinstance(current, Mapping):
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        for key in _ACCOUNT_SIDE_FAULT_TEXT_KEYS:
+            if key in current:
+                pending.append(current.get(key))
+
+
+def _account_side_image_fault_source(*values: Any) -> str:
+    for value in values:
+        for text in _iter_account_side_fault_texts(value):
+            if _account_side_image_fault_text_matches(text):
+                return text.strip()
+    return ""
+
+
+def account_side_image_fault_message(failure: ImageFailure) -> str:
+    """The upstream sentence recorded when this account is marked abnormal."""
+    return _account_side_image_fault_source(
+        failure.public_detail,
+        failure.raw_detail,
+    ) or "\u7531\u4e8e\u6211\u8fd9\u8fb9\u53d1\u751f\u4e86\u9519\u8bef\uff0c\u6211\u672a\u80fd\u751f\u6210\u56fe\u7247"
+
+
+def _account_side_image_fault(source: str, raw_detail: Any) -> ImageFailure:
+    return image_failure(
+        "image_account_side_fault",
+        raw_detail=raw_detail if raw_detail not in (None, "") else source,
+    ).with_public_detail(source)
+
+
+def _promote_account_side_image_fault(
+    failure: ImageFailure,
+    *sources: Any,
+) -> ImageFailure:
+    if (
+        failure.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+        or failure.code == "image_account_side_fault"
+        or failure.scope == "delivery"
+    ):
+        return failure
+    source = _account_side_image_fault_source(
+        failure.public_detail,
+        failure.raw_detail,
+        *sources,
+    )
+    if not source:
+        return failure
+    return _account_side_image_fault(source, failure.raw_detail)
+
+
 def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
     codes = _structured_codes(exc.body)
     context = str(exc.context or "").strip().lower()
@@ -549,6 +780,21 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
         retry_after=retry_after,
         raw_detail=exc.body,
     )
+
+    # This exact sentence is an account-side fault in either language.
+    # 400, 401, content review, quota, and signed downloads stay on their own paths.
+    # A real 400 owns the text boundary even when the body repeats the sentence.
+    if (
+        credential_scope == "account"
+        and status_code not in {400, 401}
+        and (
+            structured_failure is None
+            or structured_failure.code not in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+        )
+    ):
+        fault_source = _account_side_image_fault_source(exc.body)
+        if fault_source:
+            return _account_side_image_fault(fault_source, exc.body).with_raw_detail(exc.body)
 
     # The real HTTP status owns the text/failure boundary. Structured fields
     # may refine the reason, but must never turn a non-400 response into text
@@ -631,6 +877,13 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
             return image_failure("file_upload_throttled", retry_after=retry_after, raw_detail=exc.body)
     if structured_failure is not None and structured_failure.status_code == status_code:
         return structured_failure
+    # Quota, review, auth, and download stay ahead of the sentence even when
+    # the HTTP status does not match that code's usual status.
+    if (
+        structured_failure is not None
+        and structured_failure.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+    ):
+        return structured_failure
     if status_code in {403, 423}:
         return replace(
             image_failure("upstream_unavailable", retry_after=retry_after, raw_detail=exc.body),
@@ -652,16 +905,63 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
 
 
 def classify_image_exception(exc: BaseException, *, code: str | None = None) -> ImageFailure:
-    failure = getattr(exc, "failure", None)
-    if isinstance(failure, ImageFailure):
-        return failure
+    fault_sources = tuple(
+        getattr(exc, name, None)
+        for name in (
+            "raw_upstream_message",
+            "upstream_error",
+            "last_assistant_text",
+            "raw_error",
+            "public_error",
+            "last_task_error",
+        )
+    ) + (str(exc),)
 
     def remember(resolved: ImageFailure) -> ImageFailure:
+        # UpstreamHTTPError stringifies the whole body. A prompt echo in that
+        # text must not promote the response into an account fault. 400 never
+        # promotes. Other statuses may promote only from explicit text fields.
+        if isinstance(exc, UpstreamHTTPError):
+            status_code = int(getattr(exc, "status_code", 0) or 0)
+            if status_code != 400:
+                resolved = _promote_account_side_image_fault(
+                    resolved,
+                    *(
+                        getattr(exc, name, None)
+                        for name in (
+                            "raw_upstream_message",
+                            "upstream_error",
+                            "last_assistant_text",
+                            "raw_error",
+                            "public_error",
+                            "last_task_error",
+                        )
+                    ),
+                    exc.body,
+                )
+                keep = _classify_structured_failure_codes(
+                    _structured_codes(exc.body),
+                    retry_after=getattr(exc, "retry_after", None),
+                    raw_detail=exc.body,
+                )
+                if (
+                    str(getattr(exc, "credential_scope", "account") or "account") == "account"
+                    and keep is not None
+                    and keep.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+                    and resolved.code in _ACCOUNT_SIDE_HTTP_FALLBACK_CODES
+                ):
+                    resolved = keep
+        else:
+            resolved = _promote_account_side_image_fault(resolved, *fault_sources)
         try:
             setattr(exc, "failure", resolved)
         except (AttributeError, TypeError):
             pass
         return resolved
+
+    failure = getattr(exc, "failure", None)
+    if isinstance(failure, ImageFailure):
+        return remember(failure)
 
     if isinstance(exc, ImageEgressDeadlineError):
         return remember(image_failure("task_interrupted", raw_detail=str(exc)))
@@ -774,7 +1074,12 @@ def classify_upstream_message(value: Any) -> ImageFailure | None:
             failure = failure.with_public_detail(
                 response.get("error") or outer.get("error")
             )
-        return failure
+        return _promote_account_side_image_fault(
+            failure,
+            response.get("error"),
+            outer.get("error"),
+            outer,
+        )
     moderation = _mapping(outer.get("moderation_response"))
     message = _message(value)
     author = _mapping(message.get("author"))
@@ -818,15 +1123,31 @@ def merge_message_failure(
     if current is None:
         return candidate
 
+    # 审查、额度、鉴权和下载失败不能被这句账号侧原话盖掉，不论谁先出现。
     if candidate.code == current.code:
         winner, other = candidate, current
+    elif (
+        current.code == "image_account_side_fault"
+        and candidate.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+    ):
+        winner, other = candidate, current
+    elif (
+        candidate.code == "image_account_side_fault"
+        and current.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+    ):
+        winner, other = current, candidate
     elif _failure_priority(candidate.code) > _failure_priority(current.code):
         winner, other = candidate, current
     else:
         winner, other = current, candidate
-    if not winner.raw_detail and other.raw_detail:
+    # 保留码已经赢了就不要再把账号侧原句抄进公开文案，否则额度会显示成这句。
+    keep_wins_over_fault = (
+        winner.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+        and other.code == "image_account_side_fault"
+    )
+    if not keep_wins_over_fault and not winner.raw_detail and other.raw_detail:
         winner = winner.with_raw_detail(other.raw_detail)
-    if not winner.public_detail and other.public_detail:
+    if not keep_wins_over_fault and not winner.public_detail and other.public_detail:
         winner = winner.with_public_detail(other.public_detail)
     return winner
 
@@ -1080,6 +1401,14 @@ def classify_message_facts(
         (*structured_codes, normalized_status),
         raw_detail=raw_detail,
     )
+    if (
+        structured_failure is not None
+        and structured_failure.code in _ACCOUNT_SIDE_FAULT_KEEP_CODES
+    ):
+        return structured_failure
+    fault_source = _account_side_image_fault_source(raw_detail)
+    if fault_source:
+        return _account_side_image_fault(fault_source, raw_detail)
     if structured_failure is not None:
         return structured_failure
 

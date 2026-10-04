@@ -80,7 +80,7 @@ def thumbnail_url(base_url: str, relative_path: str) -> str:
 
     rel = normalize_image_relative_path(relative_path)
     return with_media_access(
-        image_media_mount_url(rel, "image-thumbnails", base_url=base_url),
+        image_media_mount_url(rel, "image-thumbnails", panel=True),
         rel,
     )
 

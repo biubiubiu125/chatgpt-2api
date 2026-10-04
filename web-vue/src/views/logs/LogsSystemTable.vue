@@ -50,7 +50,7 @@
       @toggle-selection="handleToggleLogSelection"
       @open-detail="emit('open-detail', $event)"
       @request-delete-log="emit('request-delete-log', $event)"
-      @image-error="emit('image-error', $event)"
+      @image-error="(event, url) => emit('image-error', event, url)"
     />
 
     <template #footer>
@@ -104,7 +104,7 @@ const emit = defineEmits<{
   (e: 'toggle-log-selection', id: string, checked: boolean): void
   (e: 'open-detail', item: SystemLogRow): void
   (e: 'request-delete-log', item: SystemLogRow): void
-  (e: 'image-error', url: string): void
+  (e: 'image-error', event: Event, url: string): void
 }>()
 
 function rowSignature(item: SystemLogRow) {

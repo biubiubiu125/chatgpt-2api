@@ -32,7 +32,12 @@ from services.account_operation_events import (
 from services.browser_fingerprint import CHROME146_IMPERSONATE
 from services.config import config
 from services.image_account_dispatch import AccountDispatchStats, rank_image_account_tokens
-from services.image_failure import ImageFailure, classify_image_exception, image_failure
+from services.image_failure import (
+    ImageFailure,
+    account_side_image_fault_message,
+    classify_image_exception,
+    image_failure,
+)
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -2649,6 +2654,7 @@ class AccountService:
         expected_remote_check_marker: _RemoteCheckMarker | None = None,
         token_refresh_error: str | None = None,
         refresh_token_terminal: bool = False,
+        status_log: str | None = None,
     ) -> bool:
         """统一处理鉴权异常账号。
 
@@ -2666,6 +2672,7 @@ class AccountService:
             token_refresh_error=token_refresh_error,
             refresh_token_terminal=refresh_token_terminal,
             quiet=quiet,
+            status_log=status_log,
         )
 
     def get_account(self, access_token: str) -> dict | None:
@@ -3958,6 +3965,7 @@ class AccountService:
         token_refresh_error: str | None = None,
         refresh_token_terminal: bool = False,
         quiet: bool = False,
+        status_log: str | None = None,
     ) -> bool:
         _ = quiet
         now = datetime.now(timezone.utc)
@@ -4008,20 +4016,22 @@ class AccountService:
             else:
                 next_item = dict(current)
                 next_item["status"] = "禁用" if current.get("status") == "禁用" else "异常"
-                next_item["quota"] = 0
-                next_item["image_quota_unknown"] = True
-                next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
-                next_item["last_invalid_at"] = now.isoformat()
-                next_item["last_refresh_error"] = str(error or "invalid access token")
-                next_item["last_refresh_error_at"] = now.isoformat()
-                next_item["last_remote_checked_at"] = now.isoformat()
-                next_item["last_remote_check_attempt_at"] = now.isoformat()
-                next_item["last_remote_check_error"] = str(error or "invalid access token")
-                next_item["last_remote_check_error_at"] = now.isoformat()
-                next_item["last_remote_check_event"] = event
-                next_item["last_remote_check_result"] = "invalid"
-                next_item["pending_auth_remove_invalid"] = None
-                next_item["pending_auth_scope"] = None
+                # 出图账号侧故障只改状态。不能按鉴权失效把额度清零，或写成远程检查 invalid。
+                if event != "image_account_side_fault":
+                    next_item["quota"] = 0
+                    next_item["image_quota_unknown"] = True
+                    next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+                    next_item["last_invalid_at"] = now.isoformat()
+                    next_item["last_refresh_error"] = str(error or "invalid access token")
+                    next_item["last_refresh_error_at"] = now.isoformat()
+                    next_item["last_remote_checked_at"] = now.isoformat()
+                    next_item["last_remote_check_attempt_at"] = now.isoformat()
+                    next_item["last_remote_check_error"] = str(error or "invalid access token")
+                    next_item["last_remote_check_error_at"] = now.isoformat()
+                    next_item["last_remote_check_event"] = event
+                    next_item["last_remote_check_result"] = "invalid"
+                    next_item["pending_auth_remove_invalid"] = None
+                    next_item["pending_auth_scope"] = None
                 if refresh_token_terminal and token_refresh_error:
                     next_item["last_token_refresh_error"] = str(token_refresh_error)
                     next_item["last_token_refresh_error_at"] = now.isoformat()
@@ -4061,7 +4071,12 @@ class AccountService:
             if not terminal_already_recorded:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
-                    "账号鉴权确认失效" if final_status == "异常" else "已禁用账号鉴权确认失效",
+                    str(status_log or "").strip()
+                    or (
+                        "账号鉴权确认失效"
+                        if final_status == "异常"
+                        else "已禁用账号鉴权确认失效"
+                    ),
                     {
                         "source": event,
                         "token": anonymize_token(access_token),
@@ -4542,6 +4557,7 @@ class AccountService:
         expected_access_token: str | None = None,
         expected_refresh_token: str | None = None,
         expected_last_token_refresh_at: str | None = None,
+        release_image_slot: bool = True,
     ) -> dict | None:
         # Retained as call metadata only; capability-specific account state is gone.
         _ = capabilities
@@ -4549,11 +4565,18 @@ class AccountService:
             return None
         now = datetime.now(timezone.utc)
         should_verify_after_failure = False
+        should_discard_account = False
+        discard_token = ""
+        discard_refresh_token = ""
+        discard_marker: _RemoteCheckMarker | None = None
+        discard_error = ""
         consumed_quota = success if quota_consumed is None else bool(quota_consumed)
         result: dict | None = None
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
-            self._release_image_slot_locked(access_token)
+            # 后台测试没有占图片槽。调用方传 False，避免减掉正在出图的在途数。
+            if release_image_slot:
+                self._release_image_slot_locked(access_token)
             try:
                 current = self._accounts.get(access_token)
                 if current is None:
@@ -4589,7 +4612,21 @@ class AccountService:
                         next_item["status"] = "正常"
                         next_item["image_quota_unknown"] = True
                         next_item["restore_at"] = None
-                if not success and failure is not None and failure.verify_account:
+                account_side_fault = (
+                    not success
+                    and failure is not None
+                    and failure.code == "image_account_side_fault"
+                )
+                discard_account_side_fault = (
+                    account_side_fault
+                    and not failure.suppress_account_removal
+                )
+                if account_side_fault:
+                    next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                    # 先标成异常再出锁。删除发生在锁外，这段时间不能再被选中。
+                    if discard_account_side_fault and next_item.get("status") != "禁用":
+                        next_item["status"] = "异常"
+                elif not success and failure is not None and failure.verify_account:
                     next_item["fail"] = int(next_item.get("fail") or 0) + 1
                     self._mark_remote_check_pending(
                         next_item,
@@ -4613,6 +4650,12 @@ class AccountService:
                 if persisted is None:
                     should_verify_after_failure = False
                     return None
+                if discard_account_side_fault:
+                    should_discard_account = True
+                    discard_token = access_token
+                    discard_refresh_token = str(persisted.get("refresh_token") or "")
+                    discard_marker = self._remote_check_marker(persisted)
+                    discard_error = account_side_image_fault_message(failure)
                 result = dict(persisted)
             except Exception as exc:
                 # The slot was already released above. Raising here makes the
@@ -4633,6 +4676,19 @@ class AccountService:
                         "image_failure",
                         "Account verification could not be scheduled.",
                     )
+            except Exception as exc:
+                self._log_image_result_persist_failure(exc)
+        if should_discard_account and discard_marker is not None:
+            try:
+                self.handle_invalid_token(
+                    discard_token,
+                    "image_account_side_fault",
+                    error=discard_error,
+                    expected_access_token=discard_token,
+                    expected_refresh_token=discard_refresh_token,
+                    expected_remote_check_marker=discard_marker,
+                    status_log="出图账号侧故障",
+                )
             except Exception as exc:
                 self._log_image_result_persist_failure(exc)
         return result

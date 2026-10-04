@@ -70,7 +70,7 @@ def _expiry(item: Mapping[str, object], retention_hours: int) -> tuple[bool, str
 
 def _thumbnail_url(base_url: str, path: str) -> str:
     return with_media_access(
-        image_media_mount_url(path, "image-thumbnails", base_url=base_url),
+        image_media_mount_url(path, "image-thumbnails", panel=True),
         path,
     )
 
@@ -105,7 +105,7 @@ def gallery_row(
         "path": path,
         "filename": filename,
         "url": r2_url or with_media_access(
-            image_media_mount_url(path, "images", base_url=base_url),
+            image_media_mount_url(path, "images", panel=True),
             path,
         ),
         "thumbnail_url": _thumbnail_url(base_url, path) if path else r2_url,

@@ -96,16 +96,22 @@ def image_media_mount_url(
     *,
     base_url: str = "",
     public_base_url: str | None = None,
+    panel: bool = False,
 ) -> str:
-    """Build an app media URL. ``public_base_url`` only changes the public host.
+    """Build an app media URL.
 
-    The path always stays on ``/images/`` or ``/image-thumbnails/`` so the
-    signature check on this service still runs. A prefix that already ends in
-    ``/images`` is not doubled.
+    Panel links are root-relative ``/images/`` or ``/image-thumbnails/`` paths.
+    The browser uses the current site, and a public host configured for
+    external API links cannot redirect those previews. Non-panel links still
+    use ``public_base_url`` for the host only. The path stays on those two
+    prefixes so the signature check on this service still runs.
     """
 
     resource_path = str(resource_path or "").strip().lstrip("/")
     mount_name = str(mount or "").strip().strip("/")
+    if panel:
+        root = f"/{mount_name}"
+        return f"{root}/{resource_path}" if resource_path else root
     if public_base_url is None:
         public_base_url = str(config.get_image_storage_settings().get("public_base_url") or "")
     prefix = str(public_base_url or "").strip().rstrip("/")

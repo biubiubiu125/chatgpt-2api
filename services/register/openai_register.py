@@ -23,6 +23,7 @@ from services.browser_fingerprint import (
     CHROME146_SEC_CH_UA_FULL_VERSION_LIST,
     CHROME146_SEC_CH_UA_PLATFORM,
     CHROME146_SEC_CH_UA_PLATFORM_VERSION,
+    CHROME146_TIMEZONE_OFFSET_MIN,
     CHROME146_USER_AGENT,
     browser_origin,
     chrome146_headers,
@@ -32,6 +33,7 @@ from services.config import DATA_DIR
 from services.proxy_service import ClearanceBundle, normalize_proxy_url, proxy_settings
 from services.image_failure import InvalidAccessTokenError
 from services.register import mail_provider
+from services.register.chatgpt_warmup import warmup_registered_session
 from services.register.errors import (
     REGISTER_CORE_STAGE_LABELS,
     RegisterError,
@@ -146,9 +148,7 @@ common_headers = chrome146_headers({
     "accept-encoding": "gzip, deflate, br",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "dnt": "1",
     "origin": auth_base,
-    "sec-gpc": "1",
     "sec-fetch-site": "same-origin",
 })
 
@@ -157,8 +157,6 @@ navigate_headers = chrome146_headers({
     "accept-encoding": "gzip, deflate, br",
     "cache-control": "max-age=0",
     "connection": "keep-alive",
-    "dnt": "1",
-    "sec-gpc": "1",
     "sec-fetch-dest": "document",
     "sec-fetch-mode": "navigate",
     "sec-fetch-site": "same-origin",
@@ -236,30 +234,35 @@ def _account_fingerprint_payload(
     return payload
 
 
+def _cookie_records(jar: Any) -> list[tuple[str, str]]:
+    inner = getattr(jar, "jar", None)
+    source = inner if inner is not None else jar
+    try:
+        cookies = list(source)
+    except Exception:
+        return []
+    records: list[tuple[str, str]] = []
+    for cookie in cookies:
+        if isinstance(cookie, str):
+            continue
+        name = str(getattr(cookie, "name", "") or "").strip()
+        value = str(getattr(cookie, "value", "") or "").strip()
+        if name and value:
+            records.append((name, value))
+    return records
+
+
 def _session_cookie_payload(session: Any) -> dict[str, str]:
-    cookies: dict[str, str] = {}
     jar = getattr(session, "cookies", None)
     if jar is None:
-        return cookies
-    try:
-        items = jar.items() if hasattr(jar, "items") else []
-        for name, value in items:
-            name_text = str(name or "").strip()
-            value_text = str(value or "").strip()
-            if name_text and value_text:
-                cookies[name_text] = value_text
-        if cookies:
-            return cookies
-    except Exception:
-        cookies = {}
-    try:
-        for cookie in jar:
-            name_text = str(getattr(cookie, "name", "") or "").strip()
-            value_text = str(getattr(cookie, "value", "") or "").strip()
-            if name_text and value_text:
-                cookies[name_text] = value_text
-    except Exception:
-        return cookies
+        return {}
+    grouped: dict[str, set[str]] = {}
+    for name, value in _cookie_records(jar):
+        grouped.setdefault(name, set()).add(value)
+    cookies: dict[str, str] = {}
+    for name, values in grouped.items():
+        if len(values) == 1:
+            cookies[name] = next(iter(values))
     return cookies
 
 
@@ -584,6 +587,7 @@ def build_sentinel_token(
     device_id: str,
     flow: str,
     fingerprint: dict[str, str] | None = None,
+    sid: str = "",
 ) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
     fp = _browser_fingerprint(fingerprint)
@@ -593,8 +597,17 @@ def build_sentinel_token(
         flow,
         user_agent=fp["user_agent"],
         sec_ch_ua=fp["sec_ch_ua"],
+        sid=sid,
     )
     return sentinel_val
+
+
+def _apply_device_headers(headers: dict[str, str], device_id: str, session_id: str = "") -> dict[str, str]:
+    headers["oai-device-id"] = device_id
+    session = str(session_id or "").strip()
+    if session:
+        headers["oai-session-id"] = session
+    return headers
 
 
 def create_session(proxy: str = "", fingerprint: dict[str, str] | None = None) -> Any:
@@ -783,15 +796,16 @@ def validate_otp(
     device_id: str,
     code: str,
     fingerprint: dict[str, str] | None = None,
+    session_id: str = "",
 ):
     headers = _header_fingerprint(common_headers, fingerprint)
     headers["referer"] = f"{auth_base}/email-verification"
-    headers["oai-device-id"] = device_id
+    _apply_device_headers(headers, device_id, session_id)
     headers.update(_make_trace_headers())
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=not proxy_settings.should_skip_ssl_verify())
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue", fingerprint)
+    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue", fingerprint, sid=session_id)
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=not proxy_settings.should_skip_ssl_verify())
     return resp, error
 
@@ -973,6 +987,7 @@ def extract_callback_via_consent(
     user_agent_override: str = "",
     fingerprint: dict[str, str] | None = None,
     referer: str = "",
+    session_id: str = "",
 ) -> dict[str, str] | None:
     current = _absolute_auth_url(consent_url)
     if not current:
@@ -1015,7 +1030,7 @@ def extract_callback_via_consent(
     url = f"{auth_base}/api/accounts/workspace/select"
     headers = _header_fingerprint(common_headers, fp)
     headers["referer"] = current
-    headers["oai-device-id"] = device_id
+    _apply_device_headers(headers, device_id, session_id)
     headers.update(_make_trace_headers())
     headers = _headers_with_clearance(headers, url, proxy, user_agent_override)
     _set_header_value(headers, "sec-fetch-site", navigation_sec_fetch_site(current, url))
@@ -1041,7 +1056,7 @@ def extract_callback_via_consent(
     org_referer = str(ws_data.get("continue_url") or current)
     org_headers = _header_fingerprint(common_headers, fp)
     org_headers["referer"] = org_referer
-    org_headers["oai-device-id"] = device_id
+    _apply_device_headers(org_headers, device_id, session_id)
     org_headers.update(_make_trace_headers())
     org_headers = _headers_with_clearance(org_headers, org_url, proxy, user_agent_override)
     _set_header_value(org_headers, "sec-fetch-site", navigation_sec_fetch_site(org_referer, org_url))
@@ -1067,6 +1082,7 @@ def exchange_tokens_from_continue_url(
     errors: list[str] | None = None,
     fingerprint: dict[str, str] | None = None,
     referer: str = "",
+    session_id: str = "",
 ) -> dict | None:
     start_referer = str(referer or "").strip() or f"{auth_base}/email-verification"
     callback = extract_oauth_callback_params_from_url(continue_url)
@@ -1079,6 +1095,7 @@ def exchange_tokens_from_continue_url(
         user_agent_override,
         fp,
         referer=start_referer,
+        session_id=session_id,
     )
     if not callback:
         url = _absolute_auth_url(continue_url)
@@ -1245,7 +1262,7 @@ class PlatformRegistrar:
     def _json_headers(self, referer: str) -> dict[str, str]:
         headers = _header_fingerprint(common_headers, self.fingerprint)
         headers["referer"] = referer
-        headers["oai-device-id"] = self.device_id
+        _apply_device_headers(headers, self.device_id, self.session_id)
         headers.update(_make_trace_headers())
         return headers
 
@@ -1363,7 +1380,7 @@ class PlatformRegistrar:
 
         def send():
             headers = self._json_headers(f"{auth_base}/log-in?usernameKind=email")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue", self.fingerprint)
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue", self.fingerprint, sid=self.session_id)
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             return request_with_local_retry(
                 self.session,
@@ -1455,7 +1472,7 @@ class PlatformRegistrar:
         self._mailbox_code_received = True
         step(index, f"收到 Microsoft 登录验证码: {code}")
         for attempt in range(2):
-            resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
+            resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint, session_id=self.session_id)
             if resp is not None and resp.status_code == 200:
                 break
             body = _safe_response_body(resp)
@@ -1489,6 +1506,7 @@ class PlatformRegistrar:
             self.clearance_user_agent,
             exchange_errors,
             self.fingerprint,
+            session_id=self.session_id,
         )
         if not tokens:
             detail = "；".join(exchange_errors[-4:]) if exchange_errors else "未返回 token"
@@ -1524,7 +1542,7 @@ class PlatformRegistrar:
         self._stage_step(index, "account_create", "开始提交注册密码")
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fingerprint)
+        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fingerprint, sid=self.session_id)
         headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=not proxy_settings.should_skip_ssl_verify())
         if _is_cloudflare_challenge(resp):
@@ -1532,7 +1550,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise _cloudflare_block_error(resp, reason=self.clearance_failure_reason)
             headers = self._json_headers(f"{auth_base}/create-account/password")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fingerprint)
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fingerprint, sid=self.session_id)
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=not proxy_settings.should_skip_ssl_verify())
             if _is_cloudflare_challenge(resp):
@@ -1582,7 +1600,7 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> None:
         self._stage_step(index, "code_wait", f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
+        resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint, session_id=self.session_id)
         if resp is None or resp.status_code != 200:
             body = ""
             try:
@@ -1653,6 +1671,7 @@ class PlatformRegistrar:
             "oauth_create_account",
             user_agent=fp["user_agent"],
             sec_ch_ua=fp["sec_ch_ua"],
+            sid=self.session_id,
         )
 
         headers["openai-sentinel-token"] = sentinel_token
@@ -1674,6 +1693,7 @@ class PlatformRegistrar:
                 "oauth_create_account",
                 user_agent=fp["user_agent"],
                 sec_ch_ua=fp["sec_ch_ua"],
+                sid=self.session_id,
             )
 
             headers["openai-sentinel-token"] = sentinel_token
@@ -1774,6 +1794,19 @@ class PlatformRegistrar:
             self._fail_stage(error)
             self.mark_mailbox_failure(error)
             raise
+        bootstrap_warnings: list[str] = []
+        try:
+            bootstrap_warnings = warmup_registered_session(
+                self.session,
+                access_token=access_token,
+                device_id=self.device_id,
+                session_id=self.session_id,
+                fingerprint=self.fingerprint,
+            )
+        except Exception as warmup_error:
+            bootstrap_warnings = [f"ChatGPT 首页访问失败: {warmup_error}"]
+        if bootstrap_warnings:
+            step(index, "ChatGPT 首页访问有警告: " + "；".join(bootstrap_warnings), "yellow")
         result = {
             "email": email,
             "password": "",
@@ -1789,6 +1822,8 @@ class PlatformRegistrar:
             session_id=self.session_id,
         )
         result["register_proxy"] = str(self.proxy or "").strip()
+        if bootstrap_warnings:
+            result["bootstrap_warnings"] = bootstrap_warnings
         cookies = _session_cookie_payload(self.session)
         if cookies:
             result["cookies"] = cookies
@@ -1896,6 +1931,10 @@ def worker(index: int) -> dict:
                 core_ok=False,
             )
         postprocess_warnings: list[str] = []
+        for warning in result.get("bootstrap_warnings") or []:
+            text = str(warning or "").strip()
+            if text:
+                postprocess_warnings.append(text)
         pending_core_record_error = record_pending_core_result(
             result,
             reason="注册核心已完成，等待后续验活和入库",
@@ -1950,6 +1989,7 @@ def worker(index: int) -> dict:
                 register_proxy=str(result.get("register_proxy") or registrar.proxy or "").strip(),
                 verify_fn=verify_registered_account,
                 account_service_obj=account_service,
+                session=registrar.session,
             )
             result = dict(handoff.get("result") or result)
             postprocess_warnings.extend(str(item) for item in handoff.get("warnings") or [])
@@ -2014,10 +2054,80 @@ def worker(index: int) -> dict:
         registrar.close()
 
 
+def _registration_profile_headers(access_token: str, account: dict[str, Any]) -> dict[str, object]:
+    fp = account.get("fp") if isinstance(account.get("fp"), dict) else {}
+    device_id = str(fp.get("oai-device-id") or "").strip()
+    session_id = str(fp.get("oai-session-id") or "").strip()
+    headers: dict[str, object] = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    if device_id:
+        headers["oai-device-id"] = device_id
+    if session_id:
+        headers["oai-session-id"] = session_id
+    return chrome146_headers(headers)
+
+
+def _profile_get(session: Any, url: str, headers: dict[str, object]) -> dict[str, Any]:
+    try:
+        response = session.get(
+            url,
+            headers=headers,
+            timeout=20,
+            verify=not proxy_settings.should_skip_ssl_verify(),
+        )
+    except Exception as exc:
+        raise UpstreamHTTPError(url, 0, str(exc)) from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 401:
+        raise InvalidAccessTokenError(f"token invalidated ({url})")
+    if status != 200:
+        raise UpstreamHTTPError(url, status, getattr(response, "text", "") or "")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise UpstreamHTTPError(url, status, "invalid json") from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _profile_from_account(me: dict[str, Any], default_account: dict[str, Any]) -> dict[str, Any]:
+    plan_type = account_service._normalize_account_type(default_account.get("plan_type"))
+    result: dict[str, Any] = {
+        "email": me.get("email"),
+        "user_id": me.get("id"),
+        "image_quota_unknown": True,
+        "status": "正常",
+    }
+    if plan_type:
+        result["type"] = plan_type
+    return result
+
+
+def _read_profile_on_session(session: Any, access_token: str, account: dict[str, Any]) -> dict[str, Any]:
+    headers = _registration_profile_headers(access_token, account)
+    me = _profile_get(session, "https://chatgpt.com/backend-api/me", headers)
+    check_url = (
+        "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+        f"?timezone_offset_min={CHROME146_TIMEZONE_OFFSET_MIN}"
+    )
+    check = _profile_get(session, check_url, headers)
+    default_account = ((check.get("accounts") or {}).get("default") or {}).get("account") or {}
+    if not isinstance(default_account, dict):
+        default_account = {}
+    return _profile_from_account(me, default_account)
+
+
 def verify_registered_account(
     access_token: str,
     register_proxy: str = "",
     account: dict[str, Any] | None = None,
+    session: Any = None,
 ) -> dict[str, Any]:
     token = str(access_token or "").strip()
     if not token:
@@ -2031,8 +2141,11 @@ def verify_registered_account(
     from services.openai_backend_api import OpenAIBackendAPI
 
     try:
-        with OpenAIBackendAPI(token, account=account_payload, proxy=proxy) as backend:
-            remote_info = backend.get_user_info()
+        if session is not None:
+            remote_info = _read_profile_on_session(session, token, account_payload)
+        else:
+            with OpenAIBackendAPI(token, account=account_payload, proxy=proxy) as backend:
+                remote_info = backend.get_registered_profile()
     except InvalidAccessTokenError as exc:
         raise RegisterError(
             "token_invalid",

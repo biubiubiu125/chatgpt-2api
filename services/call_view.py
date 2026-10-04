@@ -461,7 +461,7 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
             or attempt.get("upstream_message_preview")
         ),
         "switched_account": _optional_bool(attempt.get("switched_account")),
-        "switched_node": _optional_bool(attempt.get("switched_node")),
+        "switched_node": _optional_bool(attempt.get("switched_node")) is True,
         "proxy_group_id": _clean(attempt.get("proxy_group_id")),
         "proxy_node_id": _clean(attempt.get("proxy_node_id")),
         "proxy_node_name": _clean(attempt.get("proxy_node_name")),

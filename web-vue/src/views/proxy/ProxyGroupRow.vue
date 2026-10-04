@@ -6,8 +6,7 @@
   >
     <td class="py-3 pr-4 align-top">
       <p class="truncate font-medium">{{ group.name || group.id }}</p>
-      <p class="mt-1 text-xs text-muted-foreground">{{ group.source === 'subscription' ? '订阅' : '手工' }} · {{ group.nodes.length }} 个节点</p>
-      <p v-if="group.subscription_error" class="mt-1 truncate text-xs text-rose-600" :title="group.subscription_error">{{ group.subscription_error }}</p>
+      <p class="mt-1 text-xs text-muted-foreground">{{ group.nodes.length }} 个节点</p>
       <p class="mt-1 truncate font-mono text-[11px] text-muted-foreground" :title="group.id">ID：{{ group.id }}</p>
       <p v-if="group.notes" class="mt-1 truncate text-xs text-muted-foreground" :title="group.notes">{{ group.notes }}</p>
     </td>

@@ -116,6 +116,7 @@ def _reconcile_core_result_unlocked(
     register_proxy: str = "",
     verify_fn: Callable[..., dict[str, Any]] | None = None,
     account_service_obj: Any = default_account_service,
+    session: Any = None,
 ) -> dict[str, Any]:
     access_token = str(result.get("access_token") or "").strip()
     if not access_token:
@@ -133,6 +134,7 @@ def _reconcile_core_result_unlocked(
             access_token,
             register_proxy=proxy,
             account=result,
+            session=session,
         )
         if not isinstance(remote_info, dict):
             raise RegisterError("verify_blocked", "注册账号验活结果格式无效。", stage="收口验活")
@@ -233,6 +235,7 @@ def _invoke_verify_fn(
     *,
     register_proxy: str = "",
     account: dict[str, Any] | None = None,
+    session: Any = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     try:
@@ -246,6 +249,8 @@ def _invoke_verify_fn(
         kwargs["register_proxy"] = register_proxy
     if accepts_keywords or "account" in parameters:
         kwargs["account"] = account
+    if session is not None and (accepts_keywords or "session" in parameters):
+        kwargs["session"] = session
     return verify_fn(access_token, **kwargs)
 
 
@@ -255,6 +260,7 @@ def reconcile_core_result(
     register_proxy: str = "",
     verify_fn: Callable[..., dict[str, Any]] | None = None,
     account_service_obj: Any = default_account_service,
+    session: Any = None,
 ) -> dict[str, Any]:
     """Serialize direct and scheduled handoff of a registration core result."""
     with _reconcile_lock:
@@ -263,6 +269,7 @@ def reconcile_core_result(
             register_proxy=register_proxy,
             verify_fn=verify_fn,
             account_service_obj=account_service_obj,
+            session=session,
         )
 
 

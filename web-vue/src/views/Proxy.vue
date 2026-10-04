@@ -134,7 +134,7 @@
       <PanelHeader title="代理组 / 多出口">
         <template #copy>
           <p class="mt-1 text-xs text-muted-foreground">
-            一个代理组就是一组多出口节点。手动组从未满的节点里随机选择；订阅组只在已测通的节点里按延迟从低到高选择。请求结束前固定该出口，出口满了会等待，不会自动绕到直连。
+            一个代理组就是一组手工填写的出口。从未满的节点里随机选择，全部占满时按负载挑选。请求结束前固定该出口，出口满了会等待，不会自动绕到直连。
           </p>
         </template>
         <template #actions>
@@ -255,41 +255,6 @@
                 <div class="flex items-end">
                   <Checkbox v-model="groupForm.enabled">启用代理组</Checkbox>
                 </div>
-              </div>
-              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <label class="text-xs">
-                  <span class="ui-field-label">节点来源</span>
-                  <GroupedSelectMenu
-                    :model-value="groupForm.source"
-                    :options="proxyGroupSourceOptions"
-                    @update:model-value="setGroupSource"
-                  />
-                </label>
-                <label v-if="groupForm.source === 'subscription'" class="text-xs">
-                  <span class="ui-field-label">刷新间隔（分钟）</span>
-                  <Input
-                    :model-value="String(groupForm.refresh_interval_minutes)"
-                    block
-                    @update:model-value="setGroupRefreshMinutes"
-                  />
-                </label>
-                <label v-if="groupForm.source === 'subscription'" class="text-xs md:col-span-2">
-                  <span class="ui-field-label">订阅地址</span>
-                  <Input
-                    :model-value="groupForm.subscription_url"
-                    block
-                    placeholder="https://"
-                    @update:model-value="groupForm.subscription_url = $event.trim()"
-                  />
-                </label>
-                <label v-if="groupForm.source === 'subscription'" class="text-xs">
-                  <span class="ui-field-label">组并发</span>
-                  <Input
-                    :model-value="String(groupForm.image_concurrency_limit)"
-                    block
-                    @update:model-value="groupForm.image_concurrency_limit = normalizeImageConcurrencyLimit($event)"
-                  />
-                </label>
               </div>
         </FormSection>
 
@@ -435,7 +400,6 @@ import {
   defaultProxyModeOptions,
   fallbackProxyModeOptions,
   proxyDefaultTestMetric,
-  proxyGroupSourceOptions,
 } from '@/views/proxy/proxyView'
 import { DEFAULT_TEST_KEY, useProxyDefaultRuntime } from '@/views/proxy/proxyDefaultRuntime'
 import {
@@ -473,8 +437,6 @@ const closeGroupModal = proxyGroupsRuntime.closeGroupModal
 const openNodeImportModal = proxyGroupsRuntime.openNodeImportModal
 const closeNodeImportModal = proxyGroupsRuntime.closeNodeImportModal
 const addGroupNode = proxyGroupsRuntime.addGroupNode
-const setGroupSource = proxyGroupsRuntime.setGroupSource
-const setGroupRefreshMinutes = proxyGroupsRuntime.setGroupRefreshMinutes
 const removeGroupNode = proxyGroupsRuntime.removeGroupNode
 const applyNodeImport = proxyGroupsRuntime.applyNodeImport
 const saveProxyGroup = proxyGroupsRuntime.saveProxyGroup

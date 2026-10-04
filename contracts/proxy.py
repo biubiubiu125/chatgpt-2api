@@ -97,11 +97,7 @@ class ProxyGroup(BaseModel):
     name: str
     strategy: ProxyGroupStrategy
     rotation_interval_minutes: float = Field(ge=0, le=1440)
-    source: Literal["manual", "subscription"] = "manual"
-    subscription_url: str = ""
-    refresh_interval_minutes: int = Field(default=10, ge=1, le=1440)
-    image_concurrency_limit: int = Field(default=0, ge=0, le=10000)
-    subscription_error: str = ""
+    source: Literal["manual"] = "manual"
     enabled: bool
     notes: str
     nodes: list[ProxyNode]
@@ -121,10 +117,6 @@ class ProxyGroupPatch(BaseModel):
     enabled: bool | None = None
     notes: str | None = None
     nodes: list[ProxyNodeInput] | None = None
-    source: Literal["manual", "subscription"] | None = None
-    subscription_url: str | None = None
-    refresh_interval_minutes: int | None = Field(default=None, ge=1, le=1440)
-    image_concurrency_limit: int | None = Field(default=None, ge=0, le=10000)
     create_only: bool = False
 class ProxyView(BaseModel):
     model_config = ConfigDict(extra="forbid")

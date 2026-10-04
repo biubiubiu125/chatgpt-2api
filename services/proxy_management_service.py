@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import threading
@@ -36,7 +35,6 @@ from services.proxy_service import (
     normalize_proxy_url,
     proxy_node_image_concurrency_limit,
 )
-from services.proxy_subscription import parse_subscription_proxies, redact_subscription_target
 from services.storage.configuration_repository import proxy_configuration_repository
 
 
@@ -44,7 +42,12 @@ PROXY_SCHEMA_VERSION = 1
 _PROXY_GROUP_STRATEGIES = {"request_random", "time_window", "round_robin"}
 _PROXY_URL_SCHEMES = {"http", "https", "socks5", "socks5h"}
 _PROXY_NODE_IMPORT_MAX_LINES = 10_000
-_SUBSCRIPTION_RESPONSE_MAX_BYTES = 2_000_000
+_DROPPED_SUBSCRIPTION_KEYS = (
+    "subscription_url",
+    "subscription_error",
+    "subscription_refreshed_at",
+    "refresh_interval_minutes",
+)
 _MutationResultT = TypeVar("_MutationResultT")
 
 
@@ -191,11 +194,8 @@ def _stored_health(item: Mapping[str, Any]) -> ProxyHealth:
     )
 
 
-def _group_health(item: Mapping[str, Any], nodes: list[ProxyNode]) -> ProxyHealth:
-    error = _clean_text(item.get("subscription_error")) or None
-    checked = _clean_text(item.get("subscription_refreshed_at")) or None
-    if error:
-        return ProxyHealth(state="unhealthy", checked_at=checked, error=error[:240])
+def _group_health(_item: Mapping[str, Any], nodes: list[ProxyNode]) -> ProxyHealth:
+    checked = None
     healthy = [node.health for node in nodes if node.health.state == "healthy"]
     if healthy:
         latencies = [health.latency_ms for health in healthy if health.latency_ms is not None]
@@ -212,56 +212,6 @@ def _group_health(item: Mapping[str, Any], nodes: list[ProxyNode]) -> ProxyHealt
             error=failed.error,
         )
     return _unknown_health()
-
-
-def _coerce_refresh_minutes(value: object) -> int:
-    try:
-        minutes = int(float(value))
-    except (OverflowError, TypeError, ValueError):
-        minutes = 10
-    return max(1, min(minutes, 1440))
-
-
-def _coerce_group_concurrency(value: object) -> int:
-    try:
-        limit = int(float(value))
-    except (OverflowError, TypeError, ValueError):
-        return 0
-    return max(0, min(limit, 10000))
-
-
-def _subscription_url(value: object) -> str:
-    raw = _clean_text(value)
-    if not raw:
-        return ""
-    parsed = urlparse(raw)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("subscription url must be http or https")
-    return raw
-
-
-def _subscription_refresh_due(group: Mapping[str, Any], now: datetime) -> bool:
-    refreshed = _parse_utc(_clean_text(group.get("subscription_refreshed_at")))
-    if refreshed is None:
-        return True
-    interval = _coerce_refresh_minutes(group.get("refresh_interval_minutes"))
-    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-    return current - refreshed >= timedelta(minutes=interval)
-
-
-def _parse_utc(value: str) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _match_proxy_url(value: object) -> str:
@@ -356,6 +306,39 @@ def _proxy_import_error_text(error: str) -> str:
     return translations.get(error, error)
 
 
+def _usable_proxy_nodes(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    nodes = item.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    return [
+        dict(node)
+        for node in nodes
+        if isinstance(node, dict) and _clean_text(node.get("url"))
+    ]
+
+
+def _manual_proxy_group_record(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep stored nodes, but stop treating a group as a subscription."""
+    record = dict(item)
+    source = _clean_text(record.get("source")) or "manual"
+    enabled = record.get("enabled") is not False
+    if source != "manual" and not _usable_proxy_nodes(record):
+        enabled = False
+    changed = source != "manual" or record.get("enabled") is not False and not enabled
+    if source != "manual":
+        record["source"] = "manual"
+    if record.get("enabled") is not False and not enabled:
+        record["enabled"] = False
+    for key in _DROPPED_SUBSCRIPTION_KEYS:
+        if key in record:
+            record.pop(key, None)
+            changed = True
+    if record.get("image_concurrency_limit") not in {None, 0, "0"}:
+        record["image_concurrency_limit"] = 0
+        changed = True
+    return record if changed else dict(item)
+
+
 class ProxyManagementService:
     """Owns the admin proxy configuration contract without changing runtime egress selection."""
 
@@ -372,7 +355,6 @@ class ProxyManagementService:
         if config_store is None and account_group_provider is None:
             self._account_group_provider = self._configured_account_groups
         self._mutation_lock = threading.RLock()
-        self._subscription_refresh_requested = threading.Event()
 
     @staticmethod
     def _configured_account_groups() -> Iterable[dict[str, Any]]:
@@ -392,10 +374,23 @@ class ProxyManagementService:
             self._account_provider = provider
 
     def view(self) -> ProxyView:
-        return self._build_view(self._snapshot())
+        return self._build_view(self._persist_manual_groups(self._snapshot()))
+
+    def _persist_manual_groups(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        raw_groups = self._raw_dict_list(snapshot, "proxy_groups")
+        migrated = [_manual_proxy_group_record(item) for item in raw_groups]
+        if migrated == raw_groups:
+            return snapshot
+        with self._mutation_lock:
+            current = self._snapshot()
+            current_groups = self._raw_dict_list(current, "proxy_groups")
+            next_groups = [_manual_proxy_group_record(item) for item in current_groups]
+            if next_groups == current_groups:
+                return current
+            return self._config.update({"proxy_groups": next_groups})
 
     def list_groups(self) -> ProxyGroupList:
-        snapshot = self._snapshot()
+        snapshot = self._persist_manual_groups(self._snapshot())
         return ProxyGroupList(
             schema_version=PROXY_SCHEMA_VERSION,
             generated_at=_generated_at(),
@@ -543,56 +538,12 @@ class ProxyManagementService:
                     for node in (base.get("nodes") or [])
                     if isinstance(node, dict)
                 ]
-            source = _clean_text(
-                values.get("source") if "source" in values else base.get("source")
-            ) or "manual"
-            if source not in {"manual", "subscription"}:
-                raise ValueError("unsupported proxy group source")
-            subscription_url = _subscription_url(
-                values.get("subscription_url")
-                if "subscription_url" in values
-                else base.get("subscription_url")
-            )
-            if source == "subscription" and "nodes" in values and not nodes:
-                nodes = [
-                    dict(node)
-                    for node in (base.get("nodes") or [])
-                    if isinstance(node, dict)
-                ]
-            if source == "subscription":
-                if not nodes and not subscription_url:
-                    raise ValueError("subscription group requires a subscription url")
-            elif not nodes:
+            if not nodes:
                 raise ValueError("proxy group requires at least one proxy node")
-            refresh_minutes = _coerce_refresh_minutes(
-                values.get("refresh_interval_minutes")
-                if "refresh_interval_minutes" in values
-                else base.get("refresh_interval_minutes")
-            )
-            group_limit = (
-                _coerce_group_concurrency(values.get("image_concurrency_limit"))
-                if source == "subscription" and "image_concurrency_limit" in values
-                else _coerce_group_concurrency(base.get("image_concurrency_limit"))
-                if source == "subscription"
-                else 0
-            )
             enabled = (
                 bool(values.get("enabled"))
                 if "enabled" in values and values.get("enabled") is not None
                 else bool(base.get("enabled", True))
-            )
-            previous_source = _clean_text(base.get("source")) or "manual"
-            previous_url = _clean_text(base.get("subscription_url"))
-            subscription_became_due = (
-                source == "subscription"
-                and enabled
-                and bool(subscription_url)
-                and (
-                    existing is None
-                    or previous_source != "subscription"
-                    or previous_url != subscription_url
-                    or not _clean_text(base.get("subscription_refreshed_at"))
-                )
             )
 
             item = {
@@ -616,31 +567,17 @@ class ProxyManagementService:
                     else _clean_text(base.get("notes"))
                 ),
                 "nodes": nodes,
-                "source": source,
-                "subscription_url": subscription_url,
-                "refresh_interval_minutes": refresh_minutes,
-                "image_concurrency_limit": group_limit,
-                "subscription_error": (
-                    ""
-                    if source != "subscription"
-                    else _clean_text(base.get("subscription_error"))[:240]
-                ),
-                "subscription_refreshed_at": (
-                    ""
-                    if source != "subscription"
-                    else _clean_text(base.get("subscription_refreshed_at"))
-                ),
+                "source": "manual",
+                "image_concurrency_limit": 0,
             }
+            for key in _DROPPED_SUBSCRIPTION_KEYS:
+                item.pop(key, None)
             next_groups = [
                 group for group in raw_groups
                 if _clean_text(group.get("id")) != group_id
             ]
-            if subscription_became_due:
-                item["subscription_refreshed_at"] = ""
             next_groups.append(item)
             updated = self._config.update({"proxy_groups": next_groups})
-            if source == "subscription" and enabled and subscription_url:
-                self._subscription_refresh_requested.set()
             group = next(
                 group for group in self._groups(updated)
                 if group.id == group_id
@@ -649,137 +586,6 @@ class ProxyManagementService:
                 group=group,
                 revision=self._revision(updated),
             )
-
-    def refresh_due_subscriptions(
-        self,
-        *,
-        fetcher: Callable[[str], str] | None = None,
-        prober: Callable[[str], Mapping[str, Any]] | None = None,
-        now: datetime | None = None,
-    ) -> int:
-        current = now or datetime.now(timezone.utc)
-        due_ids: list[str] = []
-        with self._mutation_lock:
-            for group in self._raw_dict_list(self._snapshot(), "proxy_groups"):
-                if _clean_text(group.get("source")) != "subscription":
-                    continue
-                if group.get("enabled") is False:
-                    continue
-                if not _clean_text(group.get("subscription_url")):
-                    continue
-                if _subscription_refresh_due(group, current):
-                    due_ids.append(_clean_text(group.get("id")))
-        refreshed = 0
-        for group_id in due_ids:
-            if self.refresh_subscription_group(group_id, fetcher=fetcher, prober=prober):
-                refreshed += 1
-        return refreshed
-
-    def wait_for_subscription_refresh(self, stop_event: threading.Event, timeout: float) -> None:
-        """等下一次订阅刷新，保存新订阅时提前醒来。"""
-        remaining = max(0.0, float(timeout))
-        while remaining > 0 and not stop_event.is_set():
-            step = min(0.25, remaining)
-            if self._subscription_refresh_requested.wait(step):
-                self._subscription_refresh_requested.clear()
-                return
-            remaining -= step
-
-    def refresh_subscription_group(
-        self,
-        group_id: object,
-        *,
-        fetcher: Callable[[str], str] | None = None,
-        prober: Callable[[str], Mapping[str, Any]] | None = None,
-    ) -> bool:
-        stored_id = _clean_text(group_id)
-        with self._mutation_lock:
-            group = self._raw_group_locked(stored_id)
-            if group is None or _clean_text(group.get("source")) != "subscription":
-                return False
-            url = _clean_text(group.get("subscription_url"))
-            if not url:
-                return False
-            existing_nodes = [
-                dict(node)
-                for node in (group.get("nodes") or [])
-                if isinstance(node, dict)
-            ]
-        fetch = fetcher or self.fetch_subscription_text
-        try:
-            parsed = parse_subscription_proxies(fetch(url))
-        except Exception as exc:
-            self._record_subscription_failure(stored_id, url, exc)
-            return False
-        if not parsed:
-            self._record_subscription_failure(
-                stored_id,
-                url,
-                RuntimeError("subscription returned no usable proxies"),
-            )
-            return False
-        probes = self._probe_subscription_urls(parsed, prober)
-        merged = self._merge_subscription_nodes(existing_nodes, parsed, probes)
-        with self._mutation_lock:
-            current = self._raw_group_locked(stored_id)
-            if (
-                current is None
-                or _clean_text(current.get("source")) != "subscription"
-                or _clean_text(current.get("subscription_url")) != url
-            ):
-                return False
-            current["nodes"] = merged
-            current["subscription_error"] = ""
-            current["subscription_refreshed_at"] = _generated_at()
-            self._write_group_locked(stored_id, current)
-        return True
-
-    def fetch_subscription_text(self, url: str) -> str:
-        from curl_cffi.requests import Session
-
-        from services.browser_fingerprint import CHROME146_IMPERSONATE
-
-        session = Session(impersonate=CHROME146_IMPERSONATE, timeout=20)
-        response = None
-        try:
-            try:
-                response = session.get(
-                    url,
-                    timeout=20,
-                    allow_redirects=False,
-                    stream=True,
-                )
-            except Exception:
-                raise RuntimeError("subscription fetch failed") from None
-            status = int(getattr(response, "status_code", 0) or 0)
-            if status in {301, 302, 303, 307, 308}:
-                raise RuntimeError("subscription redirect is not allowed")
-            if status >= 400:
-                raise RuntimeError(f"subscription http {status}")
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content():
-                if isinstance(chunk, str):
-                    chunk = chunk.encode("utf-8")
-                elif not isinstance(chunk, (bytes, bytearray)):
-                    chunk = b""
-                total += len(chunk)
-                if total > _SUBSCRIPTION_RESPONSE_MAX_BYTES:
-                    raise RuntimeError("subscription response is too large")
-                if chunk:
-                    chunks.append(bytes(chunk))
-            return b"".join(chunks).decode("utf-8", errors="replace")
-        finally:
-            if response is not None:
-                close_response = getattr(response, "close", None)
-                if callable(close_response):
-                    close_response()
-            session.close()
-
-    def probe_subscription_node(self, url: str) -> dict[str, Any]:
-        from services.proxy_service import test_proxy
-
-        return test_proxy(url, timeout=12)
 
     def record_group_probe_results(self, group_id: object, results: object) -> None:
         stored_id = _group_reference_id(group_id) or _clean_text(group_id)
@@ -815,95 +621,6 @@ class ProxyManagementService:
                 next_groups.append(updated)
             if changed:
                 self._config.update({"proxy_groups": next_groups})
-
-    def _record_subscription_failure(self, group_id: str, url: str, exc: BaseException) -> None:
-        message = str(exc or "").strip() or exc.__class__.__name__
-        if url and url in message:
-            message = message.replace(url, redact_subscription_target(url))
-        message = message[:240] or "subscription refresh failed"
-        with self._mutation_lock:
-            current = self._raw_group_locked(group_id)
-            if (
-                current is None
-                or _clean_text(current.get("source")) != "subscription"
-                or _clean_text(current.get("subscription_url")) != url
-            ):
-                return
-            current["subscription_error"] = message
-            current["subscription_refreshed_at"] = _generated_at()
-            self._write_group_locked(group_id, current)
-
-    def _probe_subscription_urls(
-        self,
-        urls: list[str],
-        prober: Callable[[str], Mapping[str, Any]] | None,
-    ) -> dict[str, dict[str, Any]]:
-        probe = prober or self.probe_subscription_node
-        if not urls:
-            return {}
-        results: dict[str, dict[str, Any]] = {}
-        workers = min(4, len(urls))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(probe, url): url for url in urls}
-            for future in as_completed(futures):
-                url = futures[future]
-                try:
-                    value = future.result()
-                except Exception as exc:
-                    message = str(exc or "").strip()
-                    lowered = message.lower()
-                    timed_out = "timeout" in lowered or "timed out" in lowered
-                    value = {
-                        "state": "unhealthy",
-                        "error": "超时" if timed_out else (message[:240] or "连接失败"),
-                        "latency_ms": None,
-                    }
-                results[url] = self._health_record(value if isinstance(value, Mapping) else {})
-        return results
-
-    def _merge_subscription_nodes(
-        self,
-        existing_nodes: list[dict[str, Any]],
-        urls: list[str],
-        probes: Mapping[str, Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
-        by_url: dict[str, dict[str, Any]] = {}
-        used_ids: set[str] = set()
-        for node in existing_nodes:
-            node_id = _clean_text(node.get("id"))
-            if node_id:
-                used_ids.add(node_id)
-            key = _match_proxy_url(node.get("url"))
-            if key and key not in by_url:
-                by_url[key] = node
-        merged: list[dict[str, Any]] = []
-        for index, url in enumerate(urls):
-            key = _match_proxy_url(url) or url
-            health = dict(probes.get(url) or probes.get(key) or {})
-            old = by_url.get(key)
-            if old is not None:
-                node = dict(old)
-                node["url"] = key
-                node["health"] = health or dict(node.get("health") or {})
-                merged.append(node)
-                continue
-            node_id = f"node-{index + 1}"
-            if node_id in used_ids:
-                suffix = 2
-                while f"{node_id}-{suffix}" in used_ids:
-                    suffix += 1
-                node_id = f"{node_id}-{suffix}"
-            used_ids.add(node_id)
-            merged.append({
-                "id": node_id,
-                "name": node_id,
-                "url": key,
-                "enabled": True,
-                "image_concurrency_limit": DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT,
-                "notes": "",
-                "health": health,
-            })
-        return merged
 
     def _raw_group_locked(self, group_id: str) -> dict[str, Any] | None:
         for group in self._raw_dict_list(self._snapshot(), "proxy_groups"):
@@ -1251,24 +968,16 @@ class ProxyManagementService:
             if isinstance(node, dict)
         ]
         reference_labels = list(references)
-        source = _clean_text(item.get("source")) or "manual"
-        if source not in {"manual", "subscription"}:
-            source = "manual"
+        enabled = item.get("enabled") is not False
+        if (_clean_text(item.get("source")) or "manual") != "manual" and not _usable_proxy_nodes(item):
+            enabled = False
         return ProxyGroup(
             id=group_id,
             name=_clean_text(item.get("name")) or group_id,
             strategy=strategy,
             rotation_interval_minutes=_coerce_rotation_minutes(item.get("rotation_interval_minutes")),
-            source=source,
-            subscription_url=_clean_text(item.get("subscription_url")),
-            refresh_interval_minutes=_coerce_refresh_minutes(item.get("refresh_interval_minutes")),
-            image_concurrency_limit=(
-                _coerce_group_concurrency(item.get("image_concurrency_limit"))
-                if source == "subscription"
-                else 0
-            ),
-            subscription_error=_clean_text(item.get("subscription_error"))[:240],
-            enabled=item.get("enabled") is not False,
+            source="manual",
+            enabled=enabled,
             notes=_clean_text(item.get("notes")),
             nodes=nodes,
             reference_text=f"group:{group_id}",

@@ -1,4 +1,5 @@
 import apiClient from './client'
+import { panelMediaRelativeUrl } from '@/lib/panelMediaUrl'
 import { formatRequestDuration } from '@/lib/requestDuration'
 import type {
   CallPresentationStatus,
@@ -110,6 +111,10 @@ export type AttemptSummary = {
   upstream_error: string
   upstream_text: string
   switched_account: boolean | null
+  switched_node?: boolean
+  proxy_group_id?: string
+  proxy_node_id?: string
+  proxy_node_name?: string
   presentation: AttemptPresentation
   timings_ms: Record<string, number>
   monitor: Record<string, unknown>
@@ -270,19 +275,9 @@ function cleanString(value: unknown): string {
 function normalizePreviewUrl(url: string, apiBaseUrl = ''): string {
   const value = cleanString(url)
   if (!value || value.startsWith('file-service://')) return ''
-  if (value.startsWith('/images/') || value.startsWith('/image-thumbnails/')) return value
-  if (value.startsWith('images/') || value.startsWith('image-thumbnails/')) return `/${value}`
-  if (/^https?:\/\//i.test(value)) {
-    try {
-      const parsed = new URL(value)
-      if (parsed.pathname.startsWith('/images/') || parsed.pathname.startsWith('/image-thumbnails/')) {
-        return `${parsed.pathname}${parsed.search}${parsed.hash}`
-      }
-    } catch {
-      return value
-    }
-    return value
-  }
+  const relative = panelMediaRelativeUrl(value, true)
+  if (relative) return relative
+  if (/^https?:\/\//i.test(value)) return value
   if (value.startsWith('/') && apiBaseUrl) return `${apiBaseUrl}${value}`
   return ''
 }

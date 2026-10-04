@@ -25,11 +25,6 @@ export const fallbackProxyModeOptions = [
   { label: '自定义代理', value: 'custom' },
 ] as const
 
-export const proxyGroupSourceOptions = [
-  { label: '手工填写', value: 'manual' },
-  { label: '订阅', value: 'subscription' },
-] as const
-
 const defaultProxyModes = new Set<string>(defaultProxyModeOptions.map((item) => item.value))
 const fallbackProxyModes = new Set<string>(fallbackProxyModeOptions.map((item) => item.value))
 
@@ -83,9 +78,6 @@ export function proxyGroupRowSignature(group: ProxyGroup, testingKey: string, sa
     group.id,
     group.name,
     group.enabled !== false ? 1 : 0,
-    group.source,
-    group.subscription_error,
-    group.image_concurrency_limit,
     group.health?.latency_ms,
     group.strategy,
     group.rotation_interval_minutes,

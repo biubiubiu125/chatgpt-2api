@@ -208,8 +208,6 @@ class ResolvedProxyReference:
 
 
 class ProxySettingsStore:
-    _IMAGE_NODE_FAILURE_COOLDOWN_SECONDS = 600
-
     def __init__(
         self,
         config_store=None,
@@ -223,7 +221,6 @@ class ProxySettingsStore:
         self._clearance_cache: dict[tuple[str, str], ClearanceBundle] = {}
         self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
         self._egress_inflight: dict[str, int] = {}
-        self._image_node_failures: dict[tuple[str, str], float] = {}
         self._lock = threading.RLock()
         self._egress_condition = threading.Condition(self._lock)
 
@@ -400,49 +397,6 @@ class ProxySettingsStore:
         if not label or label.startswith("explicit"):
             label = "fallback" if profile.proxy_url else source
         return replace(profile, proxy_source=source, egress_label=label)
-
-    def reserve_subscription_sibling(
-        self,
-        group_id: object,
-        *,
-        exclude_node_id: str,
-        deadline_monotonic: float | None = None,
-        stop_event: threading.Event | None = None,
-    ) -> ProxyRuntimeProfile | None:
-        """同一订阅组内再拿一个健康节点。不等待，也不把手工组当成可轮换的订阅。"""
-        selection = self._resolve_proxy_group(
-            group_id,
-            reserve_image_egress=True,
-            deadline_monotonic=deadline_monotonic,
-            stop_event=stop_event,
-            exclude_node_id=exclude_node_id,
-            subscription_siblings_only=True,
-            wait_for_capacity=False,
-            discount_current_group_hold=True,
-        )
-        if not selection.proxy_url:
-            return None
-        runtime = self._get_runtime_settings()
-        clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
-        return ProxyRuntimeProfile(
-            proxy_url=normalize_proxy_url(selection.proxy_url),
-            proxy_source="sibling_group",
-            egress_key=selection.egress_key,
-            egress_label=selection.egress_label,
-            proxy_group_id=selection.group_id,
-            proxy_node_id=selection.node_id,
-            proxy_node_name=selection.node_name,
-            image_concurrency_limit=max(0, int(selection.image_concurrency_limit or 0)),
-            image_egress_reserved=bool(selection.image_egress_reserved),
-            image_egress_wait_ms=max(0, int(selection.image_egress_wait_ms or 0)),
-            group_egress_key=selection.group_egress_key,
-            group_image_concurrency_limit=max(0, int(selection.group_image_concurrency_limit or 0)),
-            runtime_enabled=bool(runtime.get("enabled")),
-            egress_mode="proxy",
-            skip_ssl_verify=bool(runtime.get("skip_ssl_verify")),
-            reset_session_status_codes=_status_codes_tuple(runtime.get("reset_session_status_codes")),
-            clearance=clearance,
-        )
 
     def build_session_kwargs(
         self,
@@ -741,61 +695,6 @@ class ProxySettingsStore:
                 return _clean(profile.get("proxy"))
         return ""
 
-    def note_image_subscription_node_failure(self, profile: object) -> None:
-        """出图还没开始就失败时，短时间把这个订阅节点排到同组健康节点后面。
-
-        只记进程内的单调时钟，不改探活健康状态，订阅刷新也不能把它清掉。
-        手工组和直连不记。同组都受罚时仍然会选延迟最低的节点。
-        """
-        group_id = _clean(getattr(profile, "proxy_group_id", ""))
-        node_id = _clean(getattr(profile, "proxy_node_id", ""))
-        if not group_id or not node_id or not self._is_subscription_proxy_group(group_id):
-            return
-        expires = time.monotonic() + self._IMAGE_NODE_FAILURE_COOLDOWN_SECONDS
-        with self._lock:
-            self._image_node_failures[(group_id, node_id)] = expires
-
-    def note_image_subscription_node_success(self, profile: object) -> None:
-        """这次出图真正走通之后，只清掉当前节点的失败降权。"""
-        group_id = _clean(getattr(profile, "proxy_group_id", ""))
-        node_id = _clean(getattr(profile, "proxy_node_id", ""))
-        if not group_id or not node_id:
-            return
-        with self._lock:
-            self._image_node_failures.pop((group_id, node_id), None)
-
-    def _is_subscription_proxy_group(self, group_id: str) -> bool:
-        for group in self._proxy_dict_list("proxy_groups"):
-            if _clean(group.get("id")) != group_id:
-                continue
-            return (_clean(group.get("source")) or "manual") == "subscription"
-        return False
-
-    def _image_node_failure_active_locked(self, group_id: str, node_id: str) -> bool:
-        expires = self._image_node_failures.get((group_id, node_id))
-        if expires is None:
-            return False
-        if expires <= time.monotonic():
-            self._image_node_failures.pop((group_id, node_id), None)
-            return False
-        return True
-
-    def _preferred_subscription_node(
-        self,
-        group_id: str,
-        nodes: list[tuple[int, Mapping[str, object]]],
-    ) -> tuple[int, Mapping[str, object]]:
-        fresh: list[tuple[int, Mapping[str, object]]] = []
-        penalized: list[tuple[int, Mapping[str, object]]] = []
-        for node_index, node in nodes:
-            node_id = _proxy_node_id(node, node_index)
-            if self._image_node_failure_active_locked(group_id, node_id):
-                penalized.append((node_index, node))
-            else:
-                fresh.append((node_index, node))
-        pool = fresh or penalized or list(nodes)
-        return pool[0]
-
     def _resolve_proxy_group(
         self,
         group_id: object,
@@ -803,10 +702,7 @@ class ProxySettingsStore:
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
         stop_event: threading.Event | None = None,
-        exclude_node_id: str = "",
-        subscription_siblings_only: bool = False,
         wait_for_capacity: bool = True,
-        discount_current_group_hold: bool = False,
     ) -> ProxyGroupSelection:
         normalized = _clean(group_id)
         if not normalized:
@@ -814,34 +710,26 @@ class ProxySettingsStore:
         for group in self._proxy_dict_list("proxy_groups"):
             if _clean(group.get("id")) != normalized or group.get("enabled") is False:
                 continue
-            subscription = (_clean(group.get("source")) or "manual") == "subscription"
-            if subscription_siblings_only and not subscription:
-                return ProxyGroupSelection()
             _raise_if_image_egress_stopped(
                 stop_event,
                 deadline_monotonic,
                 waiting="while selecting proxy group capacity",
             )
-            group_limit = _group_image_concurrency_limit(group)
-            group_key = f"group-cap:{normalized}" if group_limit > 0 else ""
-            exclude = _clean(exclude_node_id)
+            # Group-level image concurrency is retired. Node limits still apply,
+            # including groups that have not been opened in the admin UI yet.
+            group_limit = 0
+            group_key = ""
             nodes = [
                 node for node in group.get("nodes", [])
                 if isinstance(node, dict)
                 and node.get("enabled", True)
                 and _clean(node.get("url"))
             ]
-            indexed_nodes: list[tuple[int, Mapping[str, object]]] = []
-            for index, node in enumerate(nodes):
-                if subscription and not _node_probe_healthy(node):
-                    continue
-                if exclude and _proxy_node_id(node, index) == exclude:
-                    continue
-                indexed_nodes.append((index, node))
+            indexed_nodes: list[tuple[int, Mapping[str, object]]] = [
+                (index, node) for index, node in enumerate(nodes)
+            ]
             if not indexed_nodes:
                 return ProxyGroupSelection()
-            if subscription:
-                indexed_nodes.sort(key=lambda item: (_node_probe_latency(item[1]), item[0]))
             started = time.perf_counter()
 
             def decorate(selection: ProxyGroupSelection) -> ProxyGroupSelection:
@@ -859,8 +747,6 @@ class ProxySettingsStore:
                         waiting="while selecting proxy group capacity",
                     )
                     group_inflight = int(self._egress_inflight.get(group_key, 0)) if group_key else 0
-                    if discount_current_group_hold and group_inflight > 0:
-                        group_inflight -= 1
                     group_open = group_limit <= 0 or group_inflight < group_limit
                     available_nodes = [
                         (node_index, node)
@@ -872,50 +758,29 @@ class ProxySettingsStore:
                         )
                     ]
                     if available_nodes:
-                        if subscription:
-                            selected_index, selected = self._preferred_subscription_node(
-                                normalized,
-                                available_nodes,
-                            )
-                        else:
-                            selected_index, selected = random.choice(available_nodes)
+                        selected_index, selected = random.choice(available_nodes)
                         selection = decorate(
                             _proxy_group_selection(normalized, selected, selected_index)
                         )
-                        if reserve_image_egress:
-                            reserved = False
-                            if selection.image_concurrency_limit > 0:
-                                self._egress_inflight[selection.egress_key] = int(
-                                    self._egress_inflight.get(selection.egress_key, 0)
-                                ) + 1
-                                reserved = True
-                            if group_limit > 0 and group_key:
-                                self._egress_inflight[group_key] = int(
-                                    self._egress_inflight.get(group_key, 0)
-                                ) + 1
-                                reserved = True
-                            if reserved:
-                                selection = replace(
-                                    selection,
-                                    image_egress_reserved=True,
-                                    image_egress_wait_ms=int((time.perf_counter() - started) * 1000),
-                                )
+                        if reserve_image_egress and selection.image_concurrency_limit > 0:
+                            self._egress_inflight[selection.egress_key] = int(
+                                self._egress_inflight.get(selection.egress_key, 0)
+                            ) + 1
+                            selection = replace(
+                                selection,
+                                image_egress_reserved=True,
+                                image_egress_wait_ms=int((time.perf_counter() - started) * 1000),
+                            )
                         return selection
                     if not reserve_image_egress:
-                        if subscription:
-                            selected_index, selected = self._preferred_subscription_node(
+                        selected_index, selected = min(
+                            indexed_nodes,
+                            key=lambda item: self._proxy_node_load_score(
                                 normalized,
-                                indexed_nodes,
-                            )
-                        else:
-                            selected_index, selected = min(
-                                indexed_nodes,
-                                key=lambda item: self._proxy_node_load_score(
-                                    normalized,
-                                    item[1],
-                                    item[0],
-                                ),
-                            )
+                                item[1],
+                                item[0],
+                            ),
+                        )
                         return decorate(
                             _proxy_group_selection(normalized, selected, selected_index)
                         )
@@ -1051,31 +916,6 @@ def _egress_key_for_proxy(proxy_url: object) -> str:
     normalized = normalize_proxy_url(_clean(proxy_url))
     return f"proxy:{normalized}" if normalized else "direct"
 
-
-def _group_image_concurrency_limit(group: Mapping[str, object]) -> int:
-    try:
-        value = int(float(group.get("image_concurrency_limit") or 0))
-    except (OverflowError, TypeError, ValueError):
-        return 0
-    return max(0, min(value, 10000))
-
-
-def _node_probe_healthy(node: Mapping[str, object]) -> bool:
-    health = node.get("health")
-    return isinstance(health, Mapping) and _clean(health.get("state")) == "healthy"
-
-
-def _node_probe_latency(node: Mapping[str, object]) -> int:
-    health = node.get("health")
-    if not isinstance(health, Mapping):
-        return 10**9
-    try:
-        value = health.get("latency_ms")
-        if value is None or value == "":
-            return 10**9
-        return int(value)
-    except (OverflowError, TypeError, ValueError):
-        return 10**9
 
 
 def _profile_egress_limits(profile: ProxyRuntimeProfile) -> list[tuple[str, int]]:

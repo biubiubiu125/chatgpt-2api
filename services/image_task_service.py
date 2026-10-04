@@ -1791,6 +1791,9 @@ class ImageTaskService:
         backend = None
         egress_reserved = False
         held_token = ""
+        expected_access_token = None
+        expected_refresh_token = None
+        expected_last_token_refresh_at = None
         resume_admission = None
         outcome: bool | None = None
         failure = None
@@ -1879,6 +1882,14 @@ class ImageTaskService:
                 follow_up = self._resume_follow_up(key, conversation_id, seen)
                 raise _ResumeAttemptDone
             held_token = access_token
+            credential_snapshot = account_service.get_account(held_token) or {}
+            expected_access_token = str(
+                credential_snapshot.get("access_token") or held_token
+            ).strip()
+            expected_refresh_token = str(
+                credential_snapshot.get("refresh_token") or ""
+            ).strip()
+            expected_last_token_refresh_at = credential_snapshot.get("last_token_refresh_at")
             resume_admission = image_gate.image_generation_gate.current()
             if resume_admission is not None:
                 image_gate.image_generation_gate.acquire_running(resume_admission)
@@ -2078,6 +2089,9 @@ class ImageTaskService:
                             held_token,
                             True,
                             quota_consumed=not quota_already_consumed,
+                            expected_access_token=expected_access_token,
+                            expected_refresh_token=expected_refresh_token,
+                            expected_last_token_refresh_at=expected_last_token_refresh_at,
                         )
                     elif outcome is False:
                         account_service.mark_image_result(
@@ -2089,6 +2103,9 @@ class ImageTaskService:
                                 and failure is not None
                                 and failure.code == "image_download_failed"
                             ),
+                            expected_access_token=expected_access_token,
+                            expected_refresh_token=expected_refresh_token,
+                            expected_last_token_refresh_at=expected_last_token_refresh_at,
                         )
                     else:
                         account_service.release_image_slot(held_token)

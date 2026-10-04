@@ -201,11 +201,11 @@
                       type="button"
                       class="studio-result-media"
                       :class="{ 'has-image': Boolean(slot.asset.url) }"
-                      @click="$emit('preview', slot.asset.url, `图片 ${slot.index}`, slot.asset.path)"
+                      @click="$emit('preview', panelMediaUrl(slot.asset.url), `图片 ${slot.index}`, slot.asset.path)"
                     >
                       <img
                         v-if="slot.asset.url"
-                        :src="slot.asset.url"
+                        :src="panelMediaUrl(slot.asset.url)"
                         :alt="`图片 ${slot.index}`"
                         :width="slot.asset.width || undefined"
                         :height="slot.asset.height || undefined"
@@ -309,6 +309,7 @@ import type { CSSProperties } from 'vue'
 import type { EditableFileTask } from '@/api/editableFileTasks'
 import type { ImageTask } from '@/api/imageTasks'
 import { useToast } from '@/composables/useToast'
+import { panelMediaUrl } from '@/lib/panelMediaUrl'
 import { hasStudioCodeContent } from '@/lib/studioMarkdownRenderer'
 import {
   useEditableFileTaskDownload,

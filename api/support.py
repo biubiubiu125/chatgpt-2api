@@ -126,22 +126,6 @@ def start_image_selection_warmer(stop_event: Event) -> Thread:
     return thread
 
 
-def start_proxy_subscription_refresher(stop_event: Event) -> Thread:
-    def worker() -> None:
-        from services.proxy_management_service import proxy_management_service
-
-        while not stop_event.is_set():
-            try:
-                proxy_management_service.refresh_due_subscriptions()
-            except Exception as exc:
-                print(f"[proxy-subscription] fail {exc}")
-            proxy_management_service.wait_for_subscription_refresh(stop_event, 30)
-
-    thread = Thread(target=worker, name="proxy-subscription-refresher", daemon=True)
-    thread.start()
-    return thread
-
-
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     """Compatibility alias for integrations importing the old watcher name."""
     return start_account_lifecycle_watcher(stop_event)

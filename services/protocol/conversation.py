@@ -33,6 +33,7 @@ from services.image_failure import (
     classify_message_facts,
     classify_task_failure,
     classify_upstream_message,
+    client_text_for_failure,
     extract_message_facts,
     image_failure,
     is_terminal_message_status,
@@ -40,6 +41,7 @@ from services.image_failure import (
     merge_message_failure,
     public_image_error_message,
     terminal_assistant_text,
+    upstream_text_for_failure,
 )
 from services.image_storage_service import image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
@@ -1040,9 +1042,10 @@ def update_conversation_state(
     )
     if (
         candidate_failure is not None
-        and candidate_failure.code == "upstream_text_reply"
+        and candidate_failure.code in {"upstream_text_reply", "image_account_side_fault"}
         and not classify_terminal_text_as_image_failure
     ):
+        # 文本对话里的这句原话按普通正文返回，不算出图失败，也不删号。
         candidate_failure = None
     if candidate_failure is not None:
         # Explicit codes outrank terminal text; terminal text only replaces a
@@ -1273,15 +1276,15 @@ def _get_detailed_failure_from_tasks(
     conversation_id: str,
     timeout_secs: float = 10.0,
     wait_secs: float = 2.0,
-) -> tuple[ImageFailure | None, str]:
-    """Return the most specific structured task failure and its diagnostic text."""
+) -> tuple[ImageFailure | None, str, bool]:
+    """Return the task failure, its text, and whether the query itself failed."""
     import time as _time
     try:
         if wait_secs > 0:
             _time.sleep(wait_secs)
         tasks = backend._query_backend_tasks(conversation_id=conversation_id, timeout_secs=timeout_secs)
         if not tasks:
-            return None, ""
+            return None, "", False
 
         selected_failure: ImageFailure | None = None
         for task in tasks:
@@ -1301,11 +1304,12 @@ def _get_detailed_failure_from_tasks(
             })
             selected_failure = merge_message_failure(selected_failure, candidate)
         if selected_failure is None:
-            return None, ""
+            return None, "", False
         selected_error = _failure_raw_text(selected_failure)
         return (
             selected_failure.with_raw_detail(selected_error or selected_failure.raw_detail),
             selected_error,
+            False,
         )
     except Exception as exc:
         if _is_account_auth_failure(exc):
@@ -1315,7 +1319,16 @@ def _get_detailed_failure_from_tasks(
             "conversation_id": conversation_id,
             "error": diagnostic_excerpt(exc, 300),
         })
-        return None, ""
+        # 查询失败只说明这次没读到任务。调用方仍按已经确认的失败结算。
+        return None, "", True
+
+
+def _unpack_task_probe(result: tuple) -> tuple[ImageFailure | None, str, bool]:
+    """Accept the current 3-tuple and older 2-tuple test doubles."""
+    failure = result[0] if result else None
+    error = str(result[1] or "") if len(result) > 1 else ""
+    failed = bool(result[2]) if len(result) > 2 else False
+    return failure, error, failed
 
 
 def _image_stream_timeout_task_diagnostics(
@@ -1515,7 +1528,7 @@ def _recover_after_image_stream_timeout(
     terminal_failure: ImageFailure | None = None
     for failure in (stream_failure, task_failure, conversation_failure):
         terminal_failure = merge_message_failure(terminal_failure, failure)
-    failure_detail = _failure_raw_text(terminal_failure, message)
+    failure_detail = client_text_for_failure(terminal_failure, message)
 
     followup.update({
         "failure_code": terminal_failure.code if terminal_failure else "",
@@ -1586,7 +1599,10 @@ def _recover_after_image_stream_timeout(
             upstream_error=(
                 "" if terminal_failure.code == "upstream_text_reply" else failure_detail
             ),
-            raw_upstream_message=terminal_upstream_text,
+            raw_upstream_message=upstream_text_for_failure(
+                terminal_failure,
+                terminal_upstream_text,
+            ),
         )
         if is_timeout:
             setattr(terminal_exc, "stream_timeout_secs", config.image_stream_timeout_secs)
@@ -1823,6 +1839,11 @@ def stream_image_outputs(
         stream_failure is not None
         and stream_failure.code == "upstream_text_reply"
     )
+    # 账号侧原句也要先看任务记录。额度、审查、鉴权只写在任务上时不能删号。
+    should_check_task_failure = bool(
+        stream_failure is not None
+        and stream_failure.code in {"image_account_side_fault", "upstream_text_reply"}
+    )
     conversation_stream_ms = int((time.perf_counter() - conversation_stream_started) * 1000)
     http_timing = _backend_http_timing_data(backend)
     _monitor_image_stage(
@@ -1879,7 +1900,9 @@ def stream_image_outputs(
         return
 
     if not file_ids and not sediment_ids and last.get("blocked"):
-        _task_failure, detailed_error = _get_detailed_failure_from_tasks(backend, conversation_id)
+        _task_failure, detailed_error, _probe_failed = _unpack_task_probe(
+            _get_detailed_failure_from_tasks(backend, conversation_id)
+        )
         policy_failure = image_failure(
             "content_policy_violation",
             raw_detail=detailed_error or message,
@@ -1895,21 +1918,21 @@ def stream_image_outputs(
         )
         return
 
-    if is_text_reply and conversation_id and not file_ids and not sediment_ids:
-        task_failure, task_error = _get_detailed_failure_from_tasks(
-            backend,
-            conversation_id,
-            timeout_secs=5.0,
-            wait_secs=0.0,
+    if should_check_task_failure and conversation_id and not file_ids and not sediment_ids:
+        task_failure, task_error, _probe_failed = _unpack_task_probe(
+            _get_detailed_failure_from_tasks(
+                backend,
+                conversation_id,
+                timeout_secs=5.0,
+            )
         )
         previous_code = stream_failure.code
-        merged_failure = merge_message_failure(stream_failure, task_failure)
+        merged_failure = merge_message_failure(stream_failure, task_failure) or stream_failure
         stream_failure = merged_failure
         if task_failure is not None and merged_failure.code != previous_code:
-            stream_failure = merged_failure.with_raw_detail(
-                task_error or merged_failure.raw_detail or message
-            )
-            message = task_error or message
+            detail = client_text_for_failure(stream_failure, task_error)
+            stream_failure = stream_failure.with_raw_detail(detail)
+            message = detail
             logger.info({
                 "event": "image_text_reply_structured_failure",
                 "conversation_id": conversation_id,
@@ -1923,7 +1946,7 @@ def stream_image_outputs(
             model=request.model,
             index=index,
             total=total,
-            text=_failure_raw_text(stream_failure, message),
+            text=client_text_for_failure(stream_failure, message),
             conversation_id=conversation_id,
             failure=stream_failure,
         )
@@ -2000,6 +2023,39 @@ def stream_image_outputs(
         failure=failure,
     )
 
+def _codex_conversation_id(events: list[Any]) -> str:
+    """Read an explicit conversation id. Do not scan every account task."""
+
+    def nested(value: Any, depth: int) -> str:
+        if depth > 6:
+            return ""
+        if isinstance(value, list):
+            for item in value:
+                found = nested(item, depth + 1)
+                if found:
+                    return found
+            return ""
+        if not isinstance(value, dict):
+            return ""
+        for key in ("conversation_id", "original_conversation_id"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+        for key in ("response", "item", "output", "metadata", "error"):
+            if key not in value:
+                continue
+            found = nested(value.get(key), depth + 1)
+            if found:
+                return found
+        return ""
+
+    for event in events:
+        found = nested(event, 0)
+        if found:
+            return found
+    return ""
+
+
 def _codex_response_images(value: Any) -> list[str]:
     if isinstance(value, dict):
         if value.get("type") == "image_generation_call" and isinstance(value.get("result"), str):
@@ -2059,11 +2115,34 @@ def stream_codex_image_outputs(
             "response_ms": int((time.perf_counter() - codex_started) * 1000),
             "image_count": len(images),
         })
+    conversation_id = _codex_conversation_id(events)
+    if (
+        not images
+        and failure is not None
+        and failure.code in {"image_account_side_fault", "upstream_text_reply"}
+        and conversation_id
+    ):
+        # 和普通 SSE 一样：额度、审查、鉴权只写在任务上时不能按原句删号。
+        task_failure, task_error, _probe_failed = _unpack_task_probe(
+            _get_detailed_failure_from_tasks(
+                backend,
+                conversation_id,
+                timeout_secs=5.0,
+            )
+        )
+        previous_code = failure.code
+        merged_failure = merge_message_failure(failure, task_failure) or failure
+        if task_failure is not None and merged_failure.code != previous_code:
+            detail = client_text_for_failure(merged_failure, task_error)
+            if detail:
+                merged_failure = merged_failure.with_raw_detail(detail)
+        failure = merged_failure
     if not images:
         if failure is not None:
             raise ImageGenerationError(
                 "",
                 failure=failure,
+                conversation_id=conversation_id,
                 raw_error="",
                 upstream_error=diagnostic_excerpt(
                     _failure_raw_text(failure), 4000
@@ -2073,6 +2152,7 @@ def stream_codex_image_outputs(
         raise ImageGenerationError(
             "No image result found in response",
             failure=image_failure("no_image_generated"),
+            conversation_id=conversation_id,
         )
     formatted = format_image_result(
         [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
@@ -2145,9 +2225,6 @@ def _generate_single_image(
     attempted_tokens: set[str] = set()
     fallback_retry_pending = False
     fallback_retry_used = False
-    sibling_retry_pending = False
-    sibling_retry_used = False
-    sibling_retry_profile = None
     fallback_from_egress: dict[str, Any] = {}
     image_attempts: list[dict[str, Any]] = []
     retry_error: ImageGenerationError | None = None
@@ -2209,29 +2286,6 @@ def _generate_single_image(
     def account_attempt_count() -> int:
         return sum(1 for item in image_attempts if not item.get("switched_node"))
 
-    def release_pending_sibling_egress() -> None:
-        nonlocal sibling_retry_profile, sibling_retry_pending
-        profile = sibling_retry_profile
-        if profile is None:
-            return
-        sibling_retry_profile = None
-        sibling_retry_pending = False
-        if not bool(getattr(profile, "image_egress_reserved", False)):
-            return
-        try:
-            proxy_settings.release_image_egress(profile)
-        except Exception as exc:
-            logger.warning({
-                "event": "image_sibling_egress_release_failed",
-                "error": diagnostic_excerpt(exc, 500),
-                "index": index,
-            })
-            return
-        try:
-            setattr(profile, "image_egress_reserved", False)
-        except Exception:
-            return
-
     def record_failed_node_attempt(
             node_backend: OpenAIBackendAPI,
             failed: ImageFailure,
@@ -2285,324 +2339,311 @@ def _generate_single_image(
         })
 
     while True:
-        try:
-            if _image_request_stopped(request):
-                held_token = retry_token
-                retry_token = ""
-                if held_token:
-                    try:
-                        account_service.release_image_slot(held_token)
-                    except Exception as exc:
-                        logger.warning({
-                            "event": "image_account_slot_release_failed",
-                            "error": diagnostic_excerpt(exc, 500),
-                            "index": index,
-                        })
-                raise _deadline_slot_error(index)
-            if pause_worker is not None:
-                pause_worker()
-            request.monitor_attempt = len(image_attempts) + 1
-            request.monitor_account_attempt = account_attempt_count() + 1
-            request.monitor_node_switch_count = sum(
-                1 for item in image_attempts if item.get("switched_node")
-            )
-            account_wait_started = time.perf_counter()
-            selection_timing: dict[str, Any] = {}
-            stream_started = 0.0
-            try:
-                if retry_token:
-                    token = retry_token
-                    retry_token = ""
-                else:
-                    if request.progress_callback:
-                        request.progress_callback("getting_account")
-                    _monitor_image_stage(
-                        request,
-                        "image_getting_account",
-                        max_account_attempts=max_account_attempts,
-                        index=index,
-                        total=total,
-                    )
-                    plan_type, _ = split_image_model(request.model)
-                    codex_model = is_codex_image_model(request.model)
-                    token = account_service.get_available_access_token(
-                        plan_type=plan_type,
-                        source_type="codex" if codex_model else None,
-                        plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                        excluded_tokens=attempted_tokens,
-                        deadline_monotonic=request.deadline_monotonic or None,
-                        stop_event=request.abandoned,
-                        timing=selection_timing,
-                    )
-                    attempted_tokens.add(token)
-                    account_attempt_started = account_wait_started
-                    fallback_retry_pending = False
-                    fallback_retry_used = False
-                    fallback_from_egress = {}
-                    sibling_retry_pending = False
-                    sibling_retry_used = False
-                    sibling_retry_profile = None
-            except ImageAccountSelectionError as exc:
-                _monitor_image_stage(
-                    request,
-                    "image_local_rejected",
-                    local_reason="account_pool",
-                    status="failed",
-                    index=index,
-                    total=total,
-                )
-                if retry_error is not None:
-                    raise attach_attempts(retry_error) from exc
-                raise ImageGenerationError(
-                    str(exc) or "image generation failed",
-                    failure=image_failure(exc.code, raw_detail=str(exc)),
-                    account_email=account_email,
-                    image_attempts=image_attempts,
-                ) from exc
-            except RuntimeError as exc:
-                _monitor_image_stage(
-                    request,
-                    "image_local_rejected",
-                    local_reason="account_pool",
-                    status="failed",
-                    index=index,
-                    total=total,
-                )
-                if retry_error is not None:
-                    raise attach_attempts(retry_error) from exc
-                raise ImageGenerationError(
-                    str(exc) or "image generation failed",
-                    failure=image_failure("no_available_account"),
-                    account_email=account_email,
-                    image_attempts=image_attempts,
-                ) from exc
-
-            emitted_for_token = False
-            returned_message = False
-            returned_result = False
-            image_slot_finalized = False
-            attempt_started = account_attempt_started or account_wait_started
-            attempt_conversation_id = ""
-            checkpointed_conversations: set[str] = set()
-            attempt_access_token = token
-            attempt_refresh_token = ""
-            attempt_last_token_refresh_at = None
-
-            def finalize_image_slot(
-                success: bool,
-                *,
-                failure: ImageFailure | None = None,
-                error: ImageGenerationError | None = None,
-                quota_consumed: bool | None = None,
-            ) -> None:
-                nonlocal image_slot_finalized
-                if image_slot_finalized:
-                    return
-                image_slot_finalized = True
+        if _image_request_stopped(request):
+            held_token = retry_token
+            retry_token = ""
+            if held_token:
                 try:
-                    if failure is not None and failure.code == "task_interrupted":
-                        account_service.release_image_slot(token)
-                    else:
-                        account_service.mark_image_result(
-                            token,
-                            success,
-                            failure=failure,
-                            quota_consumed=quota_consumed,
-                            capabilities={"auth", "image_generation"}
-                            | ({"file_upload"} if request.images else set()),
-                            expected_access_token=attempt_access_token,
-                            expected_refresh_token=attempt_refresh_token,
-                            expected_last_token_refresh_at=attempt_last_token_refresh_at,
-                        )
+                    account_service.release_image_slot(held_token)
                 except Exception as exc:
                     logger.warning({
-                        "event": "image_account_result_update_failed",
-                        "account_email": account_email,
-                        "success": success,
-                        "failure_code": failure.code if failure is not None else "",
+                        "event": "image_account_slot_release_failed",
                         "error": diagnostic_excerpt(exc, 500),
+                        "index": index,
                     })
-                    try:
-                        account_service.release_image_slot(token)
-                    except Exception as release_exc:
-                        logger.warning({
-                            "event": "image_account_slot_release_failed",
-                            "account_email": account_email,
-                            "error": diagnostic_excerpt(release_exc, 500),
-                        })
-                attempt: dict[str, Any] = {
-                    "slot": index,
-                    "attempt": len(image_attempts) + 1,
-                    "account_email": account_email,
-                    "status": (
-                        "success"
-                        if success
-                        else "text_review"
-                        if failure is not None and failure.outcome == "text"
-                        else "failed"
-                    ),
-                    "duration_ms": max(0, int((time.perf_counter() - attempt_started) * 1000)),
-                }
-                if attempt_conversation_id:
-                    attempt["conversation_id"] = attempt_conversation_id
-                if failure is not None:
-                    raw_error = str(getattr(error, "raw_error", "") or "").strip()
-                    if failure.code == "image_poll_timeout":
-                        raw_error = ""
-                    upstream_error = str(
-                        getattr(error, "upstream_error", "")
-                        or getattr(error, "last_task_error", "")
-                        or ""
-                    ).strip()
-                    raw_upstream_message = str(
-                        getattr(error, "raw_upstream_message", "")
-                        or getattr(error, "upstream_message_preview", "")
-                        or getattr(error, "last_assistant_text", "")
-                        or ""
-                    ).strip()
-                    public_error = (
-                        error.public_error
-                        if error is not None
-                        else public_image_error_message(failure)
-                    )
-                    failure_fields = {
-                        **failure.diagnostic_fields(),
-                        "public_error": public_error,
-                        "account_failure": failure.verify_account,
-                        "switched_account": False,
-                    }
-                    if raw_error:
-                        failure_fields["raw_error"] = raw_error
-                    if upstream_error:
-                        failure_fields["upstream_error"] = upstream_error
-                    if raw_upstream_message:
-                        failure_fields["raw_upstream_message"] = raw_upstream_message
-                    attempt.update(failure_fields)
-                if backend is not None:
-                    attempt.update(_backend_egress_data(backend))
-                image_attempts.append(attempt)
-                if failure is not None and request.trace_image_perf:
-                    _monitor_image_stage(
-                        request,
-                        "image_attempt_failed",
-                        status="text_review" if failure.outcome == "text" else "failed",
-                        **failure.diagnostic_fields(),
-                        public_error=attempt.get("public_error", ""),
-                        raw_error=attempt.get("raw_error", ""),
-                        account_failure=failure.verify_account,
-                        account_email=account_email,
-                        conversation_id=attempt_conversation_id,
-                        stream_error_ms=(
-                            int((time.perf_counter() - stream_started) * 1000)
-                            if stream_started > 0 else 0
-                        ),
-                        index=index,
-                        total=total,
-                    )
-
-            account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
-            account = account_service.get_account(token) or {}
-            attempt_refresh_token = str(account.get("refresh_token") or "").strip()
-            attempt_last_token_refresh_at = account.get("last_token_refresh_at")
-            account_email = str(account.get("email") or "").strip()
-            if pending_switch_attempt_index is not None:
-                previous_attempt = image_attempts[pending_switch_attempt_index]
-                previous_attempt["switched_account"] = True
-                logger.warning({
-                    "event": "image_cross_account_retry",
-                    "call_id": request.call_id,
-                    "failure_code": previous_attempt.get("failure_code", ""),
-                    "account_email": previous_attempt.get("account_email", ""),
-                    "next_account_email": account_email,
-                    "attempted_account_count": account_attempt_count() + 1,
-                    "max_account_attempts": max_account_attempts,
-                    "index": index,
-                })
-                if request.trace_image_perf:
-                    _monitor_image_stage(
-                        request,
-                        "image_cross_account_retry",
-                        status="retrying",
-                        failure_code=previous_attempt.get("failure_code", ""),
-                        account_email=account_email,
-                        previous_account_email=previous_attempt.get("account_email", ""),
-                        account_switch_count=account_attempt_count(),
-                        max_account_attempts=max_account_attempts,
-                        index=index,
-                        total=total,
-                    )
-                pending_switch_attempt_index = None
-            retry_error = None
-            selection_detail: dict[str, Any] = {}
-            selection_monitor: dict[str, Any] = {}
-            if selection_timing:
-                selection_detail = {
-                    "refresh_ms": int(selection_timing.get("refresh_ms") or 0),
-                    "remote_check_ms": int(selection_timing.get("remote_check_ms") or 0),
-                    "slot_wait_ms": int(selection_timing.get("slot_wait_ms") or 0),
-                    "preflight_skipped": bool(selection_timing.get("preflight_skipped")),
-                    "attempts": int(selection_timing.get("attempts") or 0),
-                }
-                selection_monitor = {
-                    "attempts": selection_detail["attempts"],
-                    "account_slot_wait_ms": selection_detail["slot_wait_ms"],
-                    "account_refresh_ms": selection_detail["refresh_ms"],
-                    "account_remote_check_ms": selection_detail["remote_check_ms"],
-                }
+            raise _deadline_slot_error(index)
+        if pause_worker is not None:
+            pause_worker()
+        request.monitor_attempt = len(image_attempts) + 1
+        request.monitor_account_attempt = account_attempt_count() + 1
+        request.monitor_node_switch_count = sum(
+            1 for item in image_attempts if item.get("switched_node")
+        )
+        account_wait_started = time.perf_counter()
+        selection_timing: dict[str, Any] = {}
+        stream_started = 0.0
+        try:
+            if retry_token:
+                token = retry_token
+                retry_token = ""
+            else:
+                if request.progress_callback:
+                    request.progress_callback("getting_account")
+                _monitor_image_stage(
+                    request,
+                    "image_getting_account",
+                    max_account_attempts=max_account_attempts,
+                    index=index,
+                    total=total,
+                )
+                plan_type, _ = split_image_model(request.model)
+                codex_model = is_codex_image_model(request.model)
+                token = account_service.get_available_access_token(
+                    plan_type=plan_type,
+                    source_type="codex" if codex_model else None,
+                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                    excluded_tokens=attempted_tokens,
+                    deadline_monotonic=request.deadline_monotonic or None,
+                    stop_event=request.abandoned,
+                    timing=selection_timing,
+                )
+                attempted_tokens.add(token)
+                account_attempt_started = account_wait_started
+                fallback_retry_pending = False
+                fallback_retry_used = False
+                fallback_from_egress = {}
+        except ImageAccountSelectionError as exc:
             _monitor_image_stage(
                 request,
-                "image_account_lookup",
-                account_wait_ms=account_wait_ms,
-                account_email=account_email,
-                account_found=bool(account),
-                max_account_attempts=max_account_attempts,
+                "image_local_rejected",
+                local_reason="account_pool",
+                status="failed",
                 index=index,
                 total=total,
-                **selection_monitor,
             )
-            if account_wait_ms >= 5000:
+            if retry_error is not None:
+                raise attach_attempts(retry_error) from exc
+            raise ImageGenerationError(
+                str(exc) or "image generation failed",
+                failure=image_failure(exc.code, raw_detail=str(exc)),
+                account_email=account_email,
+                image_attempts=image_attempts,
+            ) from exc
+        except RuntimeError as exc:
+            _monitor_image_stage(
+                request,
+                "image_local_rejected",
+                local_reason="account_pool",
+                status="failed",
+                index=index,
+                total=total,
+            )
+            if retry_error is not None:
+                raise attach_attempts(retry_error) from exc
+            raise ImageGenerationError(
+                str(exc) or "image generation failed",
+                failure=image_failure("no_available_account"),
+                account_email=account_email,
+                image_attempts=image_attempts,
+            ) from exc
+
+        emitted_for_token = False
+        returned_message = False
+        returned_result = False
+        image_slot_finalized = False
+        attempt_started = account_attempt_started or account_wait_started
+        attempt_conversation_id = ""
+        checkpointed_conversations: set[str] = set()
+        attempt_access_token = token
+        attempt_refresh_token = ""
+        attempt_last_token_refresh_at = None
+
+        def finalize_image_slot(
+            success: bool,
+            *,
+            failure: ImageFailure | None = None,
+            error: ImageGenerationError | None = None,
+            quota_consumed: bool | None = None,
+        ) -> None:
+            nonlocal image_slot_finalized
+            if image_slot_finalized:
+                return
+            image_slot_finalized = True
+            try:
+                if failure is not None and failure.code == "task_interrupted":
+                    account_service.release_image_slot(token)
+                else:
+                    account_service.mark_image_result(
+                        token,
+                        success,
+                        failure=failure,
+                        quota_consumed=quota_consumed,
+                        capabilities={"auth", "image_generation"}
+                        | ({"file_upload"} if request.images else set()),
+                        expected_access_token=attempt_access_token,
+                        expected_refresh_token=attempt_refresh_token,
+                        expected_last_token_refresh_at=attempt_last_token_refresh_at,
+                    )
+            except Exception as exc:
                 logger.warning({
-                    "event": "image_account_wait_slow",
-                    "call_id": request.call_id,
-                    "account_wait_ms": account_wait_ms,
+                    "event": "image_account_result_update_failed",
                     "account_email": account_email,
-                    "index": index,
-                    **selection_detail,
+                    "success": success,
+                    "failure_code": failure.code if failure is not None else "",
+                    "error": diagnostic_excerpt(exc, 500),
                 })
-            logger.debug({
-                "event": "image_account_lookup",
-                "call_id": request.call_id,
-                "token_prefix": token[:12] + "..." if len(token) > 12 else token,
+                try:
+                    account_service.release_image_slot(token)
+                except Exception as release_exc:
+                    logger.warning({
+                        "event": "image_account_slot_release_failed",
+                        "account_email": account_email,
+                        "error": diagnostic_excerpt(release_exc, 500),
+                    })
+            attempt: dict[str, Any] = {
+                "slot": index,
+                "attempt": len(image_attempts) + 1,
                 "account_email": account_email,
-                "account_found": bool(account),
+                "status": (
+                    "success"
+                    if success
+                    else "text_review"
+                    if failure is not None and failure.outcome == "text"
+                    else "failed"
+                ),
+                "duration_ms": max(0, int((time.perf_counter() - attempt_started) * 1000)),
+            }
+            if attempt_conversation_id:
+                attempt["conversation_id"] = attempt_conversation_id
+            if failure is not None:
+                raw_error = str(getattr(error, "raw_error", "") or "").strip()
+                if failure.code == "image_poll_timeout":
+                    raw_error = ""
+                upstream_error = str(
+                    getattr(error, "upstream_error", "")
+                    or getattr(error, "last_task_error", "")
+                    or ""
+                ).strip()
+                raw_upstream_message = str(
+                    getattr(error, "raw_upstream_message", "")
+                    or getattr(error, "upstream_message_preview", "")
+                    or getattr(error, "last_assistant_text", "")
+                    or ""
+                ).strip()
+                public_error = (
+                    error.public_error
+                    if error is not None
+                    else public_image_error_message(failure)
+                )
+                failure_fields = {
+                    **failure.diagnostic_fields(),
+                    "public_error": public_error,
+                    "account_failure": failure.verify_account,
+                    "switched_account": False,
+                }
+                if raw_error:
+                    failure_fields["raw_error"] = raw_error
+                if upstream_error:
+                    failure_fields["upstream_error"] = upstream_error
+                if raw_upstream_message:
+                    failure_fields["raw_upstream_message"] = raw_upstream_message
+                attempt.update(failure_fields)
+            if backend is not None:
+                attempt.update(_backend_egress_data(backend))
+            image_attempts.append(attempt)
+            if failure is not None and request.trace_image_perf:
+                _monitor_image_stage(
+                    request,
+                    "image_attempt_failed",
+                    status="text_review" if failure.outcome == "text" else "failed",
+                    **failure.diagnostic_fields(),
+                    public_error=attempt.get("public_error", ""),
+                    raw_error=attempt.get("raw_error", ""),
+                    account_failure=failure.verify_account,
+                    account_email=account_email,
+                    conversation_id=attempt_conversation_id,
+                    stream_error_ms=(
+                        int((time.perf_counter() - stream_started) * 1000)
+                        if stream_started > 0 else 0
+                    ),
+                    index=index,
+                    total=total,
+                )
+
+        account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
+        account = account_service.get_account(token) or {}
+        attempt_refresh_token = str(account.get("refresh_token") or "").strip()
+        attempt_last_token_refresh_at = account.get("last_token_refresh_at")
+        account_email = str(account.get("email") or "").strip()
+        if pending_switch_attempt_index is not None:
+            previous_attempt = image_attempts[pending_switch_attempt_index]
+            previous_attempt["switched_account"] = True
+            logger.warning({
+                "event": "image_cross_account_retry",
+                "call_id": request.call_id,
+                "failure_code": previous_attempt.get("failure_code", ""),
+                "account_email": previous_attempt.get("account_email", ""),
+                "next_account_email": account_email,
+                "attempted_account_count": account_attempt_count() + 1,
+                "max_account_attempts": max_account_attempts,
+                "index": index,
+            })
+            if request.trace_image_perf:
+                _monitor_image_stage(
+                    request,
+                    "image_cross_account_retry",
+                    status="retrying",
+                    failure_code=previous_attempt.get("failure_code", ""),
+                    account_email=account_email,
+                    previous_account_email=previous_attempt.get("account_email", ""),
+                    account_switch_count=account_attempt_count(),
+                    max_account_attempts=max_account_attempts,
+                    index=index,
+                    total=total,
+                )
+            pending_switch_attempt_index = None
+        retry_error = None
+        selection_detail: dict[str, Any] = {}
+        selection_monitor: dict[str, Any] = {}
+        if selection_timing:
+            selection_detail = {
+                "refresh_ms": int(selection_timing.get("refresh_ms") or 0),
+                "remote_check_ms": int(selection_timing.get("remote_check_ms") or 0),
+                "slot_wait_ms": int(selection_timing.get("slot_wait_ms") or 0),
+                "preflight_skipped": bool(selection_timing.get("preflight_skipped")),
+                "attempts": int(selection_timing.get("attempts") or 0),
+            }
+            selection_monitor = {
+                "attempts": selection_detail["attempts"],
+                "account_slot_wait_ms": selection_detail["slot_wait_ms"],
+                "account_refresh_ms": selection_detail["refresh_ms"],
+                "account_remote_check_ms": selection_detail["remote_check_ms"],
+            }
+        _monitor_image_stage(
+            request,
+            "image_account_lookup",
+            account_wait_ms=account_wait_ms,
+            account_email=account_email,
+            account_found=bool(account),
+            max_account_attempts=max_account_attempts,
+            index=index,
+            total=total,
+            **selection_monitor,
+        )
+        if account_wait_ms >= 5000:
+            logger.warning({
+                "event": "image_account_wait_slow",
+                "call_id": request.call_id,
                 "account_wait_ms": account_wait_ms,
+                "account_email": account_email,
                 "index": index,
                 **selection_detail,
             })
-            if hold_worker is not None:
-                try:
-                    hold_worker()
-                except ImageGenerationError:
-                    account_service.release_image_slot(token)
-                    raise
-        except BaseException:
-            release_pending_sibling_egress()
-            raise
+        logger.debug({
+            "event": "image_account_lookup",
+            "call_id": request.call_id,
+            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
+            "account_email": account_email,
+            "account_found": bool(account),
+            "account_wait_ms": account_wait_ms,
+            "index": index,
+            **selection_detail,
+        })
+        if hold_worker is not None:
+            try:
+                hold_worker()
+            except ImageGenerationError:
+                account_service.release_image_slot(token)
+                raise
         backend: OpenAIBackendAPI | None = None
         egress_acquired = False
         using_fallback_profile = False
-        using_sibling_profile = False
         try:
             egress_started = time.perf_counter()
             explicit_profile = None
-            using_sibling_profile = sibling_retry_pending
-            sibling_retry_pending = False
             using_fallback_profile = fallback_retry_pending
             fallback_retry_pending = False
-            if using_sibling_profile:
-                explicit_profile = sibling_retry_profile
-                sibling_retry_profile = None
-            elif using_fallback_profile:
+            if using_fallback_profile:
                 explicit_profile = proxy_settings.get_fallback_profile(
                     upstream=True,
                     reserve_image_egress=True,
@@ -2805,15 +2846,6 @@ def _generate_single_image(
                 )
             _cleanup_image_conversations_after_success(backend, outputs)
             finalize_image_slot(True)
-            if backend is not None:
-                try:
-                    proxy_settings.note_image_subscription_node_success(backend.proxy_profile)
-                except Exception as exc:
-                    logger.warning({
-                        "event": "image_subscription_node_success_clear_failed",
-                        "error": diagnostic_excerpt(exc, 500),
-                        "index": index,
-                    })
             attach_attempts_to_outputs(outputs)
             if request.trace_image_perf:
                 result_images = image_output_metadata([
@@ -2867,63 +2899,12 @@ def _generate_single_image(
                 failure_code=failure.code,
                 conversation_id=attempt_conversation_id,
             )
-            if (
-                early_connection_failure
-                and backend is not None
-                and not _image_request_stopped(request)
-            ):
-                try:
-                    proxy_settings.note_image_subscription_node_failure(backend.proxy_profile)
-                except Exception as note_exc:
-                    logger.warning({
-                        "event": "image_subscription_node_failure_note_failed",
-                        "error": diagnostic_excerpt(note_exc, 500),
-                        "index": index,
-                    })
-            sibling_deadline: BaseException | None = None
-            if (
-                early_connection_failure
-                and not sibling_retry_used
-                and not using_fallback_profile
-                and not using_sibling_profile
-                and backend is not None
-            ):
-                current_profile = backend.proxy_profile
-                sibling_group_id = str(getattr(current_profile, "proxy_group_id", "") or "")
-                sibling_node_id = str(getattr(current_profile, "proxy_node_id", "") or "")
-                if sibling_group_id and sibling_node_id:
-                    try:
-                        sibling_profile = proxy_settings.reserve_subscription_sibling(
-                            sibling_group_id,
-                            exclude_node_id=sibling_node_id,
-                            deadline_monotonic=request.deadline_monotonic or None,
-                            stop_event=request.abandoned,
-                        )
-                    except ImageEgressDeadlineError as deadline_exc:
-                        sibling_deadline = deadline_exc
-                    else:
-                        if sibling_profile is not None:
-                            sibling_retry_profile = sibling_profile
-                            try:
-                                record_failed_node_attempt(
-                                    backend,
-                                    failure,
-                                    stream_error_ms,
-                                    "image_subscription_sibling_retry",
-                                )
-                                sibling_retry_used = True
-                                sibling_retry_pending = True
-                                retry_token = token
-                            except BaseException:
-                                release_pending_sibling_egress()
-                                raise
-                            continue
-            if sibling_deadline is not None:
-                exc = sibling_deadline
-                failure = image_failure("task_interrupted", raw_detail=str(sibling_deadline))
-            else:
-                fallback_reference = proxy_settings.get_fallback_proxy_reference()
-            if sibling_deadline is None and early_connection_failure and fallback_reference and not fallback_retry_used:
+            fallback_reference = (
+                proxy_settings.get_fallback_proxy_reference()
+                if early_connection_failure and not fallback_retry_used and not using_fallback_profile
+                else ""
+            )
+            if fallback_reference:
                 fallback_from_egress = _backend_egress_data(backend) if backend is not None else {}
                 if backend is not None:
                     record_failed_node_attempt(

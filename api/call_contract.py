@@ -177,6 +177,10 @@ class AttemptSummary(BaseModel):
     upstream_error: str
     upstream_text: str
     switched_account: bool | None
+    switched_node: bool = False
+    proxy_group_id: str = ""
+    proxy_node_id: str = ""
+    proxy_node_name: str = ""
     presentation: AttemptPresentation
     timings_ms: dict[str, int] = Field(default_factory=dict)
     monitor: dict[str, Any] = Field(default_factory=dict)

@@ -5,6 +5,7 @@ from typing import Literal, cast
 
 from services.account_processing import account_processing_slot
 from services.account_service import account_service
+from services.image_failure import ImageGenerationError
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
@@ -183,6 +184,12 @@ class AccountTestService:
             raise_on_error=True,
             image_scope=True,
         )
+        current = account_service.get_account(active_token)
+        if not isinstance(current, dict):
+            current = account
+        expected_access_token = str(current.get("access_token") or active_token)
+        expected_refresh_token = str(current.get("refresh_token") or "")
+        expected_last_token_refresh_at = current.get("last_token_refresh_at")
         backend: OpenAIBackendAPI | None = None
         with account_processing_slot():
             try:
@@ -200,6 +207,23 @@ class AccountTestService:
                     else stream_image_outputs
                 )
                 result = collect_image_outputs(stream(backend, request))
+            except ImageGenerationError as exc:
+                failure = getattr(exc, "failure", None)
+                if (
+                    failure is not None
+                    and failure.code == "image_account_side_fault"
+                    and not failure.suppress_account_removal
+                ):
+                    account_service.mark_image_result(
+                        active_token,
+                        False,
+                        failure=failure,
+                        expected_access_token=expected_access_token,
+                        expected_refresh_token=expected_refresh_token,
+                        expected_last_token_refresh_at=expected_last_token_refresh_at,
+                        release_image_slot=False,
+                    )
+                raise
             finally:
                 if backend is not None:
                     backend.close()
@@ -223,7 +247,11 @@ class AccountTestService:
         if not images:
             raise RuntimeError("上游没有返回图片")
 
-        updated = account_service.mark_image_result(active_token, True)
+        updated = account_service.mark_image_result(
+            active_token,
+            True,
+            release_image_slot=False,
+        )
         if updated is None:
             raise RuntimeError("图片已生成，但账号额度更新失败")
         return list(dict.fromkeys(images)), updated

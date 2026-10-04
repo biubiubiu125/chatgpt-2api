@@ -1,4 +1,5 @@
 import apiClient from './client'
+import { panelMediaRelativeUrl } from '@/lib/panelMediaUrl'
 
 export type GalleryMediaType = 'all' | 'image'
 export type GalleryFileMediaType = Exclude<GalleryMediaType, 'all'>
@@ -126,7 +127,12 @@ function defaultFileBaseUrl(): string {
 
 export function resolveGalleryFileUrl(url: string, baseUrl = defaultFileBaseUrl()): string {
   const raw = cleanString(url)
-  if (!raw) return ''
+  if (!raw || raw.startsWith('data:') || raw.startsWith('blob:')) return raw
+  const relative = panelMediaRelativeUrl(raw)
+  if (relative) {
+    const origin = typeof window !== 'undefined' ? window.location.origin : ''
+    return origin ? `${origin}${relative}` : relative
+  }
   if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw
   if (raw.startsWith('//')) {
     const protocol = typeof window !== 'undefined' ? window.location.protocol : 'https:'

@@ -13,9 +13,13 @@ from typing import TYPE_CHECKING
 
 from services.browser_fingerprint import (
     CHROME146_ACCEPT_LANGUAGE,
+    CHROME146_HARDWARE_CONCURRENCY,
+    CHROME146_SCREEN_HEIGHT,
+    CHROME146_SCREEN_WIDTH,
     CHROME146_SEC_CH_UA,
     CHROME146_USER_AGENT,
     chrome146_headers,
+    chrome146_pow_date_string,
 )
 from services.proxy_service import proxy_settings
 from utils.turnstile import solve_turnstile_token
@@ -29,10 +33,10 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500_000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str, ua: str):
+    def __init__(self, device_id: str, ua: str, sid: str = ""):
         self.device_id = device_id
         self.user_agent = ua
-        self.sid = str(uuid.uuid4())
+        self.sid = str(sid or "").strip() or str(uuid.uuid4())
 
     @staticmethod
     def _fnv1a_32(text: str) -> str:
@@ -50,23 +54,23 @@ class SentinelTokenGenerator:
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
         return [
-            "1920x1080",
-            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            f"{CHROME146_SCREEN_WIDTH}x{CHROME146_SCREEN_HEIGHT}",
+            chrome146_pow_date_string(),
             4294705152,
             random.random(),
             self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js",
+            SENTINEL_SDK_URL,
             None,
             None,
             CHROME146_ACCEPT_LANGUAGE,
             random.random(),
-            random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
-            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
-            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
+            "vendorSub-undefined",
+            "location",
+            "Object",
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            CHROME146_HARDWARE_CONCURRENCY,
             time.time() * 1000 - perf_now,
         ]
 
@@ -96,6 +100,22 @@ class SentinelTokenGenerator:
 # ── 默认 User-Agent 和 sec-ch-ua ──────────────────────────────
 DEFAULT_SENTINEL_USER_AGENT = CHROME146_USER_AGENT
 DEFAULT_SENTINEL_SEC_CH_UA = CHROME146_SEC_CH_UA
+SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+
+
+def _remember_oai_sc(session: object, value: str) -> None:
+    text = str(value or "").strip()
+    if not text or session is None:
+        return
+    jar = getattr(session, "cookies", None)
+    setter = getattr(jar, "set", None)
+    if not callable(setter):
+        return
+    for domain in (".openai.com", ".chatgpt.com"):
+        try:
+            setter("oai-sc", text, domain=domain)
+        except Exception:
+            continue
 
 
 def _chrome146_user_agent(value: object = "") -> str:
@@ -128,6 +148,7 @@ def build_sentinel_token(
     *,
     user_agent: str = "",
     sec_ch_ua: str = "",
+    sid: str = "",
 ) -> tuple[str, str]:
     """请求 sentinel token 并返回 (sentinel_header_value, oai_sc_cookie_value)。
 
@@ -146,7 +167,7 @@ def build_sentinel_token(
     """
     ua = _chrome146_user_agent(user_agent)
     ch_ua = _chrome146_sec_ch_ua(sec_ch_ua)
-    generator = SentinelTokenGenerator(device_id, ua)
+    generator = SentinelTokenGenerator(device_id, ua, sid=sid)
     requirements_token = generator.generate_requirements_token()
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -185,6 +206,7 @@ def build_sentinel_token(
     sentinel_value = json.dumps({"p": p_value, "t": so_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
     # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
     oai_sc_value = "0" + token
+    _remember_oai_sc(session, oai_sc_value)
     return sentinel_value, oai_sc_value
 
 
@@ -195,6 +217,7 @@ def build_sentinel_with_so_token(
     *,
     user_agent: str = "",
     sec_ch_ua: str = "",
+    sid: str = "",
 ) -> tuple[str, str, str]:
     """请求 sentinel token 并返回 (sentinel_header_value, so_token_header_value, oai_sc_cookie_value)。
 
@@ -213,7 +236,7 @@ def build_sentinel_with_so_token(
     """
     ua = _chrome146_user_agent(user_agent)
     ch_ua = _chrome146_sec_ch_ua(sec_ch_ua)
-    generator = SentinelTokenGenerator(device_id, ua)
+    generator = SentinelTokenGenerator(device_id, ua, sid=sid)
     requirements_token = generator.generate_requirements_token()
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -256,5 +279,6 @@ def build_sentinel_with_so_token(
     sentinel_value = json.dumps({"p": p_value, "t": so_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
     # oai-sc cookie = "0" + sentinel token "c" value
     oai_sc_value = "0" + token
+    _remember_oai_sc(session, oai_sc_value)
 
     return sentinel_value, so_token, oai_sc_value

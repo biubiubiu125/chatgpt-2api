@@ -237,6 +237,7 @@ import {
   useStudioConversationPersistenceRuntime,
 } from '@/views/studio/studioConversationPersistenceRuntime'
 import { useStudioConversationSelectionRuntime } from '@/views/studio/studioConversationSelectionRuntime'
+import { panelImageAssetSource } from '@/lib/panelMediaUrl'
 import { useStudioFileTaskRuntime } from '@/views/studio/studioFileTaskRuntime'
 import { useStudioImageTaskRuntime } from '@/views/studio/studioImageTaskRuntime'
 import { useStudioLayoutRuntime } from '@/views/studio/studioLayoutRuntime'
@@ -627,14 +628,8 @@ function imageAssetFilename(asset: StudioImageAssetView, fallback: string) {
   return safeImageFilename(filename)
 }
 
-function localImageUrl(path: string) {
-  const cleaned = cleanAssetText(path).replace(/^\/+/, '')
-  if (!cleaned) return ''
-  return `/images/${cleaned.split('/').filter(Boolean).map((part) => encodeURIComponent(part)).join('/')}`
-}
-
 function imageAssetSource(asset: StudioImageAssetView) {
-  return localImageUrl(asset.path) || cleanAssetText(asset.url)
+  return panelImageAssetSource(asset)
 }
 
 function imageCompareSource(asset: StudioImageAssetView, name: string): StudioImageCompareSource | null {
