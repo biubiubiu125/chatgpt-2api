@@ -26,6 +26,7 @@ _IMAGE_FAILURE_LABELS = {
     "upstream_connection_timeout": "上游连接超时",
     "upstream_rate_limited": "上游服务限流",
     "image_poll_timeout": "等待图片结果超时",
+    "image_followup_unavailable": "图片结果会话未建立",
     "image_stream_timeout": "上游图片流超时",
     "image_stream_interrupted": "上游图片流中断",
     "image_tool_error": "图片工具异常",

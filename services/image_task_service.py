@@ -463,7 +463,11 @@ def _select_resume_target(task: Mapping[str, object]) -> tuple[str, str]:
     raise ValueError("task has no conversation_id")
 
 
-_RESUMABLE_IMAGE_CODES = frozenset({"image_poll_timeout", "image_download_failed"})
+_RESUMABLE_IMAGE_CODES = frozenset({
+    "image_download_failed",
+    "image_followup_unavailable",
+    "image_poll_timeout",
+})
 
 
 def _resume_error_code_after_busy(preferred: object, current: object, conversation_id: object) -> str:
@@ -676,6 +680,17 @@ def _generation_push_metadata(result: Mapping[str, Any], *, prompt: object = Non
     if model is not None and str(model).strip():
         metadata["model"] = model
     return metadata
+
+
+def _release_image_backend(backend: Any) -> None:
+    """Return before HTTP/3 teardown. Resume fakes that only have close() still close."""
+    finish = getattr(backend, "finish_without_blocking", None)
+    if callable(finish):
+        finish([])
+        return
+    close = getattr(backend, "close", None)
+    if callable(close):
+        close()
 
 
 class ImageTaskService:
@@ -2122,7 +2137,7 @@ class ImageTaskService:
                     from services.proxy_service import proxy_settings
                     proxy_settings.release_image_egress(profile)
             if backend is not None:
-                backend.close()
+                _release_image_backend(backend)
         if follow_up is None:
             return
         next_conversation, next_token = follow_up

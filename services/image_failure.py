@@ -98,6 +98,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
         "transient", "image_generation", False, 502, "server_error",
         verify_account=True,
     ),
+    "image_followup_unavailable": FailurePolicy(
+        "transient", "image_generation", False, 502, "server_error",
+    ),
     "image_stream_timeout": FailurePolicy(
         "transient", "image_generation", False, 502, "server_error",
         verify_account=True,
@@ -244,6 +247,7 @@ def image_failure(
 
 
 IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
+IMAGE_FOLLOWUP_PUBLIC_MESSAGE = "Image result session was interrupted. Please try again."
 IMAGE_TOOL_ERROR_PUBLIC_MESSAGE = "The image generation tool encountered an error. Please try again."
 IMAGE_QUOTA_PUBLIC_MESSAGE = "No image generation quota is currently available."
 IMAGE_BUSY_PUBLIC_MESSAGE = "Image generation is busy. Please try again later."
@@ -351,6 +355,8 @@ def public_image_error_message(
         return IMAGE_BUSY_PUBLIC_MESSAGE
     if failure.code == "image_poll_timeout":
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
+    if failure.code == "image_followup_unavailable":
+        return IMAGE_FOLLOWUP_PUBLIC_MESSAGE
     if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
 
@@ -532,6 +538,7 @@ def _failure_priority(code: str) -> int:
     if normalized == "upstream_text_reply":
         return 2
     if normalized in {
+        "image_followup_unavailable",
         "image_poll_timeout",
         "image_stream_interrupted",
         "image_stream_timeout",

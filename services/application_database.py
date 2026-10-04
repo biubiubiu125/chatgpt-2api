@@ -227,10 +227,17 @@ def synchronize_application_metadata(connection, metadata: MetaData) -> None:
 
 
 def initialize_application_database(database_url: str) -> Engine:
-    """Create the current application schema."""
+    """Create missing tables and apply additive columns on existing tables.
+
+    ``create_all`` leaves an already-created table at its old shape.  Startup
+    must also run the additive synchronizer, or a later query for a new column
+    fails on PostgreSQL.
+    """
     engine = create_database_engine(database_url)
     with _schema_lock:
-        DatabaseBase.metadata.create_all(engine)
+        with engine.begin() as connection:
+            DatabaseBase.metadata.create_all(connection)
+            synchronize_application_metadata(connection, DatabaseBase.metadata)
     return engine
 
 

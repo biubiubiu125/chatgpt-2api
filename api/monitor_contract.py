@@ -79,6 +79,7 @@ class MonitorAccountAttemptView(StrictMonitorModel):
     attempt: int = Field(ge=0)
     max_attempts: int = Field(ge=0)
     switch_count: int = Field(ge=0)
+    node_switch_count: int = Field(ge=0)
     image_count: int = Field(ge=0)
     display: str
 
@@ -116,6 +117,7 @@ class MonitorImageView(StrictMonitorModel):
     account_attempt: int | None = None
     max_account_attempts: int | None = None
     account_switch_count: int | None = None
+    node_switch_count: int | None = None
     stage: str | None = None
     stage_label: str | None = None
     updated_at: str | None = None
@@ -164,11 +166,16 @@ class MonitorEventView(StrictMonitorModel):
     account_email: str | None = None
     previous_account_email: str | None = None
     account_switch_count: int | None = None
+    account_attempt: int | None = None
+    node_switch_count: int | None = None
     max_account_attempts: int | None = None
     status: str | None = None
     handler_queue_ms: int | None = None
     stream_first_queue_ms: int | None = None
     account_wait_ms: int | None = None
+    account_slot_wait_ms: int | None = None
+    account_refresh_ms: int | None = None
+    account_remote_check_ms: int | None = None
     egress_wait_ms: int | None = None
     upload_ms: int | None = None
     bootstrap_ms: int | None = None
@@ -250,6 +257,7 @@ class MonitorRecordView(StrictMonitorModel):
     image_account_attempt: int | None = None
     image_account_max_attempts: int | None = None
     image_account_switch_count: int | None = None
+    image_node_switch_count: int | None = None
     attempt_count: int | None = None
     switch_count: int | None = None
     image_requested_count: int | None = None

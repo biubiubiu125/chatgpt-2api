@@ -215,6 +215,8 @@ def _resolve_image_urls_with_monitor(
             **kwargs,
         )
     except Exception as exc:
+        if conversation_id and not getattr(exc, "conversation_id", ""):
+            setattr(exc, "conversation_id", conversation_id)
         if request.trace_image_perf:
             result_timing = _backend_image_result_timing_data(
                 backend,
@@ -1646,9 +1648,7 @@ def _recover_after_image_stream_timeout(
     )
 
 
-def _cleanup_image_conversations_after_success(backend: OpenAIBackendAPI, outputs: Iterable[ImageOutput]) -> None:
-    if not config.image_remove_conversation_after_result:
-        return
+def _image_result_conversation_ids(outputs: Iterable[ImageOutput]) -> list[str]:
     conversation_ids: list[str] = []
     seen: set[str] = set()
     for output in outputs:
@@ -1657,16 +1657,26 @@ def _cleanup_image_conversations_after_success(backend: OpenAIBackendAPI, output
             continue
         seen.add(conversation_id)
         conversation_ids.append(conversation_id)
-    for conversation_id in conversation_ids:
-        try:
-            backend.delete_conversation(conversation_id)
-            logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_remove_failed",
-                "conversation_id": conversation_id,
-                "error": diagnostic_excerpt(exc, 500),
-            })
+    return conversation_ids
+
+
+def _finish_image_backend(
+        backend: OpenAIBackendAPI | None,
+        egress_acquired: bool,
+        outputs: Iterable[ImageOutput],
+) -> None:
+    """Release the image egress lease, then close upstream off the caller."""
+    if backend is None:
+        return
+    if egress_acquired:
+        proxy_settings.release_image_egress(backend.proxy_profile)
+    finish = getattr(backend, "finish_without_blocking", None)
+    if callable(finish):
+        finish(_image_result_conversation_ids(outputs))
+        return
+    close = getattr(backend, "close", None)
+    if callable(close):
+        close()
 
 
 def _image_result_output_from_urls(
@@ -2258,6 +2268,7 @@ def _generate_single_image(
             or (
                 conversation_id
                 and failure.code in {
+                    "image_followup_unavailable",
                     "image_poll_timeout",
                     "image_stream_timeout",
                     "image_stream_interrupted",
@@ -2638,6 +2649,8 @@ def _generate_single_image(
         backend: OpenAIBackendAPI | None = None
         egress_acquired = False
         using_fallback_profile = False
+        outputs: list[ImageOutput] = []
+        hide_image_conversations = False
         try:
             egress_started = time.perf_counter()
             explicit_profile = None
@@ -2844,7 +2857,7 @@ def _generate_single_image(
                     conversation_id=attempt_conversation_id,
                     image_attempts=image_attempts,
                 )
-            _cleanup_image_conversations_after_success(backend, outputs)
+            hide_image_conversations = True
             finalize_image_slot(True)
             attach_attempts_to_outputs(outputs)
             if request.trace_image_perf:
@@ -2892,6 +2905,14 @@ def _generate_single_image(
             ):
                 failure = image_failure("task_interrupted", raw_detail=str(exc))
             attempt_conversation_id = str(getattr(exc, "conversation_id", "") or attempt_conversation_id)
+            if attempt_conversation_id:
+                _note_image_session(
+                    request,
+                    attempt_conversation_id,
+                    attempt_access_token,
+                    checkpointed_conversations,
+                    index,
+                )
             stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
             http_timing = _backend_http_timing_data(backend)
             early_connection_failure = _pre_image_connection_failure(
@@ -2981,7 +3002,11 @@ def _generate_single_image(
                         setattr(image_error, attr, getattr(exc, attr))
 
             if (
-                failure.code in {"image_poll_timeout", "image_download_failed"}
+                failure.code in {
+                    "image_download_failed",
+                    "image_followup_unavailable",
+                    "image_poll_timeout",
+                }
                 and attempt_access_token
                 and not str(getattr(image_error, "account_token_fingerprint", "") or "").strip()
             ):
@@ -3015,10 +3040,11 @@ def _generate_single_image(
                 raise
             raise image_error from exc
         finally:
-            if egress_acquired and backend is not None:
-                proxy_settings.release_image_egress(backend.proxy_profile)
-            if backend is not None:
-                backend.close()
+            _finish_image_backend(
+                backend,
+                egress_acquired,
+                outputs if hide_image_conversations else (),
+            )
 
 
 def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:

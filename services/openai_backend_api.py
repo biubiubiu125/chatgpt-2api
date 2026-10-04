@@ -2,13 +2,16 @@ import base64
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import threading
 import time
+import weakref
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures.thread import _threads_queues, _worker
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -16,6 +19,7 @@ from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
 from curl_cffi import CurlInfo, CurlOpt, requests
+from curl_cffi.requests.models import STREAM_END
 from PIL import Image
 
 from services.account_service import account_service
@@ -48,12 +52,179 @@ from services.image_failure import (
 )
 from services.protocol.reasoning import normalize_thinking_effort
 from services.provider_asset_url import ProviderAssetUrlError, resolve_provider_asset_url
-from services.proxy_service import ProxyRuntimeProfile, proxy_settings
+from services.proxy_service import ImageEgressDeadlineError, ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.diagnostics import diagnostic_excerpt
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
+
+class _ImageUpstreamClosePool(ThreadPoolExecutor):
+    """Four daemon workers. submit() queues; it does not close on the caller."""
+
+    def _adjust_thread_count(self) -> None:
+        # CPython 3.13 starts non-daemon workers. Those idle threads would
+        # keep the process alive after the image call has already returned.
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_ref: object, q: Any = self._work_queue) -> None:
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            worker = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self._threads.add(worker)
+            _threads_queues[worker] = self._work_queue
+
+
+_IMAGE_UPSTREAM_CLOSE_POOL = _ImageUpstreamClosePool(
+    max_workers=4,
+    thread_name_prefix="image-upstream-close",
+)
+
+
+def _submit_image_upstream_close(target: Callable[..., None], *args: Any) -> bool:
+    """Queue one upstream teardown. Never raises and never blocks on close."""
+    try:
+        _IMAGE_UPSTREAM_CLOSE_POOL.submit(target, *args)
+        return True
+    except Exception as exc:
+        logger.warning({
+            "event": "image_upstream_close_failed",
+            "stage": "submit",
+            "error": diagnostic_excerpt(exc, 500),
+        })
+    try:
+        threading.Thread(
+            target=target,
+            args=args,
+            name="image-upstream-close",
+            daemon=True,
+        ).start()
+        return True
+    except Exception as exc:
+        logger.warning({
+            "event": "image_upstream_close_failed",
+            "stage": "submit",
+            "error": diagnostic_excerpt(exc, 500),
+        })
+        return False
+
+
+def _signal_stream_quit(response: Any) -> None:
+    quit_now = getattr(response, "quit_now", None)
+    setter = getattr(quit_now, "set", None)
+    if not callable(setter):
+        return
+    try:
+        setter()
+    except Exception:
+        return
+
+
+def _close_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning({
+            "event": "image_upstream_close_failed",
+            "stage": "response",
+            "error": diagnostic_excerpt(exc, 500),
+        })
+
+
+def _take_request_curl(session: Any) -> Any:
+    """Remove the curl handle this thread used, without closing it.
+
+    curl_cffi Session.close() only closes the calling thread's thread-local
+    handle. The background closer must close this object itself.
+    """
+    if session is None:
+        return None
+    try:
+        local = getattr(session, "_local", None)
+        if local is not None:
+            curl = getattr(local, "curl", None)
+            if curl is not None:
+                try:
+                    del local.curl
+                except Exception:
+                    try:
+                        local.curl = None
+                    except Exception:
+                        pass
+                return curl
+        if getattr(session, "_use_thread_local_curl", True):
+            return None
+        curl = getattr(session, "_curl", None)
+        if curl is None:
+            return None
+        try:
+            session._curl = None
+        except Exception:
+            pass
+        return curl
+    except Exception:
+        return None
+
+
+def _restore_request_curl(session: Any, curl: Any) -> None:
+    if session is None or curl is None:
+        return
+    local = getattr(session, "_local", None)
+    if local is None or getattr(local, "curl", None) is not None:
+        return
+    try:
+        local.curl = curl
+    except Exception:
+        return
+
+
+def _close_request_curl(curl: Any) -> None:
+    if curl is None:
+        return
+    close = getattr(curl, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning({
+            "event": "image_upstream_close_failed",
+            "stage": "request_curl",
+            "error": diagnostic_excerpt(exc, 500),
+        })
+
+
+def _close_detached_stream(response: Any, session: Any, request_curl: Any = None) -> None:
+    _close_response(response)
+    _close_request_curl(request_curl)
+    if session is None:
+        return
+    try:
+        session.close()
+    except Exception as exc:
+        logger.warning({
+            "event": "image_upstream_close_failed",
+            "stage": "generation_session",
+            "error": diagnostic_excerpt(exc, 500),
+        })
 from utils.turnstile import solve_turnstile_token
 
 
@@ -237,25 +408,46 @@ class _CurlResponseStream:
         self.headers = response.headers
         self.status = int(getattr(response, "status_code", 0) or 0)
         self._pending = bytearray()
-        self._chunks = iter(response.iter_content())
         self._eof = False
+        # curl_cffi's iter_content() finalizes the stream on the caller thread
+        # when it sees STREAM_END. Image Codex must read the queue itself so
+        # EOF can return before HTTP/3 teardown.
+        self._queue = getattr(response, "queue", None)
+        self._chunks = None if self._queue is not None else iter(response.iter_content())
 
-    def _fill(self) -> None:
+    def _fill(self, timeout: float | None = None) -> bool:
+        """Read one chunk. False means the wait timed out and nothing arrived."""
         if self._eof:
-            return
-        try:
-            chunk = next(self._chunks)
-        except StopIteration:
-            self._eof = True
-            return
+            return True
+        if self._queue is not None:
+            try:
+                chunk = self._queue.get() if timeout is None else self._queue.get(timeout=timeout)
+            except queue.Empty:
+                return False
+            if isinstance(chunk, BaseException):
+                raise chunk
+            if chunk is STREAM_END:
+                self._eof = True
+                return True
+        else:
+            # No queue means the transport cannot be polled. Keep the old
+            # blocking read; production streams always have a queue.
+            try:
+                chunk = next(self._chunks)
+            except StopIteration:
+                self._eof = True
+                return True
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
         if chunk:
             self._pending.extend(chunk)
+        return True
 
-    def readline(self) -> bytes:
+    def readline(self, timeout: float | None = None) -> bytes | None:
+        """Return one line, b\"\" at EOF, or None if the wait timed out."""
         while b"\n" not in self._pending and not self._eof:
-            self._fill()
+            if not self._fill(timeout):
+                return None
         if not self._pending:
             return b""
         index = self._pending.find(b"\n")
@@ -274,6 +466,17 @@ class _CurlResponseStream:
         self._pending.clear()
         return data
 
+    def read_chunk(self, timeout: float | None = None) -> bytes | None:
+        """Return buffered bytes, b\"\" at EOF, or None if the wait timed out."""
+        if not self._fill(timeout):
+            if not self._pending:
+                return None
+        if self._eof and not self._pending:
+            return b""
+        data = bytes(self._pending)
+        self._pending.clear()
+        return data
+
     def close(self) -> None:
         close = getattr(self._response, "close", None)
         if callable(close):
@@ -282,6 +485,49 @@ class _CurlResponseStream:
 
 class ImageRequestStopped(TimeoutError):
     """The image request was abandoned or its deadline passed during HTTP."""
+
+
+class ImageFollowupSessionError(RuntimeError):
+    """Poll or download cannot share the live generation session."""
+
+    def __init__(self, message: str = "image follow-up session is not isolated") -> None:
+        super().__init__(message)
+        self.failure = image_failure(
+            "image_followup_unavailable",
+            raw_detail=message,
+        )
+
+
+def _read_queued_response_text(response: Any, timeout_secs: float = 1.0) -> str:
+    """Read an error body already queued on a stream, without closing it.
+
+    Streaming responses keep ``content`` empty until something drains the
+    queue. ``response.text`` therefore hides the upstream error. Do not call
+    ``response.close()`` here; that waits for perform and then tears the
+    handle down on this thread.
+    """
+    if getattr(response, "queue", None) is None:
+        return str(getattr(response, "text", "") or "")
+    raw = _CurlResponseStream(response)
+    parts = bytearray()
+    deadline = time.monotonic() + max(0.0, min(float(timeout_secs or 0), 1.0))
+    while len(parts) < 65536:
+        remaining = deadline - time.monotonic()
+        piece = raw.read_chunk(timeout=0 if remaining <= 0 else min(0.05, remaining))
+        if not piece:
+            if piece == b"" or parts or time.monotonic() >= deadline:
+                break
+            continue
+        parts.extend(piece)
+        text = bytes(parts).decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        try:
+            json.loads(text)
+        except Exception:
+            continue
+        break
+    return bytes(parts).decode("utf-8", "replace")
 
 
 def _reraise_image_http_stopped(exc: BaseException) -> None:
@@ -440,6 +686,10 @@ class OpenAIBackendAPI:
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
+        self._close_handed_off = False
+        self._image_stream_completed = False
+        self._pending_detached_responses: list[Any] = []
+        self._deferred_upstream_closes: list[tuple[Any, Any, Any]] = []
         if use_global_proxy:
             # Account refresh and image calls ignore a stored account proxy.
             # That value is registration-only.
@@ -502,6 +752,8 @@ class OpenAIBackendAPI:
                 continue
 
     def close(self) -> None:
+        if getattr(self, "_close_handed_off", False):
+            return
         lock = getattr(self, "_image_http_lock", None)
         if lock is None:
             if getattr(self, "_closed", False):
@@ -517,10 +769,209 @@ class OpenAIBackendAPI:
                 return
             self._close_session_locked()
 
+    def _pending_detached_response_list(self) -> list[Any]:
+        pending = getattr(self, "_pending_detached_responses", None)
+        if not isinstance(pending, list):
+            pending = []
+            self._pending_detached_responses = pending
+        return pending
+
+    def _deferred_upstream_close_list(self) -> list[tuple[Any, Any, Any]]:
+        deferred = getattr(self, "_deferred_upstream_closes", None)
+        if not isinstance(deferred, list):
+            deferred = []
+            self._deferred_upstream_closes = deferred
+        return deferred
+
+    def detach_stream(self, response: Any, *, stream_completed: bool = False) -> None:
+        """Stop using the generation connection before poll and download.
+
+        The request thread swaps in a fresh session and returns. Closing the
+        SSE response and the generation session happens in the background, so
+        HTTP/3 teardown cannot sit in front of the image result. If a fresh
+        session cannot be opened, the response stays with this thread until
+        finish_without_blocking; a background close must not share the session.
+
+        ``stream_completed`` is true only when the SSE read finished on its
+        own. Timeout, cancellation, and connection errors must not skip the
+        first result poll.
+        """
+        self._image_stream_completed = bool(stream_completed)
+        _signal_stream_quit(response)
+        old_session = getattr(self, "session", None)
+        follow = None
+        if old_session is not None:
+            try:
+                follow = self._open_isolated_session()
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_followup_session_failed",
+                    "error": diagnostic_excerpt(exc, 500),
+                })
+        if follow is not None and follow is not old_session:
+            self._image_followup_blocked = False
+            self.session = follow
+            self.bind_image_stop(getattr(self, "abandoned", None))
+            request_curl = _take_request_curl(old_session)
+            if _submit_image_upstream_close(
+                _close_detached_stream,
+                response,
+                old_session,
+                request_curl,
+            ):
+                return
+            self._deferred_upstream_close_list().append((response, old_session, request_curl))
+            return
+        if old_session is not None:
+            self._image_followup_blocked = True
+        self._pending_detached_response_list().append(response)
+
+    def _require_isolated_image_session(self) -> None:
+        if getattr(self, "_image_followup_blocked", False):
+            raise ImageFollowupSessionError("image follow-up session is not isolated")
+
+    def finish_without_blocking(self, conversation_ids: list[str] | None = None) -> None:
+        """Release the caller before this backend's session is closed."""
+        if getattr(self, "_close_handed_off", False):
+            return
+        session = getattr(self, "session", None)
+        ids: list[str] = []
+        seen: set[str] = set()
+        for raw in conversation_ids or []:
+            conversation_id = str(raw or "").strip()
+            if not conversation_id or conversation_id in seen:
+                continue
+            seen.add(conversation_id)
+            ids.append(conversation_id)
+        request_curl = _take_request_curl(session)
+        pending_responses = list(self._pending_detached_response_list())
+        deferred = list(self._deferred_upstream_close_list())
+        try:
+            scheduled = _submit_image_upstream_close(
+                self._finish_image_upstream_later,
+                session,
+                ids,
+                getattr(self, "proxy_profile", None),
+                request_curl,
+                pending_responses,
+                deferred,
+            )
+        except Exception as exc:
+            logger.warning({
+                "event": "image_upstream_close_failed",
+                "stage": "submit",
+                "error": diagnostic_excerpt(exc, 500),
+            })
+            scheduled = False
+        if not scheduled:
+            _restore_request_curl(session, request_curl)
+            return
+        self._close_handed_off = True
+        self.session = None
+        self._pending_detached_responses = []
+        self._deferred_upstream_closes = []
+
+    def _finish_image_upstream_later(
+            self,
+            session: Any,
+            conversation_ids: list[str],
+            profile: Any,
+            request_curl: Any = None,
+            pending_responses: list[Any] | None = None,
+            deferred: list[tuple[Any, Any, Any]] | None = None,
+    ) -> None:
+        try:
+            self._wait_http_idle()
+            self._hide_image_conversations(session, conversation_ids, profile)
+        finally:
+            for response in pending_responses or []:
+                _close_response(response)
+            for response, old_session, old_curl in deferred or []:
+                _close_detached_stream(response, old_session, old_curl)
+            _close_request_curl(request_curl)
+            if session is None:
+                return
+            try:
+                session.close()
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_upstream_close_failed",
+                    "stage": "followup_session",
+                    "error": diagnostic_excerpt(exc, 500),
+                })
+
+    def _hide_image_conversations(
+            self,
+            session: Any,
+            conversation_ids: list[str],
+            profile: Any,
+    ) -> None:
+        if not conversation_ids or session is None or not config.image_remove_conversation_after_result:
+            return
+        acquired = False
+        lease = profile
+        saved_deadline = getattr(self, "deadline_monotonic", None)
+        try:
+            if profile is not None and bool(getattr(profile, "image_egress_reserved", False)):
+                lease = replace(profile, image_egress_reserved=False)
+            if lease is not None:
+                proxy_settings.acquire_image_egress(
+                    lease,
+                    deadline_monotonic=time.monotonic() + 2.0,
+                )
+                acquired = True
+            self.session = session
+            self.deadline_monotonic = None
+            for conversation_id in conversation_ids:
+                try:
+                    self.delete_conversation(conversation_id)
+                    logger.info({
+                        "event": "image_conversation_removed",
+                        "conversation_id": conversation_id,
+                    })
+                except Exception as exc:
+                    logger.warning({
+                        "event": "image_conversation_remove_failed",
+                        "conversation_id": conversation_id,
+                        "error": diagnostic_excerpt(exc, 500),
+                    })
+        except ImageEgressDeadlineError:
+            logger.warning({
+                "event": "image_conversation_hide_skipped",
+                "reason": "egress_lease",
+                "conversation_ids": conversation_ids,
+            })
+        except Exception as exc:
+            logger.warning({
+                "event": "image_conversation_hide_skipped",
+                "reason": "error",
+                "error": diagnostic_excerpt(exc, 500),
+            })
+        finally:
+            self.session = None
+            self.deadline_monotonic = saved_deadline
+            if acquired and lease is not None:
+                try:
+                    proxy_settings.release_image_egress(lease)
+                except Exception as exc:
+                    logger.warning({
+                        "event": "image_upstream_close_failed",
+                        "stage": "egress_release",
+                        "error": diagnostic_excerpt(exc, 500),
+                    })
+
     def _close_session_locked(self) -> None:
         if getattr(self, "_session_closed", False):
             return
         self._session_closed = True
+        pending_responses = list(getattr(self, "_pending_detached_responses", None) or [])
+        deferred = list(getattr(self, "_deferred_upstream_closes", None) or [])
+        self._pending_detached_responses = []
+        self._deferred_upstream_closes = []
+        for response in pending_responses:
+            _close_response(response)
+        for response, old_session, old_curl in deferred:
+            _close_detached_stream(response, old_session, old_curl)
         session = getattr(self, "session", None)
         if session:
             try:
@@ -535,6 +986,12 @@ class OpenAIBackendAPI:
             self._image_http_lock = lock
             self._http_inflight = 0
             self._session_closed = False
+            self._http_idle = threading.Event()
+            self._http_idle.set()
+        elif getattr(self, "_http_idle", None) is None:
+            self._http_idle = threading.Event()
+            if int(getattr(self, "_http_inflight", 0) or 0) <= 0:
+                self._http_idle.set()
         return lock
 
     def _note_http_started(self) -> None:
@@ -542,15 +999,63 @@ class OpenAIBackendAPI:
             if getattr(self, "_closed", False) or getattr(self, "_session_closed", False):
                 raise ImageRequestStopped("image request deadline exceeded")
             self._http_inflight = int(getattr(self, "_http_inflight", 0) or 0) + 1
+            idle = getattr(self, "_http_idle", None)
+            if idle is not None:
+                idle.clear()
 
     def _note_http_finished(self) -> None:
         with self._ensure_http_lock():
             self._http_inflight = max(0, int(getattr(self, "_http_inflight", 1) or 1) - 1)
-            if self._http_inflight == 0 and getattr(self, "_closed", False):
-                self._close_session_locked()
+            if self._http_inflight == 0:
+                idle = getattr(self, "_http_idle", None)
+                if idle is not None:
+                    idle.set()
+                if getattr(self, "_closed", False):
+                    self._close_session_locked()
 
-    def __del__(self):
-        self.close()
+    def _wait_http_idle(self) -> None:
+        """Block the closer, not the request thread, until curl perform has returned."""
+        if getattr(self, "_image_http_lock", None) is None and int(getattr(self, "_http_inflight", 0) or 0) <= 0:
+            return
+        lock = self._ensure_http_lock()
+        while True:
+            with lock:
+                if int(getattr(self, "_http_inflight", 0) or 0) <= 0:
+                    return
+            idle = getattr(self, "_http_idle", None)
+            if idle is None:
+                time.sleep(0.05)
+                continue
+            idle.wait(0.05)
+
+    def __del__(self) -> None:
+        # Never sync-close here. curl_easy_cleanup can block the thread that
+        # drops the last reference, which may still be returning the image.
+        try:
+            if getattr(self, "_close_handed_off", False) or getattr(self, "_closed", False):
+                return
+            session = getattr(self, "session", None)
+            request_curl = _take_request_curl(session)
+            pending = list(getattr(self, "_pending_detached_responses", None) or [])
+            deferred = list(getattr(self, "_deferred_upstream_closes", None) or [])
+            scheduled = _submit_image_upstream_close(
+                self._finish_image_upstream_later,
+                session,
+                [],
+                getattr(self, "proxy_profile", None),
+                request_curl,
+                pending,
+                deferred,
+            )
+            if not scheduled:
+                _restore_request_curl(session, request_curl)
+                return
+            self._close_handed_off = True
+            self.session = None
+            self._pending_detached_responses = []
+            self._deferred_upstream_closes = []
+        except Exception:
+            return
 
     def __enter__(self):
         return self
@@ -710,6 +1215,7 @@ class OpenAIBackendAPI:
             *,
             max_duration_secs: float | None = None,
             timing_key: str = "",
+            close_response: bool = True,
     ) -> Iterator[str]:
         started = time.perf_counter()
         last_event_at = started
@@ -725,6 +1231,7 @@ class OpenAIBackendAPI:
                 response,
                 max_duration_secs=max_duration_secs,
                 should_stop=stop_check,
+                close_response=close_response,
             ):
                 now = time.perf_counter()
                 gap_ms = int((now - last_event_at) * 1000)
@@ -1276,6 +1783,25 @@ class OpenAIBackendAPI:
         return []
 
     @staticmethod
+    def _codex_event_has_assembled_image(value: Any) -> bool:
+        """True when an image_generation_call already carries usable bytes."""
+        if isinstance(value, dict):
+            result = value.get("result")
+            if (
+                value.get("type") == "image_generation_call"
+                and isinstance(result, str)
+                and result.strip()
+            ):
+                return True
+            return any(
+                OpenAIBackendAPI._codex_event_has_assembled_image(item)
+                for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(OpenAIBackendAPI._codex_event_has_assembled_image(item) for item in value)
+        return False
+
+    @staticmethod
     def _codex_event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
         summary: Dict[str, Any] = {
             "type": str(event.get("type") or ""),
@@ -1363,24 +1889,37 @@ class OpenAIBackendAPI:
         status_code = getattr(raw, "status", None)
         timeout_secs = float(max_duration_secs or 0)
         started_at = time.monotonic()
-        timed_out = False
-        timer: threading.Timer | None = None
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
         body_parts: list[str] = []
         body_preview_len = 0
 
-        def _abort_stream() -> None:
-            nonlocal timed_out
-            timed_out = True
-            try:
-                raw.close()
-            except Exception:
-                pass
+        def _read_timeout() -> float | None:
+            if timeout_secs > 0 or stop_event is not None:
+                return 0.05
+            return None
 
-        def _raise_if_timeout() -> None:
-            if timeout_secs > 0 and (timed_out or time.monotonic() - started_at > timeout_secs):
-                raise TimeoutError(OpenAIBackendAPI._stream_timeout_message(timeout_secs))
+        def _stop_reason() -> str | None:
+            if stop_event is not None and stop_event.is_set():
+                return "stopped"
+            if timeout_secs > 0 and time.monotonic() - started_at >= timeout_secs:
+                return "timeout"
+            return None
+
+        def _raise_for_stop(reason: str) -> None:
+            if reason == "stopped":
+                raise TimeoutError("image request deadline exceeded")
+            raise TimeoutError(OpenAIBackendAPI._stream_timeout_message(timeout_secs))
+
+        def _image_ready() -> bool:
+            return any(OpenAIBackendAPI._codex_event_has_assembled_image(event) for event in events)
+
+        def _raise_if_unfinished() -> None:
+            if _image_ready():
+                return
+            reason = _stop_reason()
+            if reason is not None:
+                _raise_for_stop(reason)
 
         def _append_body(text: str) -> None:
             nonlocal body_preview_len
@@ -1406,6 +1945,8 @@ class OpenAIBackendAPI:
                 return False
             if isinstance(data, dict):
                 events.append(data)
+                if OpenAIBackendAPI._codex_event_has_assembled_image(data):
+                    return True
                 return str(data.get("type") or "") in {
                     "response.completed",
                     "response.failed",
@@ -1413,41 +1954,64 @@ class OpenAIBackendAPI:
                 }
             return False
 
-        if timeout_secs > 0:
-            timer = threading.Timer(timeout_secs, _abort_stream)
-            timer.daemon = True
-            timer.start()
-        finished = threading.Event()
-        if stop_event is not None:
-            def _watch_stop() -> None:
-                while not finished.is_set():
-                    if stop_event.is_set():
-                        _abort_stream()
-                        return
-                    finished.wait(0.05)
+        def _lines_have_image(lines: list[str]) -> bool:
+            payload_text = "\n".join(lines).strip()
+            if not payload_text or payload_text == "[DONE]":
+                return False
+            try:
+                data = json.loads(payload_text)
+            except Exception:
+                return False
+            return OpenAIBackendAPI._codex_event_has_assembled_image(data)
 
-            threading.Thread(target=_watch_stop, name="image-codex-stop", daemon=True).start()
+        def _parsed_json(buf: bytes) -> Dict[str, Any] | None:
+            text = buf.decode("utf-8", "replace").strip()
+            if not text:
+                return None
+            try:
+                data = json.loads(text)
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+
+        # Do not response.close() here. That waits for perform and then runs
+        # curl_easy_cleanup. The caller detaches and closes on another thread.
         try:
             if "application/json" in content_type:
-                _raise_if_timeout()
-                text = raw.read().decode("utf-8", "replace")
-                _raise_if_timeout()
-                _append_body(text)
-                try:
-                    data = json.loads(text)
-                    if isinstance(data, dict):
-                        events.append(data)
-                except Exception as exc:
-                    parse_errors.append(str(exc))
+                buf = bytearray()
+                while True:
+                    parsed = _parsed_json(buf)
+                    if parsed is not None:
+                        events.append(parsed)
+                        _append_body(bytes(buf).decode("utf-8", "replace"))
+                        break
+                    piece = raw.read_chunk(timeout=0) if _stop_reason() else None
+                    if piece is None:
+                        _raise_if_unfinished()
+                        piece = raw.read_chunk(timeout=_read_timeout())
+                    if piece is None:
+                        continue
+                    if piece == b"":
+                        text = bytes(buf).decode("utf-8", "replace")
+                        _append_body(text)
+                        try:
+                            data = json.loads(text) if text.strip() else None
+                            if isinstance(data, dict):
+                                events.append(data)
+                        except Exception as exc:
+                            parse_errors.append(str(exc))
+                        _raise_if_unfinished()
+                        break
+                    buf.extend(piece)
             else:
                 lines: list[str] = []
                 while True:
-                    _raise_if_timeout()
-                    if stop_event is not None and stop_event.is_set():
-                        _abort_stream()
-                        raise TimeoutError("image request deadline exceeded")
-                    raw_line = raw.readline()
-                    _raise_if_timeout()
+                    raw_line = raw.readline(timeout=0) if _stop_reason() else None
+                    if raw_line is None:
+                        _raise_if_unfinished()
+                        raw_line = raw.readline(timeout=_read_timeout())
+                        if raw_line is None:
+                            continue
                     if not raw_line:
                         break
                     line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
@@ -1461,16 +2025,14 @@ class OpenAIBackendAPI:
                             lines.clear()
                             break
                         lines.append(data_line)
+                        if _lines_have_image(lines):
+                            _flush_sse_event(lines)
+                            break
                 _flush_sse_event(lines)
-                _raise_if_timeout()
-        except Exception as exc:
-            if timed_out and timeout_secs > 0 and not isinstance(exc, TimeoutError):
-                raise TimeoutError(OpenAIBackendAPI._stream_timeout_message(timeout_secs)) from exc
-            raise
-        finally:
-            finished.set()
-            if timer is not None:
-                timer.cancel()
+                _raise_if_unfinished()
+        except Exception:
+            if not _image_ready():
+                raise
 
         event_types: Dict[str, int] = {}
         image_result_lengths: list[int] = []
@@ -1577,7 +2139,7 @@ class OpenAIBackendAPI:
         try:
             status_code = int(getattr(response, "status_code", 0) or 0)
             if status_code >= 400:
-                body_text = str(getattr(response, "text", "") or "")
+                body_text = _read_queued_response_text(response)
                 body: Any = body_text
                 try:
                     body = json.loads(body_text)
@@ -1588,18 +2150,13 @@ class OpenAIBackendAPI:
                 retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
                 raise UpstreamHTTPError(path, status_code, body, retry_after=retry_after)
             raw = _CurlResponseStream(response)
-            try:
-                yield from self._iter_codex_response_events(
-                    raw,
-                    max_duration_secs=stream_timeout,
-                    stop_event=getattr(self, "abandoned", None),
-                )
-            finally:
-                raw.close()
+            yield from self._iter_codex_response_events(
+                raw,
+                max_duration_secs=stream_timeout,
+                stop_event=getattr(self, "abandoned", None),
+            )
         finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
+            self.detach_stream(response)
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -1793,6 +2350,7 @@ class OpenAIBackendAPI:
 
     def _get_conversation(self, conversation_id: str, timeout_secs: float = 60) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
+        self._require_isolated_image_session()
         timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
@@ -1833,6 +2391,7 @@ class OpenAIBackendAPI:
         当 SSE 流太短导致 conversation_id 丢失时，可以通过此方法
         查找最近创建的对话来恢复 conversation_id。
         """
+        self._require_isolated_image_session()
         timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = f"/backend-api/conversations?offset=0&limit={limit}&order=updated&conversation_filter=all"
         try:
@@ -3370,13 +3929,15 @@ class OpenAIBackendAPI:
             initial_sediment_ids: list[str] | None = None,
             minimum_images: int = 0,
     ) -> tuple[list[str], list[str]]:
+        self._require_isolated_image_session()
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        Idle waits are fixed at 1 second and are not settings. The first wait adds
-        at most 0.2 seconds of jitter. ChatGPT image generation takes ~30s; polling
-        immediately wastes requests and trips a transient 429 the upstream returns
-        within ~200ms of the SSE stream closing (the conversation document is not
-        yet committed). Empty polls use the same 1 second. A single-image hit
+        Idle waits are fixed at 1 second and are not settings. The first wait
+        runs when there is no file id yet and the SSE stream has not completed,
+        and adds at most 0.2 seconds of jitter. A completed stream with no ids
+        skips that first wait so the result is not held after the stream has
+        already finished. Known ids still wait 1 second before the first query.
+        Empty polls use the same 1 second. A single-image hit
         returns on the first sufficient file/sediment id and does not confirm with
         another conversation query. Waiting for more pictures still uses that 1
         second interval. Empty conversation documents skip /backend-api/tasks
@@ -3430,6 +3991,7 @@ class OpenAIBackendAPI:
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
+            "stream_completed": bool(getattr(self, "_image_stream_completed", False)),
         })
 
         def _remaining() -> float:
@@ -3445,9 +4007,10 @@ class OpenAIBackendAPI:
             if sleep_for > 0:
                 self._sleep_for_image_poll(sleep_for)
 
+        stream_completed = bool(getattr(self, "_image_stream_completed", False))
         if has_initial_ids:
             _idle_sleep(min(self._IMAGE_POLL_IDLE_SECS, max(0.0, _remaining())))
-        elif initial_wait > 0:
+        elif initial_wait > 0 and not stream_completed:
             jitter = random.uniform(0, min(0.2, initial_wait * 0.2))
             _idle_sleep(initial_wait + jitter)
 
@@ -3818,6 +4381,7 @@ class OpenAIBackendAPI:
 
     def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
+        self._require_isolated_image_session()
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._bounded_image_timeout(60))
@@ -3827,6 +4391,7 @@ class OpenAIBackendAPI:
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
+        self._require_isolated_image_session()
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=self._bounded_image_timeout(60))
@@ -3850,6 +4415,7 @@ class OpenAIBackendAPI:
         返回：
         - 任务列表，每个任务包含 image_gen_message 等字段。
         """
+        self._require_isolated_image_session()
         timeout_secs = self._bounded_image_timeout(timeout_secs)
         path = "/backend-api/tasks"
         response = self.session.get(
@@ -3897,6 +4463,7 @@ class OpenAIBackendAPI:
 
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
+        self._require_isolated_image_session()
         urls: list[str] = []
         resolution_errors: list[tuple[ImageFailure, Exception]] = []
         skip_patterns = {"file_upload"}
@@ -4300,6 +4867,7 @@ class OpenAIBackendAPI:
         return []
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        self._require_isolated_image_session()
         images: list[bytes] = []
         for url in urls:
             try:
@@ -4420,21 +4988,27 @@ class OpenAIBackendAPI:
         self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
+        stream_completed = False
         try:
             for payload in self._iter_timed_sse_payloads(
                 response,
                 max_duration_secs=self._bounded_image_timeout(config.image_stream_timeout_secs),
                 timing_key="image_generation_stream",
+                close_response=False,
             ):
+                if payload == "[DONE]" or self._is_image_stream_terminal_payload(payload):
+                    stream_completed = True
                 yield payload
-                if self._is_image_stream_terminal_payload(payload):
+                if stream_completed:
                     logger.info({
                         "event": "image_stream_terminal_break",
                         "payload_preview": diagnostic_excerpt(payload, 1000),
                     })
                     break
+            else:
+                stream_completed = True
         finally:
-            response.close()
+            self.detach_stream(response, stream_completed=stream_completed)
 
     def _bootstrap(self, timeout_secs: float = 30.0, *, force: bool = False) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""

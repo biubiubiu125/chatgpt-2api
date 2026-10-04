@@ -534,6 +534,8 @@ def iter_sse_payloads(
     response: requests.Response,
     max_duration_secs: float | None = None,
     should_stop: Callable[[], bool] | None = None,
+    *,
+    close_response: bool = True,
 ) -> Iterator[str]:
     started_at = time.monotonic()
     timeout_secs = float(max_duration_secs or 0)
@@ -567,12 +569,12 @@ def iter_sse_payloads(
         return max(0.001, min(cap, remaining))
 
     def _abort_stream_nonblocking() -> None:
-        """Cancel curl_cffi streaming without waiting for its stream task.
+        """Stop waiting for more SSE bytes without tearing the handle down here.
 
-        curl_cffi's Response.iter_content() blocks on an internal queue.get()
-        without a timeout. Calling response.close() from a watchdog can block on
-        stream_task.result(), so enforce our own deadline and only signal/close
-        the underlying curl handle here.
+        curl_easy_cleanup can block this thread and race the executor's
+        curl_multi_perform. Image callers pass close_response=False and detach
+        the response, so only signal quit. Callers that still own the response
+        keep the previous handle close.
         """
         nonlocal aborted
         aborted = True
@@ -581,6 +583,8 @@ def iter_sse_payloads(
                 response.quit_now.set()
         except Exception:
             pass
+        if not close_response:
+            return
         try:
             if getattr(response, "curl", None):
                 response.curl.close()
@@ -597,20 +601,24 @@ def iter_sse_payloads(
             yield from _iter_response_content_with_deadline()
             return
         while True:
-            _raise_if_timeout()
-            _raise_if_stopped()
-            wait_secs = _wait_secs()
             try:
-                chunk = stream_queue.get(timeout=wait_secs)
+                chunk = stream_queue.get_nowait()
             except queue.Empty:
                 _raise_if_timeout()
                 _raise_if_stopped()
-                continue
-            if isinstance(chunk, RequestException):
+                wait_secs = _wait_secs()
                 try:
-                    response.close()
-                except Exception:
-                    pass
+                    chunk = stream_queue.get(timeout=wait_secs)
+                except queue.Empty:
+                    _raise_if_timeout()
+                    _raise_if_stopped()
+                    continue
+            if isinstance(chunk, RequestException):
+                if close_response:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
                 raise chunk
             if chunk is STREAM_END:
                 break
@@ -638,15 +646,18 @@ def iter_sse_payloads(
 
         threading.Thread(target=_produce, name="sse-response-reader", daemon=True).start()
         while True:
-            _raise_if_timeout()
-            _raise_if_stopped()
-            wait_secs = _wait_secs()
             try:
-                item = item_queue.get(timeout=wait_secs)
+                item = item_queue.get_nowait()
             except queue.Empty:
                 _raise_if_timeout()
                 _raise_if_stopped()
-                continue
+                wait_secs = _wait_secs()
+                try:
+                    item = item_queue.get(timeout=wait_secs)
+                except queue.Empty:
+                    _raise_if_timeout()
+                    _raise_if_stopped()
+                    continue
             if item is done:
                 break
             if isinstance(item, Exception):
@@ -660,8 +671,6 @@ def iter_sse_payloads(
             lines = chunk.splitlines()
             pending = lines.pop() if lines and chunk and lines[-1] and lines[-1][-1] == chunk[-1] else None
             for raw_line in lines:
-                _raise_if_timeout()
-                _raise_if_stopped()
                 if not raw_line:
                     continue
                 line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
@@ -682,7 +691,7 @@ def iter_sse_payloads(
             raise _timeout_error() from exc
         raise
     finally:
-        if not aborted:
+        if not aborted and close_response:
             try:
                 response.close()
             except Exception:
