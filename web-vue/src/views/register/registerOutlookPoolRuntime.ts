@@ -34,17 +34,17 @@ const resetCopy: Record<OutlookResetScope, ConfirmOptions> = {
   },
   invalid: {
     title: '清除异常标记',
-    message: '将清除 token_invalid 和 login_required 标记，但不会修复失效的 refresh_token；请确认材料已经重新导入或可重新尝试。',
+    message: '将清除 token_invalid、login_required 和连续收不到验证码后的停用标记，但不会修复失效的 refresh_token，也不会交还已经提交过的加号标签。',
     confirmText: '清除',
   },
   unused: {
     title: '清空已用邮箱',
-    message: '将清空 Outlook 邮箱池中的已用记录，可能导致后续重复尝试同一邮箱。',
+    message: '将移除没有使用记录的 Outlook 邮箱行。已提交过加号标签或已停用的主号会保留，refresh_token 不会被删掉。',
     confirmText: '清空',
   },
   all: {
     title: '重置全部邮箱池',
-    message: '将重置 Outlook 邮箱池状态，包括可用、占用、失败和已用记录。',
+    message: '将重置占用、失败、已用和停用状态。已经提交给注册平台的加号标签会保留，不会重新放回。',
     confirmText: '重置',
   },
 }

@@ -237,31 +237,6 @@
             </Checkbox>
           </label>
 
-          <label class="register-field">
-            <span class="register-label">每个邮箱别名数</span>
-            <Input
-              :model-value="provider.alias_per_email"
-              type="number"
-              min="0"
-              max="200"
-              block
-              :disabled="disabled || !provider.alias_enabled"
-              @update:model-value="value => emit('update-field', index, 'alias_per_email', numberModelValue(value))"
-            />
-          </label>
-
-          <label class="register-field">
-            <span class="register-label">别名前缀</span>
-            <Input
-              :model-value="provider.alias_prefix"
-              block
-              root-class="font-mono"
-              placeholder="c2api"
-              :disabled="disabled || !provider.alias_enabled"
-              @update:model-value="value => emit('update-field', index, 'alias_prefix', String(value || '').trim())"
-            />
-          </label>
-
           <label class="register-checkbox-field register-checkbox-field--compact">
             <Checkbox
               :model-value="provider.alias_include_original"
@@ -298,6 +273,8 @@
           <MetaChip size="xs" :tone="outlookSummary.invalid ? 'danger' : 'muted'">
             异常 {{ outlookSummary.invalid }}
           </MetaChip>
+          <MetaChip v-if="outlookSummary.retired" size="xs" tone="warning">停用 {{ outlookSummary.retired }}</MetaChip>
+          <MetaChip v-if="outlookSummary.submittedAlias" size="xs" tone="info">已提交别名 {{ outlookSummary.submittedAlias }}</MetaChip>
           <MetaChip v-if="outlookSummary.pending" size="xs" tone="info">
             待保存 {{ outlookSummary.pending }}
           </MetaChip>
@@ -324,6 +301,8 @@
           <MetaChip size="xs" tone="warning">需登录 {{ outlookSummary.loginRequired }}</MetaChip>
           <MetaChip size="xs" tone="warning">失效 {{ outlookSummary.tokenInvalid }}</MetaChip>
           <MetaChip size="xs" tone="warning">临时失败 {{ outlookSummary.failed }}</MetaChip>
+          <MetaChip v-if="outlookSummary.retired" size="xs" tone="warning">停用 {{ outlookSummary.retired }}</MetaChip>
+          <MetaChip v-if="outlookSummary.submittedAlias" size="xs" tone="info">已提交别名 {{ outlookSummary.submittedAlias }}</MetaChip>
         </div>
       </details>
     </div>

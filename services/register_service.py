@@ -110,6 +110,24 @@ def _outlook_credential_changed(old: dict | None, new: dict) -> bool:
     return False
 
 
+def _outlook_refresh_reset_addresses(credentials: list[dict]) -> list[str]:
+    """更新凭据时同时解除主号上的停用。加号行本身不是停用记录。"""
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for credential in credentials:
+        email = str(credential.get("email") or "").strip()
+        parent = mail_provider.outlook_alias_parent_email(
+            str(credential.get("login_email") or credential.get("alias_of") or email)
+        )
+        for item in (email, parent):
+            key = item.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            addresses.append(item.strip())
+    return addresses
+
+
 def _safe_bool(value: object, fallback: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -545,8 +563,7 @@ class RegisterService:
                 credentials = mail_provider.parse_outlook_credentials(
                     str(provider.get("mailboxes") or "")
                 )
-                expanded = mail_provider.expand_outlook_aliases(credentials, provider)
-                pool_stats = mail_provider.outlook_token_pool_stats(expanded)
+                pool_stats = mail_provider.outlook_token_pool_stats(credentials, provider)
                 if int(pool_stats.get("available") or 0) > 0:
                     return True
         return False
@@ -866,13 +883,13 @@ class RegisterService:
                 continue
             pool_text = str(provider.get("mailboxes") or "")
             base_credentials = mail_provider.parse_outlook_credentials(pool_text)
-            credentials = mail_provider.expand_outlook_aliases(base_credentials, provider)
+            pool_stats = mail_provider.outlook_token_pool_stats(base_credentials, provider)
             provider["mailboxes_configured"] = bool(pool_text.strip())
-            provider["mailboxes_count"] = len(credentials)
+            provider["mailboxes_count"] = len(base_credentials)
             provider["mailboxes_base_count"] = len(base_credentials)
-            provider["mailboxes_alias_count"] = max(0, len(credentials) - len(base_credentials))
-            provider["mailboxes_preview"] = [c["email"] for c in credentials]
-            provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
+            provider["mailboxes_alias_count"] = int(pool_stats.get("submitted_alias") or 0)
+            provider["mailboxes_preview"] = [c["email"] for c in base_credentials]
+            provider["mailboxes_stats"] = pool_stats
             provider["mailboxes_parse_stats"] = mail_provider.inspect_outlook_credentials(pool_text)
 
     def _drop_mail_proxy(self) -> None:
@@ -990,11 +1007,7 @@ class RegisterService:
                     if _outlook_credential_changed(old_credentials.get(credential["email"].strip().lower()), credential)
                 ]
                 if refreshed_credentials:
-                    refreshed_addresses = [
-                        item["email"]
-                        for credential in refreshed_credentials
-                        for item in mail_provider.expand_outlook_aliases([credential], provider)
-                    ]
+                    refreshed_addresses = _outlook_refresh_reset_addresses(refreshed_credentials)
                     mail_provider.clear_outlook_token_states(
                         refreshed_addresses,
                         states=mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES,
@@ -1206,8 +1219,7 @@ class RegisterService:
                 or self._runtime_lease_active_locked()
             ):
                 raise ValueError("注册任务仍在运行，请先停止再重置 Outlook 邮箱池")
-        if scope == "unused":
-            with self._lock:
+            if scope == "unused":
                 with file_lock(self._lock_path()):
                     self._config = self._load_unlocked()
                     removed = self._prune_unused_outlook_pools()
@@ -1215,17 +1227,17 @@ class RegisterService:
                     openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "total", "threads")})
                     self._save_unlocked()
                     self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
-            return self.get()
-        scope_aliases = {"failed": "retryable", "retryable": "retryable", "invalid": "invalid", "all": "all"}
-        scope = scope_aliases.get(scope, "all")
-        cleared = mail_provider.reset_outlook_token_pool_state(scope)
-        scope_label = {"retryable": "占用/临时失败", "invalid": "异常", "all": "全部"}[scope]
-        with self._lock:
-            self._reload_locked()
-            self._append_log(
-                f"已重置 Outlook 邮箱池状态（范围={scope_label}），清除 {cleared} 条记录",
-                "yellow",
-            )
+            else:
+                scope_aliases = {"failed": "retryable", "retryable": "retryable", "invalid": "invalid", "all": "all"}
+                if scope not in scope_aliases:
+                    raise ValueError(f"不支持的 Outlook 邮箱池重置范围: {scope}")
+                scope = scope_aliases[scope]
+                cleared = mail_provider.reset_outlook_token_pool_state(scope)
+                scope_label = {"retryable": "占用/临时失败", "invalid": "异常", "all": "全部"}[scope]
+                self._append_log(
+                    f"已重置 Outlook 邮箱池状态（范围={scope_label}），清除 {cleared} 条记录；已提交加号标签保留",
+                    "yellow",
+                )
         return self.get()
 
     def _append_log(self, text: str, color: str = "") -> None:
@@ -1478,6 +1490,16 @@ class RegisterService:
             self._append_log(f"注册任务异常退出: {exc}", "error")
             raise
         finally:
+            while futures:
+                self._bump(running=len(futures), done=done, success=success, fail=fail)
+                finished, futures = wait(
+                    futures,
+                    timeout=REGISTER_RUNTIME_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not finished:
+                    continue
+                collect_finished(finished)
             finish_runtime()
             if not run_failed:
                 self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")

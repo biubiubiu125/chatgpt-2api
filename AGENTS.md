@@ -29,7 +29,7 @@
 
 ## 当前版本
 
-- 当前版本是 `0.1.3`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
+- 当前版本是 `0.1.4`，以仓库根目录 `VERSION` 为准；`pyproject.toml`、`uv.lock`、`web-vue/package.json`、`web-vue/package-lock.json` 和 `CHANGELOG.md` 必须与它一致。
 - 默认 Web/API 端口是 `2080`，默认安装目录是 `/opt/chatgpt-2api`。`deploy/install.sh` 询问端口和图片访问地址；图片地址留空时结果链接保持相对路径，不使用请求里的 `Host`，只填域名或 IP 会写成 `https://` 地址后写入 `CHATGPT2API_BASE_URL`。
 - 图片同时出图默认 `16`，排队默认 `256`，分别是 `CHATGPT2API_IMAGE_TASK_WORKERS` 和 `CHATGPT2API_IMAGE_TASK_QUEUE_SIZE`。面板任务、OpenAI 出图、聊天生图和超时后续查共用；一次要 n 张就占 n 个名额，排满后同步接口和任务接口都会立刻拒绝。`CHATGPT2API_THREAD_TOKENS` 只是接口入口线程容量，不是同时出图数。
 - 对外图片和文件地址带签名，并保持在 `/images/`、`/image-thumbnails/` 或 `/files/`。`public_base_url` 只改主机，不改挂载路径。面板里的图库、工作台和日志预览改用当前打开站点的 `/images/`、`/image-thumbnails/`，不跟 `public_base_url`。只有带 `exp` 和 `sig` 的本站地址才改写，没有签名的远程地址保持原样。图片存储可切到 `r2`：对象写入 Cloudflare R2，返回的公开地址不签名；关闭 WebDAV 开关不会把 `r2` 改回本地。WebDAV 全量同步成功后删除对应 R2 对象，删除失败保留 tombstone。聊天和 Responses 的用户图片只接受公网地址；上游结果下载只允许 ChatGPT 资产域名，且不跟随跳转。一次多张图时，有图片成功就返回成功的图片。
@@ -43,6 +43,7 @@
 - 应用库启动时给已有表补上缺失的列。缺主键列就中止启动，不留到查询新列时才失败。
 - 上游原句「由于我这边发生了错误，我未能生成图片」及其英文译文才算账号侧出图故障，标点和空白忽略，改写不算。账号先标成「异常」，自动移除开着时立刻删除；「禁用」保持禁用且不删。这次仍按现有切号次数换号，不当成限流，也不只做远程校验。额度、审查、鉴权、下载失败和真实 HTTP 400 优先，不因正文里带这句原句而删号。凭据在这次请求里已经换过时不删新凭据。会话里已经出现这句原句时，最多再等 2 秒查一次任务，不等到轮询超时；这一轮已经返回图片后，后面再出现原句不删号。
 - 注册拿到 token 后，用同一会话只读访问 ChatGPT 首页和几个查询接口。访问失败只记警告，不让这次注册失败。
+- Outlook 加号别名不预生成。启用后领用时用 `secrets` 生成至少 2 位 `a-z0-9` 标签，`@` 左边不超过 64 字节。同一主号同时只领 1 个，租约 3600 秒；登录和收信仍用原邮箱凭据。平台请求实际发出后才记下已提交标签。Graph 和 IMAP 都查收件箱和垃圾箱，并用原始头匹配加号地址。连续三次精确的 `mailbox_wait_timeout` 或 `mailbox_login_wait_timeout` 且搜索完整时，主号标为停用，不删凭据行。重置全部状态保留已提交标签。刷新加号行会清掉主号停用和家庭租约，已用别名不动。
 - 请求写了明确尺寸时，结果图用 Pillow Lanczos 适配到该尺寸；适配失败就返回原图。不再提供图片放大开关和放大引擎设置。
 - 概览运行信息不显示应用版本和实例名称，其余项按两列自动上移。总出站流量和总入站流量与速率同一次采样，取当前网络命名空间里除回环外的网卡累计字节；读不到时显示 `--`，零字节显示 `0 B`。这不是本月流量，也不是只统计图片流量。
 - 版本检查用 `scripts/check_release_version.py`，发布占用检查用 `scripts/check_unpublished_release.sh`。执行要求见 `.codex/rules/git-and-release.md`。

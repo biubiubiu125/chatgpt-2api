@@ -164,7 +164,7 @@ export function defaultProvider(type = 'yyds_mail'): RegisterProvider {
         alias_enabled: false,
         alias_per_email: 5,
         alias_prefix: 'c2api',
-        alias_include_original: true,
+        alias_include_original: false,
       }
     case 'icloud_api':
       return { ...base, api_base: '', api_key: '' }
@@ -491,6 +491,7 @@ export function outlookPoolSummary(provider: RegisterProvider) {
   const failed = numeric(stats.failed)
   const retryable = numeric(stats.retryable) || failed
   const invalid = numeric(stats.invalid) || loginRequired + tokenInvalid
+  const retired = numeric(stats.retired)
 
   return {
     saved: numeric(provider.mailboxes_count),
@@ -503,39 +504,29 @@ export function outlookPoolSummary(provider: RegisterProvider) {
     failed,
     retryable,
     invalid,
-    abnormal: retryable + invalid,
+    retired,
+    submittedAlias: numeric(stats.submitted_alias) || numeric(provider.mailboxes_alias_count),
+    abnormal: numeric(stats.abnormal) || retryable + invalid + retired,
   }
 }
 
 export function outlookAliasSummary(provider: RegisterProvider) {
   const base = numeric(provider.mailboxes_base_count || provider.mailboxes_count)
   const alias = numeric(provider.mailboxes_alias_count)
-  const perEmail = numeric(provider.alias_per_email)
-  const includeOriginal = provider.alias_include_original !== false
-  const multiplier = provider.alias_enabled ? perEmail + (includeOriginal ? 1 : 0) : 1
-  const pending = pendingOutlookCount(provider)
   return {
     enabled: Boolean(provider.alias_enabled),
     base,
     alias,
-    perEmail,
-    includeOriginal,
-    multiplier,
-    pending,
-    pendingExpanded: provider.alias_enabled ? pending * multiplier : pending,
+    includeOriginal: provider.alias_include_original === true,
+    pending: pendingOutlookCount(provider),
   }
 }
 
 export function outlookAliasHint(provider: RegisterProvider) {
   const summary = outlookAliasSummary(provider)
   if (!summary.enabled) return '未启用加号别名，注册时直接使用导入邮箱。'
-  if (summary.pending > 0) {
-    return `保存后本次导入约展开为 ${summary.pendingExpanded} 个注册地址；登录和收信仍使用原邮箱凭据。`
-  }
-  if (summary.base > 0) {
-    return `已保存 ${summary.base} 个原邮箱，当前规则生成 ${summary.alias} 个别名地址；登录和收信仍使用原邮箱凭据。`
-  }
-  return '保存后会为 Outlook / Hotmail 地址生成加号别名；登录和收信仍使用原邮箱凭据。'
+  const submitted = summary.alias > 0 ? `已提交别名 ${summary.alias} 个。` : ''
+  return `启用后领用时生成至少 2 位随机标签，@ 左边不超过 64 字节，不预生成。同一主号同时只领 1 个；登录和收信仍使用原邮箱凭据。${submitted}`
 }
 
 export function outlookPoolHint(provider: RegisterProvider) {
@@ -544,6 +535,8 @@ export function outlookPoolHint(provider: RegisterProvider) {
   if (summary.saved <= 0) return '还没有保存 Microsoft 邮箱材料。'
   if (summary.invalid > 0) return `有 ${summary.invalid} 个异常邮箱，需要重新获取 refresh_token 或重新导入材料。`
   if (summary.retryable > 0 || summary.inUse > 0) return `有 ${summary.retryable} 个临时失败、${summary.inUse} 个占用，可在更多维护里释放后重试。`
+  if (summary.retired > 0 && summary.available <= 0) return `有 ${summary.retired} 个主号因连续收不到验证码已停用。`
+  if (summary.retired > 0) return `有 ${summary.retired} 个主号已停用，其余可继续领用。`
   if (summary.available <= 0) return '库存已用完，请导入新的 Microsoft 邮箱材料。'
   return `已保存 ${summary.saved} 个 Microsoft 邮箱材料。`
 }

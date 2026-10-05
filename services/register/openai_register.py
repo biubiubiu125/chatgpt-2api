@@ -531,7 +531,7 @@ def _mailbox_wait_timeout_error(
     register_proxy: str = "",
 ) -> RegisterError:
     mailbox = mailbox if isinstance(mailbox, dict) else {}
-    email = str(mailbox.get("email") or "").strip()
+    email = str(mailbox.get("address") or mailbox.get("login_email") or mailbox.get("email") or "").strip()
     provider = str(mailbox.get("provider") or mailbox.get("type") or mailbox.get("source") or "").strip() or "unknown"
     timeout = _mailbox_wait_timeout_seconds()
     proxy = str(register_proxy or "").strip() or "direct"
@@ -1253,6 +1253,14 @@ class PlatformRegistrar:
                 self._mailbox_result_error = ""
         return self._mailbox_result_ok
 
+    def _note_platform_email_sent(self, resp) -> None:
+        if resp is None or _is_cloudflare_challenge(resp) or not isinstance(self.mailbox, dict):
+            return
+        if str(self.mailbox.get("provider") or "") != "outlook_token":
+            return
+        self.mailbox["_platform_email_sent"] = True
+        mail_provider.mark_outlook_alias_submitted(self.mailbox)
+
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = _header_fingerprint(navigate_headers, self.fingerprint)
         if referer:
@@ -1327,6 +1335,7 @@ class PlatformRegistrar:
             ),
             verify=not proxy_settings.should_skip_ssl_verify(),
         )
+        self._note_platform_email_sent(resp)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
@@ -1342,6 +1351,7 @@ class PlatformRegistrar:
                 ),
                 verify=not proxy_settings.should_skip_ssl_verify(),
             )
+            self._note_platform_email_sent(resp)
             if _is_cloudflare_challenge(resp):
                 raise _cloudflare_block_error(resp, "Cloudflare 通行状态重试仍被拦截")
         if resp is None or resp.status_code != 200:
@@ -1382,7 +1392,7 @@ class PlatformRegistrar:
             headers = self._json_headers(f"{auth_base}/log-in?usernameKind=email")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue", self.fingerprint, sid=self.session_id)
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-            return request_with_local_retry(
+            resp, error = request_with_local_retry(
                 self.session,
                 "post",
                 url,
@@ -1391,6 +1401,8 @@ class PlatformRegistrar:
                 allow_redirects=False,
                 verify=not proxy_settings.should_skip_ssl_verify(),
             )
+            self._note_platform_email_sent(resp)
+            return resp, error
 
         resp, error = send()
         if _is_cloudflare_challenge(resp):

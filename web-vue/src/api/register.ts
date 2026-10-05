@@ -51,6 +51,8 @@ export type RegisterProvider = {
     login_required?: number
     token_invalid?: number
     failed?: number
+    retired?: number
+    submitted_alias?: number
     available?: number
     busy?: number
     retryable?: number

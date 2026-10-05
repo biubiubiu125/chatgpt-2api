@@ -3,14 +3,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import imaplib
+import itertools
+import logging
 import random
 import re
+import secrets
 import socket
 import string
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parsedate_to_datetime
@@ -31,17 +34,33 @@ from services.register.log_redaction import redact_register_log_text
 from services.register.provider_catalog import ALLOWED_MAIL_PROVIDER_TYPES, validate_provider_entries
 from utils.diagnostics import sanitize_diagnostic_text
 
+logger = logging.getLogger(__name__)
+
 OUTLOOK_TOKEN_USED_FILE = DATA_DIR / "outlook_token_used.json"
 _outlook_token_state_lock = Lock()
 # in_use 超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
-OUTLOOK_RECORDED_STATES = {"used", "in_use", "login_required", "token_invalid", "failed"}
-OUTLOOK_UNAVAILABLE_STATES = {"used", "login_required", "token_invalid", "failed"}
+OUTLOOK_ALIAS_TAG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+OUTLOOK_ALIAS_TAG_MIN_LENGTH = 2
+OUTLOOK_ALIAS_LOCAL_PART_MAX_BYTES = 64
+OUTLOOK_ALIAS_NO_CODE_RETIRE_STREAK = 3
+OUTLOOK_ALIAS_TAG_SAMPLE_ATTEMPTS = 128
+OUTLOOK_CODE_BOUNDARY_SKEW_SECONDS = 120
+OUTLOOK_CODE_SEARCH_MAX_MESSAGES = 200
+OUTLOOK_NO_CODE_TIMEOUT_CODES = {"mailbox_wait_timeout", "mailbox_login_wait_timeout"}
+OUTLOOK_OCCUPIED_TAG_STATES = {"used", "in_use", "failed", "retired", "login_required", "token_invalid"}
+OUTLOOK_GRAPH_INBOX_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+OUTLOOK_GRAPH_JUNK_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages"
+OUTLOOK_GRAPH_MESSAGE_SELECT = "subject,receivedDateTime,from,toRecipients,ccRecipients,body,bodyPreview,internetMessageHeaders"
+OUTLOOK_IMAP_JUNK_NAMES = ("Junk", "Junk Email", "垃圾邮件")
+OUTLOOK_RECORDED_STATES = {"used", "in_use", "login_required", "token_invalid", "failed", "retired"}
+OUTLOOK_UNAVAILABLE_STATES = {"used", "login_required", "token_invalid", "failed", "retired"}
 OUTLOOK_BUSY_STATES = {"in_use"}
 OUTLOOK_RETRYABLE_STATES = {"failed"}
 OUTLOOK_INVALID_STATES = {"login_required", "token_invalid"}
-OUTLOOK_CREDENTIAL_FATAL_STATES = OUTLOOK_INVALID_STATES
-OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES = OUTLOOK_RETRYABLE_STATES | OUTLOOK_INVALID_STATES
+OUTLOOK_RETIRED_STATES = {"retired"}
+OUTLOOK_CREDENTIAL_FATAL_STATES = OUTLOOK_INVALID_STATES | OUTLOOK_RETIRED_STATES
+OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES = OUTLOOK_RETRYABLE_STATES | OUTLOOK_INVALID_STATES | OUTLOOK_RETIRED_STATES
 
 
 def _outlook_token_state_file_lock_path():
@@ -59,10 +78,77 @@ def _outlook_state_transaction():
             yield
 
 
+def _normalize_submitted_tags(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    tags: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        tag = str(item or "").strip().lower()
+        if not tag or tag in seen or any(char not in OUTLOOK_ALIAS_TAG_ALPHABET for char in tag):
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tags
+
+
+def _normalize_family_lease(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    address = str(value.get("address") or "").strip().lower()
+    if not address:
+        return None
+    return {"address": address, "updated_at": str(value.get("updated_at") or "").strip()}
+
+
+def _normalize_no_code_streak(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _outlook_state_record(value: Any) -> dict[str, Any]:
+    """保留已提交标签、主号租约和连续未收码计数；旧记录缺省状态仍视为 used。"""
+    if isinstance(value, dict):
+        raw_state = value.get("state")
+        has_alias_meta = any(key in value for key in ("submitted_tags", "family_lease", "no_code_streak"))
+        if raw_state is None and not has_alias_meta:
+            state_name = "used"
+        else:
+            state_name = str(raw_state or "").strip()
+        record: dict[str, Any] = {
+            "state": state_name,
+            "reason": str(value.get("reason") or ""),
+            "updated_at": str(value.get("updated_at") or ""),
+        }
+        tags = _normalize_submitted_tags(value.get("submitted_tags"))
+        if tags:
+            record["submitted_tags"] = tags
+        lease = _normalize_family_lease(value.get("family_lease"))
+        if lease:
+            record["family_lease"] = lease
+        streak = _normalize_no_code_streak(value.get("no_code_streak"))
+        if streak:
+            record["no_code_streak"] = streak
+        return record
+    return {"state": str(value or "used").strip() or "used", "reason": "", "updated_at": ""}
+
+
+def _outlook_record_empty(record: dict[str, Any]) -> bool:
+    return not (
+        str(record.get("state") or "").strip()
+        or record.get("submitted_tags")
+        or record.get("family_lease")
+        or record.get("no_code_streak")
+    )
+
+
 def _load_outlook_token_state() -> dict[str, dict[str, Any]]:
-    """读取邮箱池状态文件，返回 {email_lower: {state, reason, updated_at}}。
+    """读取邮箱池状态文件，返回 {email_lower: record}。
 
     兼容旧格式：纯字符串列表（历史的“已用邮箱”）会被解释为 used。
+    主号记录上的 submitted_tags、family_lease、no_code_streak 必须保留。
     """
     data = read_json_file(
         OUTLOOK_TOKEN_USED_FILE,
@@ -79,16 +165,8 @@ def _load_outlook_token_state() -> dict[str, dict[str, Any]]:
     elif isinstance(data, dict):
         for key, value in data.items():
             email = str(key).strip().lower()
-            if not email:
-                continue
-            if isinstance(value, dict):
-                state[email] = {
-                    "state": str(value.get("state") or "used").strip() or "used",
-                    "reason": str(value.get("reason") or ""),
-                    "updated_at": str(value.get("updated_at") or ""),
-                }
-            else:
-                state[email] = {"state": str(value or "used").strip() or "used", "reason": "", "updated_at": ""}
+            if email:
+                state[email] = _outlook_state_record(value)
     return state
 
 
@@ -141,33 +219,204 @@ def _outlook_credential_available(store: dict[str, dict[str, Any]], credential: 
     return state not in OUTLOOK_CREDENTIAL_FATAL_STATES
 
 
+def _outlook_timestamp_stale(updated_at: str) -> bool:
+    text = str(updated_at or "").strip()
+    if not text:
+        return True
+    try:
+        ts = datetime.fromisoformat(text)
+    except Exception:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() >= OUTLOOK_IN_USE_STALE_SECONDS
+
+
+def _family_lease_active(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    lease = _normalize_family_lease(entry.get("family_lease"))
+    if not lease:
+        return False
+    return not _outlook_timestamp_stale(lease.get("updated_at") or "")
+
+
+def outlook_alias_parent_email(email: str) -> str:
+    text = str(email or "").strip().lower()
+    local, sep, domain = text.partition("@")
+    if not sep or not local or not domain:
+        return text
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
+def outlook_alias_tag_from_address(address: str, parent: str = "") -> str:
+    target = str(address or "").strip().lower()
+    parent_email = outlook_alias_parent_email(parent or target)
+    local, sep, domain = parent_email.partition("@")
+    if not sep:
+        return ""
+    prefix = f"{local}+"
+    suffix = f"@{domain}"
+    if not target.startswith(prefix) or not target.endswith(suffix) or len(target) <= len(prefix) + len(suffix):
+        return ""
+    tag = target[len(prefix):-len(suffix)]
+    if not tag or "+" in tag or any(char not in OUTLOOK_ALIAS_TAG_ALPHABET for char in tag):
+        return ""
+    return tag
+
+
+def _credential_parent_email(credential: dict[str, Any]) -> str:
+    email = str(credential.get("email") or "").strip().lower()
+    login = str(credential.get("login_email") or credential.get("alias_of") or "").strip().lower()
+    if login and login != email:
+        return outlook_alias_parent_email(login)
+    return outlook_alias_parent_email(email or login)
+
+
+def _outlook_record(store: dict[str, dict[str, Any]], address: str) -> dict[str, Any]:
+    current = store.get(str(address or "").strip().lower())
+    if isinstance(current, dict):
+        return _outlook_state_record(current)
+    return {"state": "", "reason": "", "updated_at": ""}
+
+
+def _store_outlook_record(store: dict[str, dict[str, Any]], address: str, record: dict[str, Any]) -> None:
+    key = str(address or "").strip().lower()
+    if not key:
+        return
+    cleaned = _outlook_state_record(record)
+    if _outlook_record_empty(cleaned):
+        store.pop(key, None)
+        return
+    store[key] = cleaned
+
+
+def _clear_family_lease(store: dict[str, dict[str, Any]], parent: str, address: str) -> None:
+    parent_key = outlook_alias_parent_email(parent)
+    target = str(address or "").strip().lower()
+    entry = store.get(parent_key)
+    lease = _normalize_family_lease(entry.get("family_lease") if isinstance(entry, dict) else None)
+    if not lease or lease["address"] != target:
+        return
+    record = _outlook_state_record(entry)
+    record.pop("family_lease", None)
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _store_outlook_record(store, parent_key, record)
+
+
+def _outlook_sibling_alias_in_use(store: dict[str, dict[str, Any]], parent_email: str) -> bool:
+    local, sep, domain = outlook_alias_parent_email(parent_email).partition("@")
+    if not sep:
+        return False
+    prefix = f"{local}+"
+    suffix = f"@{domain}"
+    for key, value in store.items():
+        if not str(key).startswith(prefix) or not str(key).endswith(suffix) or not isinstance(value, dict):
+            continue
+        if str(value.get("state") or "") == "in_use" and not _outlook_entry_available(value):
+            return True
+    return False
+
+
+def _outlook_family_blocked(store: dict[str, dict[str, Any]], parent_email: str) -> bool:
+    parent = outlook_alias_parent_email(parent_email)
+    entry = store.get(parent)
+    if isinstance(entry, dict):
+        state = str(entry.get("state") or "")
+        if state in OUTLOOK_CREDENTIAL_FATAL_STATES:
+            return True
+        if state == "in_use" and not _outlook_entry_available(entry):
+            return True
+        if _family_lease_active(entry):
+            return True
+    return _outlook_sibling_alias_in_use(store, parent)
+
+
+def outlook_occupied_alias_tags(parent_email: str, store: dict[str, dict[str, Any]] | None = None) -> set[str]:
+    parent = outlook_alias_parent_email(parent_email)
+    if store is None:
+        with _outlook_state_transaction():
+            store = _load_outlook_token_state()
+    tags: set[str] = set()
+    entry = store.get(parent) if isinstance(store, dict) else None
+    if isinstance(entry, dict):
+        tags.update(_normalize_submitted_tags(entry.get("submitted_tags")))
+        if _family_lease_active(entry):
+            leased = outlook_alias_tag_from_address(str((entry.get("family_lease") or {}).get("address") or ""), parent)
+            if leased:
+                tags.add(leased)
+    local, sep, domain = parent.partition("@")
+    if not sep:
+        return tags
+    prefix = f"{local}+"
+    suffix = f"@{domain}"
+    for key, value in store.items():
+        if not str(key).startswith(prefix) or not str(key).endswith(suffix):
+            continue
+        tag = outlook_alias_tag_from_address(str(key), parent)
+        if not tag or not isinstance(value, dict):
+            continue
+        state = str(value.get("state") or "")
+        if state == "in_use" and _outlook_entry_available(value):
+            continue
+        if state in OUTLOOK_OCCUPIED_TAG_STATES:
+            tags.add(tag)
+    return tags
+
+
+def outlook_no_code_streak(parent_email: str) -> int:
+    parent = outlook_alias_parent_email(parent_email)
+    with _outlook_state_transaction():
+        store = _load_outlook_token_state()
+    entry = store.get(parent)
+    if not isinstance(entry, dict):
+        return 0
+    return _normalize_no_code_streak(entry.get("no_code_streak"))
+
+
 def _set_outlook_token_state(address: str, state: str, reason: str = "") -> None:
     target = str(address or "").strip().lower()
     if not target:
         return
     with _outlook_state_transaction():
         store = _load_outlook_token_state()
-        store[target] = {"state": str(state), "reason": str(reason or ""), "updated_at": datetime.now(timezone.utc).isoformat()}
+        record = _outlook_record(store, target)
+        record["state"] = str(state)
+        record["reason"] = str(reason or "")
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _store_outlook_record(store, target, record)
         _save_outlook_token_state(store)
 
 
 def _release_outlook_token_state(address: str) -> None:
-    """把 in_use 释放回未使用（仅当当前确实是 in_use 时）。"""
+    """把 in_use 释放回未使用，并清掉指向该地址的主号租约。已提交标签保留。"""
     target = str(address or "").strip().lower()
     if not target:
         return
+    parent = outlook_alias_parent_email(target)
     with _outlook_state_transaction():
         store = _load_outlook_token_state()
         entry = store.get(target)
+        changed = False
         if isinstance(entry, dict) and str(entry.get("state") or "") == "in_use":
-            store.pop(target, None)
+            record = _outlook_state_record(entry)
+            record["state"] = ""
+            record["reason"] = ""
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _store_outlook_record(store, target, record)
+            changed = True
+        before = store.get(parent)
+        _clear_family_lease(store, parent, target)
+        if store.get(parent) != before:
+            changed = True
+        if changed:
             _save_outlook_token_state(store)
 
 
 def clear_outlook_token_states(addresses: list[str] | set[str], states: set[str] | None = None) -> int:
-    """清除指定邮箱的状态记录。
+    """清除指定邮箱的状态标记。
 
-    states 为空时清除任意状态；否则只清除指定状态。用于重新导入新凭据后释放旧失败标记，
+    states 为空时清除任意状态；否则只清除指定状态。已提交标签不删除。
     不应清除 used，避免已经成功消费的邮箱被误用。
     """
     targets = {str(item or "").strip().lower() for item in addresses}
@@ -176,28 +425,36 @@ def clear_outlook_token_states(addresses: list[str] | set[str], states: set[str]
         return 0
     with _outlook_state_transaction():
         store = _load_outlook_token_state()
-        remove: set[str] = set()
+        cleared = 0
+        now = datetime.now(timezone.utc).isoformat()
         for key in targets:
             entry = store.get(key)
             if not isinstance(entry, dict):
                 continue
             current = str(entry.get("state") or "")
-            if states is None or current in states:
-                remove.add(key)
-        for key in remove:
-            store.pop(key, None)
-        if remove:
+            if states is not None and current not in states:
+                continue
+            record = _outlook_state_record(entry)
+            if current == "retired":
+                record.pop("no_code_streak", None)
+            record.pop("family_lease", None)
+            record["state"] = ""
+            record["reason"] = ""
+            record["updated_at"] = now
+            _store_outlook_record(store, key, record)
+            cleared += 1
+        if cleared:
             _save_outlook_token_state(store)
-        return len(remove)
+        return cleared
 
 
 def reset_outlook_token_pool_state(scope: str = "all") -> int:
     """重置邮箱池状态文件。
 
-    scope=all 清空所有记录；
-    scope=retryable/failed 仅释放 in_use 与 failed（保留 used 和凭据失效状态）；
-    scope=invalid 仅释放 login_required/token_invalid，用于重新授权或重新导入 refresh_token 后手动恢复。
-    返回被清除的条目数。
+    scope=all 清除占用、失败、已用和停用，但保留已提交标签；
+    scope=retryable/failed 仅释放 in_use 与 failed，并清掉主号租约；
+    scope=invalid 释放 login_required、token_invalid 和 retired。
+    已提交标签在任何范围内都不交还。
     """
     normalized = str(scope or "all").strip().lower()
     allowed_scopes = {
@@ -215,70 +472,176 @@ def reset_outlook_token_pool_state(scope: str = "all") -> int:
         store = _load_outlook_token_state()
         if not store:
             return 0
+        now = datetime.now(timezone.utc).isoformat()
+        if normalized == "all":
+            preserved: dict[str, dict[str, Any]] = {}
+            changed = 0
+            for key, value in store.items():
+                tags = _normalize_submitted_tags(value.get("submitted_tags") if isinstance(value, dict) else None)
+                had_other = False
+                if isinstance(value, dict):
+                    had_other = bool(value.get("state") or value.get("family_lease") or value.get("no_code_streak") or value.get("reason"))
+                if tags:
+                    preserved[key] = {"state": "", "reason": "", "updated_at": "", "submitted_tags": tags}
+                    if had_other:
+                        changed += 1
+                else:
+                    changed += 1
+            _save_outlook_token_state(preserved)
+            return changed
         if normalized in {"failed", "retryable"}:
             target_states = OUTLOOK_RETRYABLE_STATES | OUTLOOK_BUSY_STATES
+            clear_lease = True
         elif normalized in {"invalid", "reauth"}:
-            target_states = OUTLOOK_INVALID_STATES
-        elif normalized in {"busy", "in_use"}:
+            target_states = OUTLOOK_INVALID_STATES | OUTLOOK_RETIRED_STATES
+            clear_lease = False
+        else:
             target_states = OUTLOOK_BUSY_STATES
-        elif normalized == "all":
-            target_states = set()
-        if target_states:
-            remove = {key for key, value in store.items() if str(value.get("state") or "") in target_states}
-            for key in remove:
-                store.pop(key, None)
-            _save_outlook_token_state(store)
-            return len(remove)
-        count = len(store)
-        _save_outlook_token_state({})
-        return count
+            clear_lease = True
+        changed = 0
+        for key, value in list(store.items()):
+            if not isinstance(value, dict):
+                continue
+            record = _outlook_state_record(value)
+            state = str(record.get("state") or "")
+            touched = False
+            if state in target_states:
+                if state == "retired":
+                    record.pop("no_code_streak", None)
+                record["state"] = ""
+                record["reason"] = ""
+                touched = True
+            if record.get("family_lease") and (clear_lease or state in target_states):
+                record.pop("family_lease", None)
+                touched = True
+            if touched:
+                record["updated_at"] = now
+                _store_outlook_record(store, key, record)
+                changed += 1
+        _save_outlook_token_state(store)
+        return changed
+
+
+def _outlook_credential_has_history(store: dict[str, dict[str, Any]], credential: dict[str, Any]) -> bool:
+    parent = _credential_parent_email(credential)
+    entry = store.get(parent)
+    if isinstance(entry, dict):
+        if _normalize_submitted_tags(entry.get("submitted_tags")):
+            return True
+        if str(entry.get("state") or "") in OUTLOOK_RECORDED_STATES or _family_lease_active(entry):
+            return True
+    local, sep, domain = parent.partition("@")
+    if not sep:
+        return False
+    prefix = f"{local}+"
+    suffix = f"@{domain}"
+    for key, value in store.items():
+        if not str(key).startswith(prefix) or not str(key).endswith(suffix):
+            continue
+        state = str(value.get("state") or "") if isinstance(value, dict) else ""
+        if state in OUTLOOK_RECORDED_STATES:
+            return True
+    return False
 
 
 def prune_outlook_unused_credentials(credentials: list[dict[str, str]], entry: dict | None = None) -> tuple[list[dict[str, str]], int]:
-    """Return credentials with recorded state, plus the number pruned as unused."""
+    """保留已有状态、已提交标签或停用记录的主号，不预展开别名。"""
+    del entry
     with _outlook_state_transaction():
         store = _load_outlook_token_state()
     kept: list[dict[str, str]] = []
     removed = 0
     for credential in credentials:
-        expanded = expand_outlook_aliases([credential], entry)
-        has_recorded = False
-        for item in expanded:
-            key = str(item.get("email") or "").strip().lower()
-            state_entry = store.get(key) if key else None
-            state = str(state_entry.get("state") or "") if isinstance(state_entry, dict) else ""
-            if state in OUTLOOK_RECORDED_STATES:
-                has_recorded = True
-                break
-        if has_recorded:
+        if _outlook_credential_has_history(store, credential):
             kept.append(credential)
         else:
             removed += 1
     return kept, removed
 
 
-def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None) -> dict[str, int]:
-    """统计邮箱池各状态数量。pool 为该 provider 当前导入的邮箱列表（用于算 unused）。"""
+def _empty_outlook_pool_counts() -> dict[str, int]:
+    return {
+        "unused": 0,
+        "in_use": 0,
+        "used": 0,
+        "login_required": 0,
+        "token_invalid": 0,
+        "failed": 0,
+        "retired": 0,
+        "submitted_alias": 0,
+    }
+
+
+def _count_outlook_family(counts: dict[str, int], store: dict[str, dict[str, Any]], credential: dict[str, Any]) -> None:
+    parent = _credential_parent_email(credential)
+    entry = store.get(parent) if isinstance(store.get(parent), dict) else {}
+    counts["submitted_alias"] += len(_normalize_submitted_tags(entry.get("submitted_tags")))
+    if not _outlook_family_blocked(store, parent):
+        counts["unused"] += 1
+        return
+    state = str(entry.get("state") or "")
+    if state in {"login_required", "token_invalid", "retired"}:
+        counts[state] += 1
+        return
+    counts["in_use"] += 1
+
+
+def _count_outlook_family_usage(counts: dict[str, int], store: dict[str, dict[str, Any]], parent: str) -> None:
+    parent_key = outlook_alias_parent_email(parent)
+    local, sep, domain = parent_key.partition("@")
+    if not sep:
+        return
+    prefix = f"{local}+"
+    suffix = f"@{domain}"
+    for key, value in store.items():
+        if not isinstance(value, dict):
+            continue
+        if key != parent_key and not (str(key).startswith(prefix) and str(key).endswith(suffix)):
+            continue
+        state = str(value.get("state") or "")
+        if state == "used":
+            counts["used"] += 1
+        elif state == "failed":
+            counts["failed"] += 1
+
+
+def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None, entry: dict | None = None) -> dict[str, int]:
+    """统计邮箱池各状态数量。启用别名时按主号统计，不把未生成的标签算进池子。"""
+    alias_enabled = _normalize_bool(entry.get("alias_enabled"), False) if isinstance(entry, dict) else False
     with _outlook_state_transaction():
         store = _load_outlook_token_state()
-        counts = {"unused": 0, "in_use": 0, "used": 0, "login_required": 0, "token_invalid": 0, "failed": 0}
+        counts = _empty_outlook_pool_counts()
         if pool:
+            seen_parents: set[str] = set()
             for credential in pool:
+                parent = _credential_parent_email(credential)
+                if alias_enabled and outlook_alias_supported(parent):
+                    if parent in seen_parents:
+                        continue
+                    seen_parents.add(parent)
+                    _count_outlook_family(counts, store, credential)
+                    _count_outlook_family_usage(counts, store, parent)
+                    continue
                 state = _outlook_credential_state(store, credential)
-                if state in counts:
+                if state == "retired":
+                    counts["retired"] += 1
+                elif state in counts:
                     counts[state] += 1
                 else:
                     counts["unused"] += 1
         else:
-            for entry in store.values():
-                state = str(entry.get("state") or "") if isinstance(entry, dict) else ""
-                if state in counts:
+            for value in store.values():
+                state = str(value.get("state") or "") if isinstance(value, dict) else ""
+                if state == "retired":
+                    counts["retired"] += 1
+                elif state in counts:
                     counts[state] += 1
+                counts["submitted_alias"] += len(_normalize_submitted_tags(value.get("submitted_tags") if isinstance(value, dict) else None))
         counts["available"] = counts["unused"]
         counts["busy"] = counts["in_use"]
         counts["retryable"] = counts["failed"]
         counts["invalid"] = counts["login_required"] + counts["token_invalid"]
-        counts["abnormal"] = counts["retryable"] + counts["invalid"]
+        counts["abnormal"] = counts["retryable"] + counts["invalid"] + counts["retired"]
         return counts
 
 
@@ -735,7 +1098,7 @@ def _mail_recipient_matches(mailbox: dict[str, Any], candidates: Any) -> bool:
     ).strip().lower()
     if not target:
         return False
-    values = _extract_text_candidates(candidates)
+    values = [item for item in _extract_text_candidates(candidates) if str(item or "").strip()]
     if not values:
         return False
     for _display_name, address in getaddresses(values):
@@ -760,6 +1123,7 @@ def _message_matches_email(data: dict[str, Any], email: str) -> bool:
         "delivered_to",
         "x_forwarded_to",
         "x_original_to",
+        "cc",
     ):
         if key in data:
             candidates.extend(_extract_text_candidates(data.get(key)))
@@ -842,13 +1206,48 @@ def _mailbox_code_boundary(mailbox: dict[str, Any]) -> datetime | None:
     return boundary.astimezone(timezone.utc)
 
 
+def _effective_code_boundary(mailbox: dict[str, Any] | None) -> datetime | None:
+    """Outlook 收信边界放宽固定时钟误差；其他供应商仍用原来的严格边界。"""
+    boundary = _mailbox_code_boundary(mailbox or {})
+    if not isinstance(boundary, datetime):
+        return None
+    if str((mailbox or {}).get("provider") or "") != "outlook_token":
+        return boundary
+    return boundary - timedelta(seconds=OUTLOOK_CODE_BOUNDARY_SKEW_SECONDS)
+
+
 def _message_before_code_boundary(mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
-    boundary = _mailbox_code_boundary(mailbox)
+    boundary = _effective_code_boundary(mailbox)
     received_at = message.get("received_at")
     if not isinstance(boundary, datetime) or not isinstance(received_at, datetime):
         return False
     current = received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
     return current.astimezone(timezone.utc) < boundary
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc)
+
+
+def _oldest_graph_received_at(items: list[dict[str, Any]]) -> datetime | None:
+    oldest: datetime | None = None
+    for item in items:
+        current = _as_utc(_parse_received_at(item.get("receivedDateTime")))
+        if current is not None and (oldest is None or current < oldest):
+            oldest = current
+    return oldest
+
+
+def _oldest_message_received_at(messages: list[dict[str, Any]]) -> datetime | None:
+    oldest: datetime | None = None
+    for item in messages:
+        current = _as_utc(item.get("received_at"))
+        if current is not None and (oldest is None or current < oldest):
+            oldest = current
+    return oldest
 
 
 def _message_before_received_after(mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
@@ -2053,6 +2452,18 @@ class OutlookTokenRateLimitError(OutlookTokenError):
     """Microsoft OAuth 临时限流，不代表 refresh_token 已失效。"""
 
 
+class OutlookAliasTagBusyError(RuntimeError):
+    """同一长度的加号标签随机抽取多次冲突，本次领用应稍后重试。"""
+
+
+class OutlookFolderMissing(RuntimeError):
+    """Graph 或 IMAP 垃圾箱不存在时只跳过该文件夹。"""
+
+
+class OutlookMailboxReadError(RuntimeError):
+    """IMAP 文件夹列表失败。不能把它当成没有垃圾箱。"""
+
+
 def _clean_outlook_value(value: str) -> str:
     return str(value or "").replace("﻿", "").replace(" ", " ").strip()
 
@@ -2186,39 +2597,89 @@ def outlook_alias_tag(prefix: str, index: int) -> str:
     return f"{clean_prefix}{index}"
 
 
-def expand_outlook_aliases(credentials: list[dict[str, str]], entry: dict | None = None) -> list[dict[str, str]]:
-    source = entry if isinstance(entry, dict) else {}
-    enabled = _normalize_bool(source.get("alias_enabled"), False)
-    per_email = _normalize_int(source.get("alias_per_email"), 0, 0, 200)
-    include_original = _normalize_bool(source.get("alias_include_original"), True)
-    prefix = str(source.get("alias_prefix") or "c2api").strip() or "c2api"
-    if not enabled or per_email <= 0:
-        return credentials
+def outlook_alias_max_tag_length(email: str) -> int:
+    parent = outlook_alias_parent_email(email)
+    local, sep, _domain = parent.partition("@")
+    if not sep or not local:
+        return 0
+    remaining = OUTLOOK_ALIAS_LOCAL_PART_MAX_BYTES - len(local.encode("utf-8")) - 1
+    return remaining if remaining >= OUTLOOK_ALIAS_TAG_MIN_LENGTH else 0
 
+
+def generate_outlook_alias_tag(email: str, occupied: set[str] | None = None) -> str | None:
+    """按需生成随机加号标签。2 位用尽后才加长，不预生成全部组合。"""
+    max_length = outlook_alias_max_tag_length(email)
+    if max_length < OUTLOOK_ALIAS_TAG_MIN_LENGTH:
+        return None
+    used = {str(item or "").strip().lower() for item in (occupied or set())}
+    used.discard("")
+    alphabet = OUTLOOK_ALIAS_TAG_ALPHABET
+    for length in range(OUTLOOK_ALIAS_TAG_MIN_LENGTH, max_length + 1):
+        capacity = len(alphabet) ** length
+        used_at_length = sum(1 for tag in used if len(tag) == length)
+        if used_at_length >= capacity:
+            continue
+        if length <= 2:
+            candidates = ["".join(chars) for chars in itertools.product(alphabet, repeat=length)]
+            free = [tag for tag in candidates if tag not in used]
+            if free:
+                return secrets.choice(free)
+            continue
+        for _ in range(OUTLOOK_ALIAS_TAG_SAMPLE_ATTEMPTS):
+            tag = "".join(secrets.choice(alphabet) for _ in range(length))
+            if tag not in used:
+                return tag
+        raise OutlookAliasTagBusyError("加号标签抽取冲突，请稍后重试")
+    return None
+
+
+def expand_outlook_aliases(credentials: list[dict[str, str]], entry: dict | None = None) -> list[dict[str, str]]:
+    """保留导入的主号。加号别名只在领用时生成，保存和预览不再预展开。"""
+    del entry
     expanded: list[dict[str, str]] = []
     seen: set[str] = set()
     for credential in credentials:
-        original = str(credential.get("login_email") or credential.get("email") or "").strip()
-        if include_original and credential.get("email"):
-            key = str(credential["email"]).strip().lower()
-            if key not in seen:
-                expanded.append(dict(credential))
-                seen.add(key)
-        if not outlook_alias_supported(original):
+        email = str(credential.get("email") or "").strip()
+        email_key = email.lower()
+        if not email_key or email_key in seen:
             continue
-        for index in range(1, per_email + 1):
-            alias_email = outlook_alias_address(original, outlook_alias_tag(prefix, index))
-            key = alias_email.lower()
-            if key in seen:
-                continue
-            expanded.append({
-                **credential,
-                "email": alias_email,
-                "login_email": original,
-                "alias_of": original,
-            })
-            seen.add(key)
+        seen.add(email_key)
+        expanded.append(dict(credential))
     return expanded
+
+
+def _remember_submitted_alias(store: dict[str, dict[str, Any]], mailbox: dict[str, Any]) -> bool:
+    """把已发出的加号写进当前状态。调用方必须已经持有状态锁。"""
+    if not _normalize_bool(mailbox.get("_platform_email_sent"), False):
+        return False
+    address = str(mailbox.get("address") or "").strip().lower()
+    parent = outlook_alias_parent_email(str(mailbox.get("login_email") or mailbox.get("alias_of") or address))
+    tag = outlook_alias_tag_from_address(address, parent)
+    if not tag or not parent:
+        return False
+    record = _outlook_record(store, parent)
+    tags = _normalize_submitted_tags(record.get("submitted_tags"))
+    if tag not in tags:
+        tags.append(tag)
+    record["submitted_tags"] = tags
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _store_outlook_record(store, parent, record)
+    return True
+
+
+def mark_outlook_alias_submitted(mailbox: dict[str, Any]) -> bool:
+    """平台请求发出后记住加号标签。原地址和未发出的领用不记。"""
+    address = str(mailbox.get("address") or "").strip().lower()
+    parent = outlook_alias_parent_email(str(mailbox.get("login_email") or mailbox.get("alias_of") or address))
+    if not outlook_alias_tag_from_address(address, parent):
+        return False
+    noted = dict(mailbox)
+    noted["_platform_email_sent"] = True
+    with _outlook_state_transaction():
+        store = _load_outlook_token_state()
+        _remember_submitted_alias(store, noted)
+        _save_outlook_token_state(store)
+    return True
 
 
 def _is_outlook_token_rate_limited(status_code: int, detail: str) -> bool:
@@ -2241,7 +2702,7 @@ def _retry_after_seconds(resp: Any, fallback: float) -> float:
 
 
 def _normalize_outlook_pool(value: Any, entry: dict | None = None) -> list[dict[str, str]]:
-    """邮箱池既支持纯文本，也支持对象列表；按 provider 配置展开 Outlook 加号别名。"""
+    """邮箱池既支持纯文本，也支持对象列表。加号别名不在这里预展开。"""
     source = entry if isinstance(entry, dict) else {}
     items: list[dict[str, str]] = []
     if isinstance(value, str):
@@ -2269,6 +2730,140 @@ def _normalize_outlook_pool(value: Any, entry: dict | None = None) -> list[dict[
     return expand_outlook_aliases(items, source)
 
 
+def _graph_folder_missing(status_code: int, detail: str) -> bool:
+    text = str(detail or "").lower()
+    return int(status_code) == 404 or "erroritemnotfound" in text or "errorfoldernotfound" in text
+
+
+def _parse_imap_list_line(line: Any) -> tuple[str, str] | None:
+    text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line or "")
+    match = re.search(r'\(([^)]*)\)\s+(?:NIL|"[^"]*")\s+(?:"((?:\\"|[^"])*)"|(\S+))\s*$', text)
+    if not match:
+        return None
+    name = (match.group(2) or match.group(3) or "").replace('\\"', '"')
+    if not name:
+        return None
+    return match.group(1) or "", name
+
+
+def _decode_imap_modified_utf7(value: str) -> str:
+    text = str(value or "")
+    decoded: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "&":
+            decoded.append(text[index])
+            index += 1
+            continue
+        end = text.find("-", index + 1)
+        if end < 0:
+            decoded.append(text[index:])
+            break
+        token = text[index + 1:end]
+        index = end + 1
+        if not token:
+            decoded.append("&")
+            continue
+        encoded = token.replace(",", "+")
+        padding = "=" * ((4 - len(encoded) % 4) % 4)
+        try:
+            decoded.append(base64.b64decode(encoded + padding).decode("utf-16-be"))
+        except Exception:
+            decoded.append(f"&{token}-")
+    return "".join(decoded)
+
+
+def _encode_imap_modified_utf7(value: str) -> str:
+    text = str(value or "")
+    encoded: list[str] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        raw = "".join(pending).encode("utf-16-be")
+        token = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        encoded.append(f"&{token}-")
+        pending.clear()
+
+    for char in text:
+        code = ord(char)
+        if 0x20 <= code <= 0x7E:
+            flush()
+            encoded.append("&-" if char == "&" else char)
+        else:
+            pending.append(char)
+    flush()
+    return "".join(encoded)
+
+
+def imap_command_mailbox(name: str) -> str:
+    """imaplib 不会给邮箱名加引号，也不会把非 ASCII 编成 modified UTF-7。
+
+    LIST 返回的 ASCII 名已经是线上形式，里面的 & 不能再编一次。
+    """
+    text = str(name or "")
+    if any(ord(char) < 0x20 or ord(char) > 0x7E for char in text):
+        text = _encode_imap_modified_utf7(text)
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def imap_junk_mailbox_name(boxes: list[tuple[str, str]]) -> str | None:
+    for flags, name in boxes:
+        if "\\Junk" in str(flags or ""):
+            return name
+    wanted = {item.lower() for item in OUTLOOK_IMAP_JUNK_NAMES}
+    for _flags, name in boxes:
+        leaf = _decode_imap_modified_utf7(str(name or "")).replace("\\", "/").split("/")[-1].strip().strip('"')
+        if leaf.lower() in wanted or leaf in OUTLOOK_IMAP_JUNK_NAMES:
+            return name
+    return None
+
+
+def _merge_mail_messages(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("message_id") or "") or f"anon:{id(item)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+    def sort_key(item: dict[str, Any]) -> float:
+        received = item.get("received_at")
+        if isinstance(received, datetime):
+            current = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
+            return current.timestamp()
+        return 0.0
+
+    merged.sort(key=sort_key, reverse=True)
+    return merged
+
+
+def _messages_include_target(messages: list[dict[str, Any]], mailbox: dict[str, Any]) -> bool:
+    target = str(mailbox.get("address") or "").strip()
+    if not target:
+        return True
+    return any(_message_matches_email(item, target) for item in messages)
+
+
+def _outlook_messages_have_current_code(messages: list[dict[str, Any]], mailbox: dict[str, Any]) -> bool:
+    target = str(mailbox.get("address") or "").strip()
+    for item in messages:
+        if _message_before_code_boundary(mailbox, item):
+            continue
+        if target and not _message_matches_email(item, target):
+            continue
+        if _extract_code(item):
+            return True
+    return False
+
+
 class OutlookTokenProvider(BaseMailProvider):
     """使用 refresh_token 读取 Outlook/Hotmail 邮箱验证码。
 
@@ -2288,6 +2883,9 @@ class OutlookTokenProvider(BaseMailProvider):
             self.mode = "auto"
         self.imap_host = str(entry.get("imap_host") or OUTLOOK_DEFAULT_IMAP_HOST).strip() or OUTLOOK_DEFAULT_IMAP_HOST
         self.message_limit = max(1, int(entry.get("message_limit") or 10))
+        self.alias_enabled = _normalize_bool(entry.get("alias_enabled"), False)
+        self.alias_include_original = _normalize_bool(entry.get("alias_include_original"), False)
+        self._graph_junk_missing_logged = False
         self.session = _create_session(conf)
 
     def close(self) -> None:
@@ -2298,6 +2896,7 @@ class OutlookTokenProvider(BaseMailProvider):
         last_detail = ""
         last_status = 0
         for attempt in range(max_attempts):
+            timeout = self._request_timeout()
             with http_target_session_request(self.session, OUTLOOK_TOKEN_URL) as request_options:
                 resp = self.session.post(
                     OUTLOOK_TOKEN_URL,
@@ -2306,7 +2905,7 @@ class OutlookTokenProvider(BaseMailProvider):
                         "Content-Type": "application/x-www-form-urlencoded",
                         "User-Agent": self.conf["user_agent"],
                     }, include_defaults=False),
-                    timeout=self._request_timeout(),
+                    timeout=timeout,
                     verify=not proxy_settings.should_skip_ssl_verify(),
                     **request_options,
                 )
@@ -2326,7 +2925,7 @@ class OutlookTokenProvider(BaseMailProvider):
             if _is_outlook_token_rate_limited(last_status, detail) and attempt < max_attempts - 1:
                 delay = _retry_after_seconds(resp, 1.5 * (attempt + 1) + random.uniform(0.5, 1.5))
                 if not self._sleep_with_deadline(delay):
-                    raise _MailWaitDeadlineExceeded("mail code wait deadline exceeded")
+                    raise OutlookTokenRateLimitError(f"OutlookToken 刷新被 Microsoft 限流: HTTP {last_status}, {detail}")
                 continue
             if _is_outlook_token_rate_limited(last_status, detail):
                 raise OutlookTokenRateLimitError(f"OutlookToken 刷新被 Microsoft 限流: HTTP {last_status}, {detail}")
@@ -2346,38 +2945,99 @@ class OutlookTokenProvider(BaseMailProvider):
         cache[scope] = (token, time.monotonic() + 600)
         return token
 
-    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        if not self.pool:
-            raise RuntimeError("OutlookToken 邮箱池为空，请在邮箱配置中导入 email----password----client_id----refresh_token")
-        with _outlook_state_transaction():
-            store = _load_outlook_token_state()
-            credential = next((item for item in self.pool if _outlook_credential_available(store, item)), None)
-            if credential is None:
-                raise RuntimeError(f"[{self.label}] OutlookToken 邮箱池暂无可用邮箱（共 {len(self.pool)} 个，已用尽或全部占用/失效），请导入新邮箱或重置池状态")
-            store[credential["email"].strip().lower()] = {"state": "in_use", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()}
-            _save_outlook_token_state(store)
+    def _mailbox_payload(self, credential: dict[str, str], address: str, login_email: str, alias_of: str = "") -> dict[str, Any]:
         return {
             "provider": self.name,
             "provider_ref": self.provider_ref,
-            "address": credential["email"],
-            "login_email": credential.get("login_email") or credential["email"],
-            "alias_of": credential.get("alias_of", ""),
+            "address": address,
+            "login_email": login_email,
+            "alias_of": alias_of,
             "label": self.label,
             "password": credential.get("password", ""),
             "client_id": credential["client_id"],
             "refresh_token": credential["refresh_token"],
         }
 
-    def _read_graph(self, access_token: str) -> list[dict[str, Any]]:
-        with http_target_session_request(self.session, OUTLOOK_GRAPH_MESSAGES_URL) as request_options:
+    def _claim_outlook_address(self, store: dict[str, dict[str, Any]], credential: dict[str, str], address: str, parent: str) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        key = str(address or "").strip().lower()
+        record = _outlook_record(store, key)
+        record["state"] = "in_use"
+        record["reason"] = ""
+        record["updated_at"] = now
+        _store_outlook_record(store, key, record)
+        if self.alias_enabled and outlook_alias_supported(parent):
+            parent_record = _outlook_record(store, parent)
+            parent_record["family_lease"] = {"address": key, "updated_at": now}
+            parent_record["updated_at"] = now
+            _store_outlook_record(store, parent, parent_record)
+        login_email = parent if key != parent else str(credential.get("login_email") or parent)
+        alias_of = parent if key != parent else str(credential.get("alias_of") or "")
+        payload = self._mailbox_payload(credential, key, login_email, alias_of)
+        payload["alias_enabled"] = bool(self.alias_enabled and outlook_alias_supported(parent))
+        return payload
+
+    def _claim_outlook_credential(self, store: dict[str, dict[str, Any]], credential: dict[str, str]) -> dict[str, Any] | None:
+        parent = _credential_parent_email(credential)
+        if not self.alias_enabled or not outlook_alias_supported(parent):
+            if not _outlook_credential_available(store, credential):
+                return None
+            address = str(credential.get("email") or "").strip()
+            return self._claim_outlook_address(store, credential, address, outlook_alias_parent_email(address))
+        if _outlook_family_blocked(store, parent):
+            return None
+        if self.alias_include_original:
+            original = dict(credential)
+            original["email"] = parent
+            original.pop("login_email", None)
+            original.pop("alias_of", None)
+            if _outlook_credential_available(store, original):
+                return self._claim_outlook_address(store, credential, parent, parent)
+        occupied = set(outlook_occupied_alias_tags(parent, store))
+        occupied.update(self._imported_plus_tags(parent))
+        tag = generate_outlook_alias_tag(parent, occupied)
+        if not tag:
+            logger.warning("OutlookToken 主号 %s 的本地部分放不下 2 位加号标签，已跳过", parent)
+            return None
+        return self._claim_outlook_address(store, credential, outlook_alias_address(parent, tag), parent)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.pool:
+            raise RuntimeError("OutlookToken 邮箱池为空，请在邮箱配置中导入 email----password----client_id----refresh_token")
+        with _outlook_state_transaction():
+            store = _load_outlook_token_state()
+            mailbox = None
+            for credential in self.pool:
+                mailbox = self._claim_outlook_credential(store, credential)
+                if mailbox is not None:
+                    break
+            if mailbox is None:
+                raise RuntimeError(f"[{self.label}] OutlookToken 邮箱池暂无可用邮箱（共 {len(self.pool)} 个，已用尽或全部占用/失效），请导入新邮箱或重置池状态")
+            _save_outlook_token_state(store)
+        return mailbox
+
+    def _imported_plus_tags(self, parent: str) -> set[str]:
+        parent_key = outlook_alias_parent_email(parent)
+        tags: set[str] = set()
+        for credential in self.pool:
+            email = str(credential.get("email") or "")
+            if outlook_alias_parent_email(email) != parent_key:
+                continue
+            tag = outlook_alias_tag_from_address(email, parent_key)
+            if tag:
+                tags.add(tag)
+        return tags
+
+    def _read_graph_page(self, access_token: str, url: str, params: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
+        with http_target_session_request(self.session, url) as request_options:
             resp = self.session.get(
-                OUTLOOK_GRAPH_MESSAGES_URL,
+                url,
                 headers=chrome146_headers({
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/json",
                     "User-Agent": self.conf["user_agent"],
                 }, include_defaults=False),
-                params={"$top": self.message_limit, "$orderby": "receivedDateTime desc", "$select": "subject,receivedDateTime,from,toRecipients,ccRecipients,body,bodyPreview"},
+                params=params,
                 timeout=self._request_timeout(),
                 verify=not proxy_settings.should_skip_ssl_verify(),
                 **request_options,
@@ -2388,9 +3048,69 @@ class OutlookTokenProvider(BaseMailProvider):
             data = {}
         if resp.status_code != 200:
             detail = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else resp.text
+            if _graph_folder_missing(resp.status_code, str(detail or "")):
+                raise OutlookFolderMissing(str(detail or resp.status_code))
             raise RuntimeError(f"OutlookToken Graph 失败: HTTP {resp.status_code}, {detail}")
         items = data.get("value") if isinstance(data, dict) else None
-        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        messages = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        next_url = str(data.get("@odata.nextLink") or "").strip() if isinstance(data, dict) else ""
+        return messages, next_url
+
+    def _read_graph_folder(self, access_token: str, url: str) -> list[dict[str, Any]]:
+        """按 message_limit 翻页，直到早于验证码边界或达到安全上限。"""
+        mailbox = getattr(self, "_graph_fetch_mailbox", None)
+        boundary = _effective_code_boundary(mailbox if isinstance(mailbox, dict) else None)
+        collected: list[dict[str, Any]] = []
+        next_url = ""
+        reached = boundary is None
+        seen_urls: set[str] = set()
+        saw_folder = False
+        hops = 0
+        while len(collected) < OUTLOOK_CODE_SEARCH_MAX_MESSAGES:
+            hops += 1
+            if hops > OUTLOOK_CODE_SEARCH_MAX_MESSAGES:
+                reached = False
+                break
+            request_url = next_url or url
+            if request_url in seen_urls:
+                reached = False
+                break
+            seen_urls.add(request_url)
+            params = None if next_url else {
+                "$top": self.message_limit,
+                "$orderby": "receivedDateTime desc",
+                "$select": OUTLOOK_GRAPH_MESSAGE_SELECT,
+            }
+            try:
+                items, next_url = self._read_graph_page(access_token, request_url, params)
+            except Exception:
+                # 第一页失败仍向外抛。后面的页失败时保留已读邮件，并算未查完。
+                if saw_folder:
+                    reached = False
+                    break
+                raise
+            saw_folder = True
+            if not items:
+                if next_url and boundary is not None:
+                    continue
+                reached = True
+                break
+            collected.extend(items)
+            if boundary is None:
+                reached = True
+                break
+            oldest = _oldest_graph_received_at(items)
+            if oldest is not None and oldest < boundary:
+                reached = True
+                break
+            if not next_url:
+                reached = True
+                break
+        self._last_folder_reached = reached
+        return collected[:OUTLOOK_CODE_SEARCH_MAX_MESSAGES]
+
+    def _read_graph(self, access_token: str) -> list[dict[str, Any]]:
+        return self._read_graph_folder(access_token, OUTLOOK_GRAPH_INBOX_MESSAGES_URL)
 
     @staticmethod
     def _graph_sender(message: dict[str, Any]) -> str:
@@ -2415,19 +3135,42 @@ class OutlookTokenProvider(BaseMailProvider):
                     recipients.append(value)
         return recipients
 
+    @staticmethod
+    def _graph_header_values(message: dict[str, Any], names: set[str]) -> list[str]:
+        headers = message.get("internetMessageHeaders")
+        if not isinstance(headers, list):
+            return []
+        values: list[str] = []
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            name = str(header.get("name") or "").strip().lower()
+            if name not in names:
+                continue
+            value = str(header.get("value") or "").strip()
+            if value:
+                values.append(value)
+        return values
+
     def _normalize_graph_item(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
         body = item.get("body") if isinstance(item.get("body"), dict) else {}
         content_type = str(body.get("contentType") or "").lower()
         content = str(body.get("content") or "")
         text_content = content if content_type != "html" else str(item.get("bodyPreview") or "")
         html_content = content if content_type == "html" else ""
+        recipients = self._graph_recipients(item)
+        recipients.extend(self._graph_header_values(item, {"to", "cc"}))
         return {
             "provider": self.name,
             "mailbox": mailbox["address"],
             "message_id": str(item.get("id") or ""),
             "subject": str(item.get("subject") or ""),
             "sender": self._graph_sender(item),
-            "to": self._graph_recipients(item),
+            "to": recipients,
+            "cc": self._graph_header_values(item, {"cc"}),
+            "delivered_to": self._graph_header_values(item, {"delivered-to"}),
+            "x_forwarded_to": self._graph_header_values(item, {"x-forwarded-to"}),
+            "x_original_to": self._graph_header_values(item, {"x-original-to"}),
             "text_content": text_content,
             "html_content": html_content,
             "received_at": _parse_received_at(item.get("receivedDateTime")),
@@ -2435,8 +3178,35 @@ class OutlookTokenProvider(BaseMailProvider):
         }
 
     def _graph_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
-        """返回最近 N 封邮件（Graph 已按 receivedDateTime desc 排序，最新在前）。"""
-        return [self._normalize_graph_item(mailbox, item) for item in self._read_graph(access_token)]
+        """收件箱和垃圾箱翻到验证码边界后按时间合并。垃圾箱不存在时只读收件箱。"""
+        previous = getattr(self, "_graph_fetch_mailbox", None)
+        self._graph_fetch_mailbox = mailbox
+        self._graph_junk_missing = False
+        try:
+            self._last_folder_reached = True
+            inbox_items = self._read_graph_folder(access_token, OUTLOOK_GRAPH_INBOX_MESSAGES_URL)
+            self._graph_inbox_reached = bool(self._last_folder_reached)
+            junk_items: list[dict[str, Any]] = []
+            try:
+                self._last_folder_reached = True
+                junk_items = self._read_graph_folder(access_token, OUTLOOK_GRAPH_JUNK_MESSAGES_URL)
+            except OutlookFolderMissing:
+                self._graph_junk_missing = True
+                self._graph_junk_reached = False
+                if not self._graph_junk_missing_logged:
+                    logger.warning("OutlookToken Graph 垃圾箱不可用，仅使用收件箱")
+                    self._graph_junk_missing_logged = True
+            except Exception:
+                if not inbox_items:
+                    raise
+                self._graph_junk_reached = False
+            else:
+                self._graph_junk_reached = bool(self._last_folder_reached)
+        finally:
+            self._graph_fetch_mailbox = previous
+        inbox = [self._normalize_graph_item(mailbox, item) for item in inbox_items]
+        junk = [self._normalize_graph_item(mailbox, item) for item in junk_items]
+        return _merge_mail_messages(inbox, junk)
 
     def _open_imap_ssl(self, proxy: str = ""):
         return _ProxiedIMAP4SSL(
@@ -2445,43 +3215,121 @@ class OutlookTokenProvider(BaseMailProvider):
             proxy=proxy,
         )
 
+    def _imap_list_mailboxes(self, imap) -> list[tuple[str, str]]:
+        try:
+            status, data = imap.list()
+        except Exception as exc:
+            raise OutlookMailboxReadError("OutlookToken IMAP 无法列出文件夹") from exc
+        if status != "OK":
+            raise OutlookMailboxReadError(f"OutlookToken IMAP 列出文件夹失败: {status}")
+        if not data:
+            return []
+        boxes: list[tuple[str, str]] = []
+        for line in data:
+            parsed = _parse_imap_list_line(line)
+            if parsed:
+                boxes.append(parsed)
+        return boxes
+
+    def _imap_fetch_uids(self, imap, mailbox: dict[str, Any], uids: list[bytes]) -> tuple[list[dict[str, Any]], int]:
+        messages: list[dict[str, Any]] = []
+        failed = 0
+        for uid in uids:
+            status, fetched = imap.uid("fetch", uid, "(INTERNALDATE RFC822)")
+            if status != "OK":
+                failed += 1
+                continue
+            raw_payload = b""
+            internal_received = None
+            for part in fetched or []:
+                if not (isinstance(part, tuple) and isinstance(part[1], bytes)):
+                    continue
+                meta = part[0].decode("utf-8", "replace") if isinstance(part[0], bytes) else str(part[0])
+                match = re.search(r'INTERNALDATE "([^"]+)"', meta)
+                if match:
+                    try:
+                        parsed = imaplib.Internaldate2tuple(b'INTERNALDATE "' + match.group(1).encode() + b'"')
+                        if parsed:
+                            internal_received = datetime.fromtimestamp(time.mktime(parsed), tz=timezone.utc)
+                    except Exception:
+                        internal_received = None
+                raw_payload = part[1]
+                break
+            if not raw_payload:
+                failed += 1
+                continue
+            messages.append(self._parse_imap_message(mailbox, raw_payload, internal_received))
+        return messages, failed
+
+    def _imap_fetch_selected(self, imap, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        status, data = imap.uid("search", None, "ALL")
+        if status != "OK":
+            self._last_folder_reached = False
+            return []
+        if not data or not data[0]:
+            self._last_folder_reached = True
+            return []
+        uids = data[0].split()
+        boundary = _effective_code_boundary(mailbox)
+        if boundary is None:
+            messages, failed = self._imap_fetch_uids(imap, mailbox, list(reversed(uids[-self.message_limit:])))
+            self._last_folder_reached = failed == 0
+            return messages
+        collected: list[dict[str, Any]] = []
+        index = len(uids)
+        reached = False
+        failed = 0
+        while index > 0 and len(collected) < OUTLOOK_CODE_SEARCH_MAX_MESSAGES:
+            start = max(0, index - self.message_limit)
+            batch = uids[start:index]
+            index = start
+            batch_messages, batch_failed = self._imap_fetch_uids(imap, mailbox, list(reversed(batch)))
+            failed += batch_failed
+            collected.extend(batch_messages)
+            oldest = _oldest_message_received_at(batch_messages)
+            if oldest is not None and oldest < boundary:
+                reached = failed == 0
+                break
+            if index == 0:
+                reached = failed == 0
+                break
+        self._last_folder_reached = reached
+        return collected[:OUTLOOK_CODE_SEARCH_MAX_MESSAGES]
+
+    def _imap_fetch_folder(self, imap, mailbox: dict[str, Any], folder: str, required: bool) -> list[dict[str, Any]]:
+        try:
+            status, _ = imap.select(imap_command_mailbox(folder), readonly=True)
+        except Exception:
+            status = "NO"
+        if status != "OK":
+            if required:
+                raise RuntimeError(f"OutlookToken IMAP select {folder} 失败")
+            self._last_folder_reached = False
+            logger.warning("OutlookToken IMAP 文件夹不可用，已跳过: %s", folder)
+            return []
+        return self._imap_fetch_selected(imap, mailbox)
+
     def _imap_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
-        """返回最近 N 封邮件，最新在前。"""
+        """收件箱和垃圾箱翻到验证码边界，最新在前。"""
         auth_string = f"user={mailbox.get('login_email') or mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
         imap = self._open_imap_ssl(_mail_imap_proxy(self.conf))
         try:
             imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
-            status, _ = imap.select("INBOX", readonly=True)
-            if status != "OK":
-                raise RuntimeError("OutlookToken IMAP select INBOX 失败")
-            status, data = imap.uid("search", None, "ALL")
-            if status != "OK" or not data or not data[0]:
-                return []
-            uids = data[0].split()[-self.message_limit :]
-            messages: list[dict[str, Any]] = []
-            for uid in reversed(uids):  # 最新在前
-                status, fetched = imap.uid("fetch", uid, "(INTERNALDATE RFC822)")
-                if status != "OK":
-                    continue
-                raw_payload = b""
-                internal_received = None
-                for part in fetched:
-                    if not (isinstance(part, tuple) and isinstance(part[1], bytes)):
-                        continue
-                    meta = part[0].decode("utf-8", "replace") if isinstance(part[0], bytes) else str(part[0])
-                    match = re.search(r'INTERNALDATE "([^"]+)"', meta)
-                    if match:
-                        try:
-                            parsed = imaplib.Internaldate2tuple(b'INTERNALDATE "' + match.group(1).encode() + b'"')
-                            if parsed:
-                                internal_received = datetime.fromtimestamp(time.mktime(parsed), tz=timezone.utc)
-                        except Exception:
-                            internal_received = None
-                    raw_payload = part[1]
-                    break
-                if raw_payload:
-                    messages.append(self._parse_imap_message(mailbox, raw_payload, internal_received))
-            return messages
+            self._last_folder_reached = True
+            inbox = self._imap_fetch_folder(imap, mailbox, "INBOX", required=True)
+            self._imap_inbox_reached = bool(self._last_folder_reached)
+            boxes = self._imap_list_mailboxes(imap)
+            junk_name = imap_junk_mailbox_name(boxes)
+            junk: list[dict[str, Any]] = []
+            if junk_name and junk_name.upper() != "INBOX":
+                self._imap_junk_absent = False
+                self._last_folder_reached = True
+                junk = self._imap_fetch_folder(imap, mailbox, junk_name, required=False)
+                self._imap_junk_reached = bool(self._last_folder_reached)
+            else:
+                self._imap_junk_absent = True
+                self._imap_junk_reached = True
+            return _merge_mail_messages(inbox, junk)
         finally:
             try:
                 imap.logout()
@@ -2525,6 +3373,7 @@ class OutlookTokenProvider(BaseMailProvider):
             "subject": _decode(str(message.get("Subject") or "")),
             "sender": _decode(str(message.get("From") or "")),
             "to": _decode(str(message.get("To") or "")),
+            "cc": _decode(str(message.get("Cc") or "")),
             "delivered_to": _decode(str(message.get("Delivered-To") or "")),
             "x_forwarded_to": _decode(str(message.get("X-Forwarded-To") or "")),
             "x_original_to": _decode(str(message.get("X-Original-To") or "")),
@@ -2534,36 +3383,83 @@ class OutlookTokenProvider(BaseMailProvider):
             "raw": None,
         }
 
+    def _mark_outlook_search(self, mailbox: dict[str, Any], incomplete: bool) -> None:
+        if isinstance(mailbox, dict):
+            mailbox["_outlook_search_incomplete"] = bool(incomplete)
+
+    def _graph_search_is_complete(self) -> bool:
+        inbox_ok = bool(getattr(self, "_graph_inbox_reached", False))
+        junk_missing = bool(getattr(self, "_graph_junk_missing", False))
+        junk_ok = bool(getattr(self, "_graph_junk_reached", False))
+        if self.mode == "graph":
+            return inbox_ok and (junk_ok or junk_missing)
+        return inbox_ok and junk_ok and not junk_missing
+
+    def _graph_search_incomplete(self, *, found_code: bool = False) -> bool:
+        if found_code:
+            return False
+        return not self._graph_search_is_complete()
+
+    def _combined_search_incomplete(self) -> bool:
+        """IMAP 已经接上时，收件箱必须由 IMAP 查完。垃圾箱只有 IMAP 确认没有，或 Graph 已经覆盖/确认没有时才算查完。"""
+        inbox_ok = bool(getattr(self, "_imap_inbox_reached", False))
+        if getattr(self, "_imap_junk_absent", False):
+            junk_ok = self.mode == "imap" or bool(getattr(self, "_graph_junk_reached", False)) or bool(getattr(self, "_graph_junk_missing", False))
+        else:
+            junk_ok = bool(getattr(self, "_imap_junk_reached", False))
+        return not (inbox_ok and junk_ok)
+
     def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
-        """拉取最近 N 封邮件（最新在前），供 wait_for_code 逐封扫描验证码。"""
+        """拉取覆盖验证码边界的邮件（最新在前），供 wait_for_code 逐封扫描验证码。"""
         client_id = str(mailbox.get("client_id") or "").strip()
         refresh_token = str(mailbox.get("refresh_token") or "").strip()
         if not client_id or not refresh_token:
             raise RuntimeError("OutlookToken mailbox 缺少 client_id 或 refresh_token")
         errors: list[str] = []
         graph_error: Exception | None = None
+        graph_messages: list[dict[str, Any]] | None = None
+        if isinstance(mailbox, dict):
+            mailbox.pop("_outlook_search_incomplete", None)
         if self.mode in {"graph", "auto"}:
             try:
                 access_token = self._access_token(mailbox, client_id, refresh_token, OUTLOOK_GRAPH_SCOPE)
-                return self._graph_messages(mailbox, access_token)
+                graph_messages = self._graph_messages(mailbox, access_token)
+                if self.mode == "graph" or _outlook_messages_have_current_code(graph_messages, mailbox):
+                    self._mark_outlook_search(mailbox, self._graph_search_incomplete(found_code=self.mode != "graph"))
+                    return graph_messages
+                errors.append("graph: no matching recipient")
             except Exception as error:
                 graph_error = error
                 if self.mode == "graph" and not _is_outlook_scope_denied(error):
+                    if isinstance(error, _MailWaitDeadlineExceeded):
+                        self._mark_outlook_search(mailbox, True)
                     raise
                 errors.append(f"graph: {error}")
+                self._mark_outlook_search(mailbox, True)
         should_try_imap = self.mode in {"imap", "auto"} or (
             self.mode == "graph" and graph_error is not None and _is_outlook_scope_denied(graph_error)
         )
         if should_try_imap:
             try:
                 access_token = self._access_token(mailbox, client_id, refresh_token, OUTLOOK_IMAP_SCOPE)
-                return self._imap_messages(mailbox, access_token)
+                imap_messages = self._imap_messages(mailbox, access_token)
+                self._mark_outlook_search(mailbox, self._combined_search_incomplete())
+                if graph_messages:
+                    return _merge_mail_messages(graph_messages, imap_messages)
+                return imap_messages
             except Exception as error:
                 if self.mode == "imap":
+                    if isinstance(error, _MailWaitDeadlineExceeded):
+                        self._mark_outlook_search(mailbox, True)
                     raise
                 errors.append(f"imap: {error}")
+                self._mark_outlook_search(mailbox, True)
                 if self.mode == "graph":
                     raise RuntimeError("; ".join(errors)) from error
+        if graph_messages is not None:
+            # Graph 已经查完收件箱和垃圾箱时，IMAP 连不上不再把这次搜索算成不完整。
+            self._mark_outlook_search(mailbox, not self._graph_search_is_complete())
+            return graph_messages
         if errors:
             raise RuntimeError("; ".join(errors))
         return []
@@ -2730,6 +3626,110 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
         provider.close()
 
 
+def _outlook_mailbox_parent(mailbox: dict[str, Any]) -> str:
+    return outlook_alias_parent_email(str(mailbox.get("login_email") or mailbox.get("alias_of") or mailbox.get("address") or ""))
+
+
+def _outlook_refresh_credential_failure(error: Exception | str | None, reason: str) -> bool:
+    """只认 Outlook 刷新凭据失败。ChatGPT 换票原文里的 access_token 不能算。"""
+    if isinstance(error, OutlookTokenError):
+        return True
+    text = str(reason or "")
+    return "OutlookToken 刷新失败" in text or "OutlookToken 刷新响应缺少 access_token" in text
+
+
+def _outlook_failure_state(error: Exception | str | None, reason: str) -> tuple[str, bool]:
+    if isinstance(error, OutlookTokenRateLimitError) or "AADSTS90055" in reason or "HTTP 429" in reason or "Microsoft 限流" in reason:
+        return "failed", False
+    if _outlook_refresh_credential_failure(error, reason):
+        return "token_invalid", True
+    # OpenAI 「邮箱登录流不支持无密码登录」不是 Outlook 需要重新登录。
+    if "login_required" in reason:
+        return "login_required", True
+    return "failed", False
+
+
+def _outlook_timeout_can_retire(mailbox: dict[str, Any]) -> bool:
+    if not _normalize_bool(mailbox.get("alias_enabled"), False):
+        return False
+    if _normalize_bool(mailbox.get("_outlook_search_incomplete"), False):
+        return False
+    return True
+
+
+def _record_outlook_no_code(store: dict[str, dict[str, Any]], mailbox: dict[str, Any], reason: str) -> None:
+    address = str(mailbox.get("address") or "").strip().lower()
+    parent = _outlook_mailbox_parent(mailbox)
+    now = datetime.now(timezone.utc).isoformat()
+    record = _outlook_record(store, address)
+    record["state"] = "failed"
+    record["reason"] = reason
+    record["updated_at"] = now
+    _store_outlook_record(store, address, record)
+    parent_record = _outlook_record(store, parent)
+    streak = _normalize_no_code_streak(parent_record.get("no_code_streak")) + 1
+    parent_record["no_code_streak"] = streak
+    parent_record["updated_at"] = now
+    lease = _normalize_family_lease(parent_record.get("family_lease"))
+    if lease and lease["address"] == address:
+        parent_record.pop("family_lease", None)
+    if streak >= OUTLOOK_ALIAS_NO_CODE_RETIRE_STREAK:
+        parent_record["state"] = "retired"
+        parent_record["reason"] = f"no_code_streak={streak}"
+        logger.warning("OutlookToken 主号连续 %s 次未收到验证码，已停用: %s", streak, parent)
+    _store_outlook_record(store, parent, parent_record)
+
+
+def _mark_outlook_mailbox_result(mailbox: dict[str, Any], *, success: bool, error: Exception | str | None = None) -> bool:
+    address = str(mailbox.get("address") or "").strip()
+    if not address:
+        return False
+    parent = _outlook_mailbox_parent(mailbox)
+    code = str(getattr(error, "code", "") or "")
+    code_received = _normalize_bool(mailbox.get("_code_received"), False)
+    reason = str(error or "").strip()
+    now = datetime.now(timezone.utc).isoformat()
+    with _outlook_state_transaction():
+        store = _load_outlook_token_state()
+        _remember_submitted_alias(store, mailbox)
+        if success or code_received:
+            parent_record = _outlook_record(store, parent)
+            if parent_record.get("no_code_streak"):
+                parent_record.pop("no_code_streak", None)
+                parent_record["updated_at"] = now
+                _store_outlook_record(store, parent, parent_record)
+        if success:
+            record = _outlook_record(store, address)
+            record["state"] = "used"
+            record["reason"] = ""
+            record["updated_at"] = now
+            _store_outlook_record(store, address, record)
+            _clear_family_lease(store, parent, address)
+            _save_outlook_token_state(store)
+            return True
+        if code in OUTLOOK_NO_CODE_TIMEOUT_CODES and not code_received and _outlook_timeout_can_retire(mailbox):
+            _record_outlook_no_code(store, mailbox, reason or code)
+            _save_outlook_token_state(store)
+            return True
+        state, cascade = _outlook_failure_state(error, reason)
+        record = _outlook_record(store, address)
+        record["state"] = state
+        record["reason"] = reason
+        record["updated_at"] = now
+        _store_outlook_record(store, address, record)
+        if cascade:
+            login_email = str(mailbox.get("login_email") or mailbox.get("alias_of") or "").strip()
+            if login_email and login_email.lower() != address.lower():
+                parent_record = _outlook_record(store, login_email)
+                parent_record["state"] = state
+                parent_record["reason"] = reason
+                parent_record["updated_at"] = now
+                _store_outlook_record(store, login_email, parent_record)
+        _clear_family_lease(store, parent, address)
+        _save_outlook_token_state(store)
+    return True
+
+
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> bool:
     """注册流程结束后更新邮箱池状态。
 
@@ -2756,28 +3756,7 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         return True
     if provider_name != OutlookTokenProvider.name:
         return True
-    address = str(mailbox.get("address") or "").strip()
-    if not address:
-        return False
-    if success:
-        _set_outlook_token_state(address, "used")
-        return True
-    reason = str(error or "").strip()
-    if isinstance(error, OutlookTokenRateLimitError) or "AADSTS90055" in reason or "HTTP 429" in reason or "Microsoft 限流" in reason:
-        _set_outlook_token_state(address, "failed", reason)
-    elif isinstance(error, OutlookTokenError) or "OutlookToken 刷新失败" in reason or "access_token" in reason:
-        _set_outlook_token_state(address, "token_invalid", reason)
-        login_email = str(mailbox.get("login_email") or mailbox.get("alias_of") or "").strip()
-        if login_email and login_email.lower() != address.lower():
-            _set_outlook_token_state(login_email, "token_invalid", reason)
-    elif "登录流" in reason or "login flow" in reason or "login_required" in reason:
-        _set_outlook_token_state(address, "login_required", reason)
-        login_email = str(mailbox.get("login_email") or mailbox.get("alias_of") or "").strip()
-        if login_email and login_email.lower() != address.lower():
-            _set_outlook_token_state(login_email, "login_required", reason)
-    else:
-        _set_outlook_token_state(address, "failed", reason)
-    return True
+    return _mark_outlook_mailbox_result(mailbox, success=success, error=error)
 
 
 def release_mailbox(mailbox: dict) -> bool:
