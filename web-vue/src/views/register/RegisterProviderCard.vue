@@ -256,11 +256,11 @@
           class="register-textarea register-textarea--tall"
           :disabled="disabled"
           :value="String(provider.mailboxes || '')"
-          placeholder="每行：邮箱----密码----client_id----refresh_token。留空保存则不修改整池"
+          placeholder="每行一个。四段是账号----密码----client_id----refresh_token；六段再加----辅助邮箱----辅助邮箱令牌。其它段数无效。清空文本框后保存会移除整池"
           @input="emit('update-field', index, 'mailboxes', ($event.target as HTMLTextAreaElement).value)"
         ></textarea>
       </label>
-      <p class="register-preview-line">提交的是完整邮箱池。删除一行后保存会从池中移除该邮箱；某行密码留空则沿用已保存密码。</p>
+      <p class="register-preview-line">提交的是完整邮箱池。删除一行后保存会从池中移除该邮箱；清空文本框后保存会移除整池。某行密码留空则沿用已保存密码。同一邮箱多行会合并，辅助邮箱会保留；凭据不一致则整次拒绝。不同邮箱池里同一邮箱的主令牌不一致也会整次拒绝。</p>
 
       <div class="register-outlook-toolbar">
         <div class="register-outlook-summary">
@@ -278,6 +278,16 @@
           <MetaChip v-if="outlookSummary.pending" size="xs" tone="info">
             待保存 {{ outlookSummary.pending }}
           </MetaChip>
+          <MetaChip v-if="outlookSummary.unrecognized" size="xs" tone="danger">
+            无法识别 {{ outlookSummary.unrecognized }}
+          </MetaChip>
+          <MetaChip v-if="outlookSummary.duplicateConflicts" size="xs" tone="danger">
+            凭据不一致 {{ outlookSummary.duplicateConflicts }}
+          </MetaChip>
+          <MetaChip v-if="outlookSummary.duplicateMerges" size="xs" tone="info">
+            重复合并 {{ outlookSummary.duplicateMerges }}
+          </MetaChip>
+          <MetaChip v-if="outlookSummary.willClear" size="xs" tone="danger">清空后移除整池</MetaChip>
         </div>
 
         <FloatingActionMenu
@@ -291,12 +301,13 @@
         />
       </div>
 
-      <p class="register-preview-line">{{ outlookPoolHint(provider) }}</p>
+      <p class="register-preview-line">{{ outlookPoolHint(provider, providers) }}</p>
       <details class="register-outlook-details">
         <summary>邮箱池详情</summary>
         <div class="register-outlook-detail-chips">
           <MetaChip size="xs" tone="muted">已保存 {{ outlookSummary.saved }}</MetaChip>
           <MetaChip size="xs" tone="info">待保存 {{ outlookSummary.pending }}</MetaChip>
+          <MetaChip v-if="outlookSummary.unrecognized" size="xs" tone="danger">无法识别 {{ outlookSummary.unrecognized }}</MetaChip>
           <MetaChip size="xs" tone="muted">占用 {{ outlookSummary.inUse }}</MetaChip>
           <MetaChip size="xs" tone="warning">需登录 {{ outlookSummary.loginRequired }}</MetaChip>
           <MetaChip size="xs" tone="warning">失效 {{ outlookSummary.tokenInvalid }}</MetaChip>
@@ -346,6 +357,7 @@ type ProviderArrayKey = 'domain'
 
 const props = defineProps<{
   provider: RegisterProvider
+  providers?: RegisterProvider[]
   index: number
   providerCount: number
   disabled: boolean
@@ -364,6 +376,7 @@ const emit = defineEmits<{
 const currentType = computed(() => providerType(props.provider))
 const requirementMessages = computed(() => providerRequirementMessages(props.provider))
 const outlookSummary = computed(() => outlookPoolSummary(props.provider))
+const providers = computed(() => props.providers || [])
 
 function numberModelValue(value: unknown) {
   const parsed = Number.parseFloat(String(value))

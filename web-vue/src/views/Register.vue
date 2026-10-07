@@ -34,6 +34,7 @@
           <RegisterTaskSettingsPanel
             :config="registerConfig"
             :custom-proxy-input="customRegisterProxyInput"
+            :locked="legacySaving"
             @update-custom-proxy="setCustomRegisterProxyInput"
           />
 
@@ -46,7 +47,7 @@
               <Button
                 size="sm"
                 variant="outline"
-                :disabled="registerTaskLocked"
+                :disabled="registerTaskLocked || legacySaving"
                 @click="addProvider"
               >
                 添加来源
@@ -58,9 +59,10 @@
                 v-for="(provider, index) in registerProviders"
                 :key="providerKey(provider, index)"
                 :provider="provider"
+                :providers="registerProviders"
                 :index="index"
                 :provider-count="registerProviders.length"
-                :disabled="registerTaskLocked"
+                :disabled="registerTaskLocked || legacySaving"
                 :saving="legacySaving"
                 :outlook-pool-action-items="outlookPoolActionItems"
                 @update-type="updateProviderType"
@@ -156,6 +158,7 @@ const outlookPoolRuntime = useRegisterOutlookPoolRuntime({
   saveCurrentConfig: () => saveLegacyConfig(),
   notifySuccess: (message) => toast.success(message),
   notifyError: (message) => toast.error(message),
+  isConfigDirty: registerConfigRuntime.isConfigDirty,
 })
 const outlookPoolActionItems = outlookPoolRuntime.outlookPoolActionItems
 const handleOutlookPoolAction = outlookPoolRuntime.handleAction

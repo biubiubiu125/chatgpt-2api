@@ -3,7 +3,7 @@
     <FormSection title="任务参数" density="roomy">
       <div class="register-form-grid">
         <label class="register-checkbox-field register-field--full">
-          <Checkbox v-model="config.auto_schedule_enabled" :disabled="config.enabled">
+          <Checkbox v-model="config.auto_schedule_enabled" :disabled="inputsLocked">
             按时段自动补号
           </Checkbox>
         </label>
@@ -16,7 +16,7 @@
               block
               root-class="font-mono"
               placeholder="18:00-02:00"
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
 
@@ -27,7 +27,7 @@
               type="number"
               min="1"
               block
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
 
@@ -39,7 +39,7 @@
               min="1"
               max="16"
               block
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
 
@@ -50,7 +50,7 @@
               block
               root-class="font-mono"
               placeholder="02:00-18:00"
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
 
@@ -61,7 +61,7 @@
               type="number"
               min="1"
               block
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
           <label class="register-field">
@@ -72,7 +72,7 @@
               min="1"
               max="16"
               block
-              :disabled="config.enabled"
+              :disabled="inputsLocked"
             />
           </label>
         </template>
@@ -83,7 +83,7 @@
             v-model="config.mode"
             :groups="registerModeGroups"
             selected-indicator="none"
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
             block
           />
         </label>
@@ -95,7 +95,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled || config.mode !== 'total'"
+            :disabled="inputsLocked || config.mode !== 'total'"
           />
         </label>
 
@@ -106,7 +106,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -117,7 +117,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -129,7 +129,7 @@
             min="1"
             max="16"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -140,7 +140,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -151,7 +151,7 @@
             block
             root-class="font-mono"
             placeholder="socks5://user:pass@host:port"
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
             @update:model-value="emit('update-custom-proxy', $event)"
           />
         </label>
@@ -171,7 +171,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -182,7 +182,7 @@
             type="number"
             min="1"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -194,7 +194,7 @@
             min="1"
             step="0.2"
             block
-            :disabled="config.enabled"
+            :disabled="inputsLocked"
           />
         </label>
 
@@ -213,6 +213,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Checkbox, Input } from 'nanocat-ui'
 
 import FormSection from '@/components/ai/FormSection.vue'
@@ -223,10 +224,13 @@ import {
   registerModeGroups,
 } from '@/views/register/registerProviderView'
 
-defineProps<{
+const props = defineProps<{
   config: LegacyRegisterConfig
   customProxyInput: string
+  locked?: boolean
 }>()
+
+const inputsLocked = computed(() => props.config.enabled || Boolean(props.locked))
 
 const emit = defineEmits<{
   (e: 'update-custom-proxy', value: string): void

@@ -61,6 +61,7 @@ OUTLOOK_INVALID_STATES = {"login_required", "token_invalid"}
 OUTLOOK_RETIRED_STATES = {"retired"}
 OUTLOOK_CREDENTIAL_FATAL_STATES = OUTLOOK_INVALID_STATES | OUTLOOK_RETIRED_STATES
 OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES = OUTLOOK_RETRYABLE_STATES | OUTLOOK_INVALID_STATES | OUTLOOK_RETIRED_STATES
+OUTLOOK_REMOVED_TOKEN_KEY = "removed_token_sha256"
 
 
 def _outlook_token_state_file_lock_path():
@@ -131,6 +132,9 @@ def _outlook_state_record(value: Any) -> dict[str, Any]:
         streak = _normalize_no_code_streak(value.get("no_code_streak"))
         if streak:
             record["no_code_streak"] = streak
+        removed = str(value.get(OUTLOOK_REMOVED_TOKEN_KEY) or "").strip().lower()
+        if len(removed) == 64 and all(char in "0123456789abcdef" for char in removed):
+            record[OUTLOOK_REMOVED_TOKEN_KEY] = removed
         return record
     return {"state": str(value or "used").strip() or "used", "reason": "", "updated_at": ""}
 
@@ -413,6 +417,45 @@ def _release_outlook_token_state(address: str) -> None:
             _save_outlook_token_state(store)
 
 
+def outlook_removed_token_fingerprint(token: object) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def remember_outlook_removed_tokens(token_by_email: dict[str, str]) -> None:
+    """邮箱离开池后，把主令牌指纹记在这个邮箱自己的停用记录上。不写到主号，不解除状态，也不保存令牌原文。"""
+    pending = {
+        str(email or "").strip().lower(): str(token or "")
+        for email, token in token_by_email.items()
+        if str(email or "").strip() and str(token or "").strip()
+    }
+    if not pending:
+        return
+    with _outlook_state_transaction():
+        store = _load_outlook_token_state()
+        changed = False
+        for email, token in pending.items():
+            fingerprint = outlook_removed_token_fingerprint(token)
+            if not fingerprint:
+                continue
+            for key in {email}:
+                entry = store.get(key)
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("state") or "") not in OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES:
+                    continue
+                record = _outlook_state_record(entry)
+                if record.get(OUTLOOK_REMOVED_TOKEN_KEY) == fingerprint:
+                    continue
+                record[OUTLOOK_REMOVED_TOKEN_KEY] = fingerprint
+                _store_outlook_record(store, key, record)
+                changed = True
+        if changed:
+            _save_outlook_token_state(store)
+
+
 def clear_outlook_token_states(addresses: list[str] | set[str], states: set[str] | None = None) -> int:
     """清除指定邮箱的状态标记。
 
@@ -569,7 +612,22 @@ def _empty_outlook_pool_counts() -> dict[str, int]:
         "failed": 0,
         "retired": 0,
         "submitted_alias": 0,
+        "reauth_ready": 0,
+        "reauth_missing": 0,
     }
+
+
+def _credential_has_recovery_pair(credential: dict[str, Any]) -> bool:
+    email = str(credential.get("recovery_email") or "").strip()
+    token = str(credential.get("recovery_refresh_token") or "").strip()
+    return "@" in email and bool(token)
+
+
+def _note_reauth_candidate(counts: dict[str, int], credential: dict[str, Any], state: str) -> None:
+    if state not in {"login_required", "token_invalid"}:
+        return
+    key = "reauth_ready" if _credential_has_recovery_pair(credential) else "reauth_missing"
+    counts[key] += 1
 
 
 def _count_outlook_family(counts: dict[str, int], store: dict[str, dict[str, Any]], credential: dict[str, Any]) -> None:
@@ -621,14 +679,16 @@ def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None, entry: di
                     seen_parents.add(parent)
                     _count_outlook_family(counts, store, credential)
                     _count_outlook_family_usage(counts, store, parent)
+                    _note_reauth_candidate(counts, credential, _outlook_credential_state(store, credential))
                     continue
                 state = _outlook_credential_state(store, credential)
                 if state == "retired":
                     counts["retired"] += 1
-                elif state in counts:
+                elif state in {"unused", "in_use", "used", "login_required", "token_invalid", "failed"}:
                     counts[state] += 1
                 else:
                     counts["unused"] += 1
+                _note_reauth_candidate(counts, credential, state)
         else:
             for value in store.values():
                 state = str(value.get("state") or "") if isinstance(value, dict) else ""
@@ -2434,6 +2494,12 @@ OUTLOOK_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
 OUTLOOK_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
 OUTLOOK_IMAP_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
 OUTLOOK_DEFAULT_IMAP_HOST = "outlook.office365.com"
+OUTLOOK_REAUTH_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+OUTLOOK_REAUTH_REDIRECT_URI = "https://localhost"
+OUTLOOK_REAUTH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
+OUTLOOK_REAUTH_AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+OUTLOOK_RECOVERY_PAIR_REASON = "辅助邮箱和辅助令牌必须成对"
+OUTLOOK_FIELD_COUNT_REASON = "字段数量不正确"
 
 
 def _is_outlook_scope_denied(error: Exception | str) -> bool:
@@ -2481,20 +2547,111 @@ def _add_outlook_parse_issue(issues: list[dict[str, Any]], line_no: int, reason:
     issues.append(issue)
 
 
+def _outlook_credential_dict(
+    email: str,
+    password: str,
+    client_id: str,
+    refresh_token: str,
+    recovery_email: str = "",
+    recovery_refresh_token: str = "",
+) -> dict[str, str]:
+    recovery_email, recovery_refresh_token = _paired_outlook_recovery(recovery_email, recovery_refresh_token)
+    return {
+        "email": email,
+        "password": password,
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "recovery_email": recovery_email,
+        "recovery_refresh_token": recovery_refresh_token,
+    }
+
+
+def _paired_outlook_recovery(email: str, token: str) -> tuple[str, str]:
+    recovery_email = str(email or "").strip()
+    recovery_token = str(token or "").strip()
+    if "@" in recovery_email and recovery_token:
+        return recovery_email, recovery_token
+    return "", ""
+
+
+def _outlook_duplicate_conflict(existing: dict[str, str], incoming: dict[str, str]) -> str:
+    """同一邮箱多行时，主凭据或两边都有的辅助邮箱不一致就拒绝。空白密码不算冲突。"""
+    existing_password = str(existing.get("password") or "")
+    incoming_password = str(incoming.get("password") or "")
+    if existing_password and incoming_password and existing_password != incoming_password:
+        return "同一邮箱的密码不一致"
+    if str(existing.get("client_id") or "") != str(incoming.get("client_id") or ""):
+        return "同一邮箱的应用编号不一致"
+    if str(existing.get("refresh_token") or "") != str(incoming.get("refresh_token") or ""):
+        return "同一邮箱的主令牌不一致"
+    existing_recovery = (
+        str(existing.get("recovery_email") or ""),
+        str(existing.get("recovery_refresh_token") or ""),
+    )
+    incoming_recovery = (
+        str(incoming.get("recovery_email") or ""),
+        str(incoming.get("recovery_refresh_token") or ""),
+    )
+    existing_has = bool(existing_recovery[0] and existing_recovery[1])
+    incoming_has = bool(incoming_recovery[0] and incoming_recovery[1])
+    if existing_has and incoming_has and existing_recovery != incoming_recovery:
+        return "同一邮箱的辅助邮箱不一致"
+    return ""
+
+
+def _merge_outlook_duplicate(existing: dict[str, str], incoming: dict[str, str]) -> None:
+    """重复行不另建邮箱。空白密码补上，缺的辅助邮箱从后面的行补上。"""
+    if not str(existing.get("password") or "") and str(incoming.get("password") or ""):
+        existing["password"] = str(incoming.get("password") or "")
+    if str(existing.get("recovery_email") or "") and str(existing.get("recovery_refresh_token") or ""):
+        return
+    recovery_email = str(incoming.get("recovery_email") or "")
+    recovery_token = str(incoming.get("recovery_refresh_token") or "")
+    if recovery_email and recovery_token:
+        existing["recovery_email"] = recovery_email
+        existing["recovery_refresh_token"] = recovery_token
+
+
+def _outlook_fields_from_parts(parts: list[str]) -> tuple[dict[str, str] | None, str]:
+    """正好四段没有辅助邮箱；正好六段再带辅助邮箱和辅助令牌。其它段数无效。"""
+    if len(parts) < 4:
+        return None, "字段不足"
+    email, password, client_id = parts[0], parts[1], parts[2]
+    if "@" not in email:
+        return None, "邮箱格式不正确"
+    if not client_id:
+        return None, "缺少 client_id"
+    refresh_token = parts[3]
+    if not refresh_token:
+        return None, "缺少 refresh_token"
+    if len(parts) not in (4, 6):
+        return None, OUTLOOK_FIELD_COUNT_REASON
+    if len(parts) == 4:
+        return _outlook_credential_dict(email, password, client_id, refresh_token), ""
+    recovery_email, recovery_token = parts[4], parts[5]
+    if "@" not in recovery_email or not recovery_token:
+        return None, OUTLOOK_RECOVERY_PAIR_REASON
+    return _outlook_credential_dict(email, password, client_id, refresh_token, recovery_email, recovery_token), ""
+
+
 def _parse_outlook_credentials_with_report(text: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    """解析邮箱池文本，每行格式：email----password----client_id----refresh_token。"""
+    """解析邮箱池。四段是主邮箱凭据；六段再带成对的辅助邮箱和辅助令牌。"""
     credentials: list[dict[str, str]] = []
-    seen: set[str] = set()
+    by_email: dict[str, dict[str, str]] = {}
     report: dict[str, Any] = {
         "raw_lines": 0,
         "non_empty": 0,
         "valid": 0,
         "duplicates": 0,
+        "conflicts": 0,
         "invalid": 0,
         "skipped": 0,
         "issues": [],
+        "invalid_issues": [],
+        "conflict_issues": [],
     }
     issues = report["issues"]
+    invalid_issues = report["invalid_issues"]
     for line_no, raw_line in enumerate(str(text or "").splitlines(), start=1):
         report["raw_lines"] += 1
         line = _clean_outlook_value(raw_line)
@@ -2504,32 +2661,32 @@ def _parse_outlook_credentials_with_report(text: str) -> tuple[list[dict[str, st
         if "----" not in line:
             report["invalid"] += 1
             _add_outlook_parse_issue(issues, line_no, "缺少 ---- 分隔符")
+            _add_outlook_parse_issue(invalid_issues, line_no, "缺少 ---- 分隔符")
             continue
-        parts = [_clean_outlook_value(part) for part in line.split("----", 3)]
-        if len(parts) != 4:
+        parts = [_clean_outlook_value(part) for part in line.split("----")]
+        row, reason = _outlook_fields_from_parts(parts)
+        email = parts[0] if parts and "@" in parts[0] else ""
+        if row is None:
             report["invalid"] += 1
-            _add_outlook_parse_issue(issues, line_no, "字段不足")
+            reason = reason or "字段不足"
+            _add_outlook_parse_issue(issues, line_no, reason, email)
+            _add_outlook_parse_issue(invalid_issues, line_no, reason, email)
             continue
-        email, password, client_id, refresh_token = parts
-        if "@" not in email:
-            report["invalid"] += 1
-            _add_outlook_parse_issue(issues, line_no, "邮箱格式不正确", email)
-            continue
-        if not client_id:
-            report["invalid"] += 1
-            _add_outlook_parse_issue(issues, line_no, "缺少 client_id", email)
-            continue
-        if not refresh_token:
-            report["invalid"] += 1
-            _add_outlook_parse_issue(issues, line_no, "缺少 refresh_token", email)
-            continue
-        key = email.lower()
-        if key in seen:
+        key = row["email"].lower()
+        existing = by_email.get(key)
+        if existing is not None:
             report["duplicates"] += 1
-            _add_outlook_parse_issue(issues, line_no, "重复邮箱，已合并", email)
+            conflict = _outlook_duplicate_conflict(existing, row)
+            if conflict:
+                report["conflicts"] += 1
+                _add_outlook_parse_issue(issues, line_no, conflict, row["email"])
+                _add_outlook_parse_issue(report["conflict_issues"], line_no, conflict, row["email"])
+            else:
+                _merge_outlook_duplicate(existing, row)
+                _add_outlook_parse_issue(issues, line_no, "重复邮箱，已合并", row["email"])
             continue
-        seen.add(key)
-        credentials.append({"email": email, "password": password, "client_id": client_id, "refresh_token": refresh_token})
+        by_email[key] = row
+        credentials.append(row)
     report["valid"] = len(credentials)
     report["skipped"] = int(report["duplicates"]) + int(report["invalid"])
     return credentials, report
@@ -2541,6 +2698,23 @@ def parse_outlook_credentials(text: str) -> list[dict[str, str]]:
 
 def inspect_outlook_credentials(text: str) -> dict[str, Any]:
     return _parse_outlook_credentials_with_report(text)[1]
+
+
+def outlook_invalid_lines(text: str) -> list[str]:
+    """返回无法按四段或六段识别的非空行，保持原顺序。重复的合法行不算。"""
+    invalid: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = _clean_outlook_value(raw_line)
+        if not line:
+            continue
+        if "----" not in line:
+            invalid.append(line)
+            continue
+        parts = [_clean_outlook_value(part) for part in line.split("----")]
+        row, _reason = _outlook_fields_from_parts(parts)
+        if row is None:
+            invalid.append(line)
+    return invalid
 
 
 def _normalize_bool(value: Any, default: bool = False) -> bool:
@@ -2717,11 +2891,17 @@ def _normalize_outlook_pool(value: Any, entry: dict | None = None) -> list[dict[
                 refresh_token = _clean_outlook_value(item.get("refresh_token") or "")
                 if "@" in email and client_id and refresh_token:
                     login_email = _clean_outlook_value(item.get("login_email") or item.get("alias_of") or email)
+                    recovery_email, recovery_token = _paired_outlook_recovery(
+                        _clean_outlook_value(item.get("recovery_email") or ""),
+                        _clean_outlook_value(item.get("recovery_refresh_token") or ""),
+                    )
                     payload = {
                         "email": email,
                         "password": _clean_outlook_value(item.get("password") or ""),
                         "client_id": client_id,
                         "refresh_token": refresh_token,
+                        "recovery_email": recovery_email,
+                        "recovery_refresh_token": recovery_token,
                     }
                     if login_email and login_email != email:
                         payload["login_email"] = login_email
@@ -2867,7 +3047,8 @@ def _outlook_messages_have_current_code(messages: list[dict[str, Any]], mailbox:
 class OutlookTokenProvider(BaseMailProvider):
     """使用 refresh_token 读取 Outlook/Hotmail 邮箱验证码。
 
-    邮箱池在应用配置里维护（mailboxes 字段，每行 email----password----client_id----refresh_token），
+    邮箱池在应用配置里维护。只接受正好四段 email----password----client_id----refresh_token，
+    或正好六段再加 ----辅助邮箱----辅助令牌。其它段数无效，不把多段拼进主令牌。注册收信只用主令牌。
     create_mailbox() 从池中取下一个未使用的邮箱，wait_for_code() 用 refresh_token 换取 access_token
     后通过 Graph/IMAP 读取最新邮件。
     """

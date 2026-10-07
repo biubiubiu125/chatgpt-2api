@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -78,53 +79,456 @@ class _RegistrationFutureAdapter:
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
-    return "\n".join(
-        f'{c["email"]}----{c.get("password", "")}----{c["client_id"]}----{c["refresh_token"]}' for c in credentials
-    )
+    lines = []
+    for item in credentials:
+        email = str(item.get("email") or "").strip()
+        if not email:
+            continue
+        fields = [
+            email,
+            str(item.get("password") or ""),
+            str(item.get("client_id") or ""),
+            str(item.get("refresh_token") or ""),
+        ]
+        recovery_email = str(item.get("recovery_email") or "").strip()
+        recovery_token = str(item.get("recovery_refresh_token") or "").strip()
+        if "@" in recovery_email and recovery_token:
+            fields.extend([recovery_email, recovery_token])
+        lines.append("----".join(fields))
+    return "\n".join(lines)
 
 
 def _merge_outlook_pool(old_text: str, new_text: str) -> str:
-    """把前端提交的邮箱池当成完整列表。空提交表示不改；同邮箱空密码沿用旧值。"""
+    """把前端提交的邮箱池当成完整列表。空提交保留原文；同邮箱空密码沿用旧值。"""
+    if not str(new_text or "").strip():
+        return str(old_text or "")
     old_credentials = {
         credential["email"].strip().lower(): credential
         for credential in mail_provider.parse_outlook_credentials(old_text or "")
     }
-    if not str(new_text or "").strip():
-        return _serialize_outlook_pool(list(old_credentials.values()))
     merged: list[dict] = []
     for credential in mail_provider.parse_outlook_credentials(new_text or ""):
         email = credential["email"].strip().lower()
-        old = old_credentials.get(email)
-        if old and not str(credential.get("password") or "").strip():
-            credential["password"] = str(old.get("password") or "")
-        merged.append(credential)
+        old = old_credentials.get(email) or {}
+        password = str(credential.get("password") or "").strip()
+        if not password:
+            password = str(old.get("password") or "")
+        recovery_email = str(credential.get("recovery_email") or "").strip()
+        recovery_token = str(credential.get("recovery_refresh_token") or "").strip()
+        if "@" not in recovery_email or not recovery_token:
+            recovery_email = str(old.get("recovery_email") or "")
+            recovery_token = str(old.get("recovery_refresh_token") or "")
+        merged.append({
+            "email": credential["email"],
+            "password": password,
+            "client_id": credential["client_id"],
+            "refresh_token": credential["refresh_token"],
+            "recovery_email": recovery_email,
+            "recovery_refresh_token": recovery_token,
+        })
     return _serialize_outlook_pool(merged)
+
+
+def _serialize_outlook_pool_preserving(credentials: list[dict], original_text: str) -> str:
+    """重写合法行时保留无法识别的原文，避免维护动作把历史坏行删掉。"""
+    serialized = _serialize_outlook_pool(credentials)
+    extras = mail_provider.outlook_invalid_lines(original_text)
+    if not extras:
+        return serialized
+    extra_text = "\n".join(extras)
+    if not serialized:
+        return extra_text
+    return serialized + "\n" + extra_text
+
+
+def _reject_unrecognized_outlook_pool(text: str) -> None:
+    report = mail_provider.inspect_outlook_credentials(text)
+    invalid = int(report.get("invalid") or 0)
+    if invalid <= 0:
+        return
+    issues = report.get("invalid_issues") if isinstance(report.get("invalid_issues"), list) else []
+    parts: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        line = issue.get("line")
+        reason = str(issue.get("reason") or "无法识别")
+        if line:
+            parts.append(f"第 {line} 行：{reason}")
+    shown = "；".join(parts)
+    hidden = invalid - len(parts)
+    extra = f"；另有 {hidden} 行未列出" if hidden > 0 else ""
+    detail = f"{shown}{extra}" if shown else ""
+    prefix = f"Outlook 邮箱池有 {invalid} 行无法识别，未保存。"
+    raise ValueError(prefix + detail if detail else prefix)
+
+
+def _reject_conflicting_outlook_pool(text: str) -> None:
+    report = mail_provider.inspect_outlook_credentials(text)
+    conflicts = int(report.get("conflicts") or 0)
+    if conflicts <= 0:
+        return
+    issues = report.get("conflict_issues") if isinstance(report.get("conflict_issues"), list) else []
+    parts: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        line = issue.get("line")
+        reason = str(issue.get("reason") or "凭据不一致")
+        if line:
+            parts.append(f"第 {line} 行：{reason}")
+    shown = "；".join(parts)
+    hidden = conflicts - len(parts)
+    extra = f"；另有 {hidden} 行未列出" if hidden > 0 else ""
+    detail = f"{shown}{extra}" if shown else ""
+    prefix = f"Outlook 邮箱池有 {conflicts} 行重复邮箱凭据不一致，未保存。"
+    raise ValueError(prefix + detail if detail else prefix)
+
+
+def _projected_outlook_pool_text(old_text: str, new_text: str, clear_requested: bool) -> str:
+    if str(new_text or "").strip():
+        return _merge_outlook_pool(old_text, new_text)
+    if clear_requested:
+        return ""
+    return str(old_text or "")
+
+
+def _reject_cross_pool_outlook_token_conflicts(texts: list[str]) -> None:
+    """不同 Outlook 池里同一邮箱的主令牌不一致则整次拒绝。不报出令牌原文。"""
+    seen: dict[str, str] = {}
+    issues: list[str] = []
+    counted: set[str] = set()
+    for index, text in enumerate(texts, start=1):
+        for credential in mail_provider.parse_outlook_credentials(text):
+            email = str(credential.get("email") or "").strip().lower()
+            token = str(credential.get("refresh_token") or "")
+            if not email or not token:
+                continue
+            previous = seen.get(email)
+            if previous is None:
+                seen[email] = token
+                continue
+            if previous == token or email in counted:
+                continue
+            counted.add(email)
+            issues.append(f"第 {index} 个 Outlook 邮箱池：同一邮箱的主令牌不一致")
+    if not issues:
+        return
+    shown = "；".join(issues[:5])
+    hidden = len(issues) - len(issues[:5])
+    extra = f"；另有 {hidden} 行未列出" if hidden > 0 else ""
+    prefix = f"Outlook 邮箱池有 {len(issues)} 个邮箱在不同池里的主令牌不一致，未保存。"
+    raise ValueError(prefix + shown + extra)
 
 
 def _outlook_credential_changed(old: dict | None, new: dict) -> bool:
     if not old:
         return False
-    for key in ("password", "client_id", "refresh_token"):
+    for key in ("password", "client_id", "refresh_token", "recovery_email", "recovery_refresh_token"):
         if str(old.get(key) or "") != str(new.get(key) or ""):
             return True
     return False
 
 
+def _outlook_state_reset_requested(old: dict | None, new: dict, store: dict | None = None) -> bool:
+    """只有主令牌变化，或离开池后再次导入了不同主令牌，才解除停用。
+
+    只改密码、应用编号或辅助邮箱不解除。已经记住的同一枚停用主令牌再次导入不解除。
+    没有旧池记录、也没有记住旧令牌时，停用状态随这个邮箱本身的新导入解除。
+    加号行导入不按主号上记住的令牌判断，也不解除主号。
+    """
+    new_token = str(new.get("refresh_token") or "")
+    if old:
+        return str(old.get("refresh_token") or "") != new_token
+    if not new_token.strip():
+        return False
+    email = str(new.get("email") or "").strip().lower()
+    if not email:
+        return False
+    if store is None:
+        store = mail_provider._load_outlook_token_state()
+    fingerprint = mail_provider.outlook_removed_token_fingerprint(new_token)
+    for key in (email,):
+        entry = store.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("state") or "") not in mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES:
+            continue
+        remembered = str(entry.get(mail_provider.OUTLOOK_REMOVED_TOKEN_KEY) or "")
+        if remembered and remembered == fingerprint:
+            return False
+        return True
+    return False
+
+
+def _acceptable_outlook_refresh_token(token: str, old_token: str) -> bool:
+    value = str(token or "").strip()
+    if not value or value == str(old_token or "").strip():
+        return False
+    return "----" not in value and "\n" not in value and "\r" not in value
+
+
+def _reauth_summary(results: list[dict]) -> dict:
+    return {
+        "replaced": sum(1 for item in results if item.get("status") == "replaced"),
+        "failed": sum(1 for item in results if item.get("status") == "failed"),
+        "skipped": sum(1 for item in results if item.get("status") == "skipped"),
+        "results": results,
+    }
+
+
+_OUTLOOK_REAUTH_PENDING_CLEAR_KEY = "outlook_reauth_pending_clears"
+_OUTLOOK_REAUTH_ROLLBACK_KEY = "outlook_reauth_rollbacks"
+
+
+def _unique_text_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+    return items
+
+
+def _outlook_reauth_pending_clear(config: dict) -> tuple[list[str], list[str]]:
+    raw = config.get(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY) if isinstance(config, dict) else None
+    if isinstance(raw, dict):
+        emails = _unique_text_list(raw.get("emails"))
+        addresses = _unique_text_list(raw.get("addresses")) or list(emails)
+        return emails, addresses
+    if isinstance(raw, list):
+        emails = _unique_text_list(raw)
+        return emails, list(emails)
+    return [], []
+
+
+def _outlook_token_fingerprint(token: object) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _outlook_reauth_pending_token_records(config: dict) -> dict[str, dict]:
+    raw = config.get(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY) if isinstance(config, dict) else None
+    tokens = raw.get("tokens") if isinstance(raw, dict) else None
+    if not isinstance(tokens, dict):
+        return {}
+    records: dict[str, dict] = {}
+    for email, record in tokens.items():
+        key = str(email or "").strip().lower()
+        if key and isinstance(record, dict):
+            records[key] = record
+    return records
+
+
+def _outlook_pool_credentials(config: dict) -> dict[str, dict]:
+    mail = config.get("mail") if isinstance(config, dict) and isinstance(config.get("mail"), dict) else {}
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    found: dict[str, dict] = {}
+    for provider in providers:
+        if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
+            continue
+        for credential in mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or "")):
+            email = str(credential.get("email") or "").strip().lower()
+            if email and email not in found:
+                found[email] = credential
+    return found
+
+
+def _drop_pending_reauth_emails(config: dict, emails: list[str]) -> None:
+    raw = config.get(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY)
+    if not isinstance(raw, dict):
+        return
+    drop = {str(item or "").strip().lower() for item in emails if str(item or "").strip()}
+    if not drop:
+        return
+    kept_emails = [
+        item for item in _unique_text_list(raw.get("emails"))
+        if item.strip().lower() not in drop
+    ]
+    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), dict) else {}
+    kept_tokens = {
+        str(key).strip().lower(): value
+        for key, value in tokens.items()
+        if str(key).strip().lower() not in drop and isinstance(value, dict)
+    }
+    if not kept_emails and not kept_tokens:
+        config.pop(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY, None)
+        return
+    addresses: list[str] = []
+    for key, record in kept_tokens.items():
+        addresses.extend(_unique_text_list(record.get("addresses")) or [key])
+    config[_OUTLOOK_REAUTH_PENDING_CLEAR_KEY] = {
+        "emails": kept_emails,
+        "addresses": _unique_text_list(addresses) or list(kept_emails),
+        "tokens": kept_tokens,
+    }
+
+
+def _restore_pending_reauth_tokens(
+    config: dict,
+    old_credentials: dict[str, dict],
+    merged_credentials: list[dict],
+) -> bool:
+    """过期文本框保存不能把刚换上的主令牌写回失效令牌。"""
+    raw = config.get(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY) if isinstance(config, dict) else None
+    if not isinstance(raw, dict) or not isinstance(raw.get("tokens"), dict):
+        return False
+    tokens = _outlook_reauth_pending_token_records(config)
+    submitted = {str(item.get("email") or "").strip().lower() for item in merged_credentials}
+    drop = [email for email in tokens if email not in submitted]
+    restored = False
+    for credential in merged_credentials:
+        email = str(credential.get("email") or "").strip().lower()
+        record = tokens.get(email)
+        if not isinstance(record, dict):
+            continue
+        saved = str(record.get("saved") or "")
+        previous = str(record.get("previous") or "")
+        old = old_credentials.get(email) or {}
+        disk_fp = _outlook_token_fingerprint(old.get("refresh_token"))
+        submitted_fp = _outlook_token_fingerprint(credential.get("refresh_token"))
+        if saved and disk_fp == saved and previous and submitted_fp == previous:
+            credential["refresh_token"] = str(old.get("refresh_token") or "")
+            restored = True
+        elif saved and submitted_fp and submitted_fp != saved:
+            drop.append(email)
+    if drop:
+        _drop_pending_reauth_emails(config, drop)
+    return restored
+
+
+def _restore_reauth_rollbacks(
+    config: dict,
+    old_credentials: dict[str, dict],
+    merged_credentials: list[dict],
+) -> bool:
+    """成功换上的主令牌不能被稍后保存的旧文本框写回去。"""
+    raw = config.get(_OUTLOOK_REAUTH_ROLLBACK_KEY) if isinstance(config, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        return False
+    submitted = {str(item.get("email") or "").strip().lower() for item in merged_credentials}
+    remaining = {
+        str(email).strip().lower(): record
+        for email, record in raw.items()
+        if str(email).strip().lower() in submitted and isinstance(record, dict)
+    }
+    restored = False
+    for credential in merged_credentials:
+        email = str(credential.get("email") or "").strip().lower()
+        record = remaining.get(email)
+        if not isinstance(record, dict):
+            continue
+        saved = str(record.get("saved") or "")
+        previous = str(record.get("previous") or "")
+        old = old_credentials.get(email) or {}
+        disk_fp = _outlook_token_fingerprint(old.get("refresh_token"))
+        submitted_fp = _outlook_token_fingerprint(credential.get("refresh_token"))
+        if submitted_fp and submitted_fp not in {saved, previous}:
+            remaining.pop(email, None)
+            continue
+        if saved and disk_fp == saved and (not submitted_fp or submitted_fp == previous):
+            credential["refresh_token"] = str(old.get("refresh_token") or "")
+            restored = True
+    if remaining:
+        config[_OUTLOOK_REAUTH_ROLLBACK_KEY] = remaining
+    else:
+        config.pop(_OUTLOOK_REAUTH_ROLLBACK_KEY, None)
+    return restored
+
+
+def _remember_reauth_rollbacks(config: dict, applied: list[dict], previous_by_email: dict[str, str]) -> None:
+    current = config.get(_OUTLOOK_REAUTH_ROLLBACK_KEY)
+    records = dict(current) if isinstance(current, dict) else {}
+    for item in applied:
+        email = str(item.get("email") or "").strip().lower()
+        if not email:
+            continue
+        records[email] = {
+            "saved": _outlook_token_fingerprint(item.get("refresh_token")),
+            "previous": _outlook_token_fingerprint(previous_by_email.get(email, "")),
+        }
+    if records:
+        config[_OUTLOOK_REAUTH_ROLLBACK_KEY] = records
+
+
+def _drop_reset_addresses_whose_token_remains(
+    addresses: list[str],
+    old_credentials: dict[str, dict],
+    new_credentials: list[dict],
+) -> list[str]:
+    """旧主令牌还在任一池里时，不解除这个地址的停用。"""
+    present: dict[str, set[str]] = {}
+    for credential in new_credentials:
+        email = str(credential.get("email") or "").strip().lower()
+        token = str(credential.get("refresh_token") or "")
+        if email and token:
+            present.setdefault(email, set()).add(token)
+    kept: list[str] = []
+    seen: set[str] = set()
+    for address in addresses:
+        key = address.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        old = old_credentials.get(key)
+        old_token = str(old.get("refresh_token") or "") if isinstance(old, dict) else ""
+        if old_token and old_token in present.get(key, set()):
+            continue
+        kept.append(address.strip())
+    return kept
+
+
+def _reauth_clear_addresses(
+    applied: list[dict],
+    old_credentials: dict[str, dict],
+    new_credentials: list[dict],
+) -> list[str]:
+    """重授权后只解除旧令牌已经不在任何池里的地址。"""
+    addresses = _drop_reset_addresses_whose_token_remains(
+        _outlook_refresh_reset_addresses(applied),
+        old_credentials,
+        new_credentials,
+    )
+    new_tokens = {
+        str(item.get("email") or "").strip().lower(): str(item.get("refresh_token") or "")
+        for item in applied
+        if str(item.get("email") or "").strip()
+    }
+    present: dict[str, set[str]] = {}
+    for credential in new_credentials:
+        email = str(credential.get("email") or "").strip().lower()
+        token = str(credential.get("refresh_token") or "")
+        if email and token:
+            present.setdefault(email, set()).add(token)
+    kept: list[str] = []
+    for address in addresses:
+        key = address.strip().lower()
+        new_token = new_tokens.get(key, "")
+        if new_token and present.get(key, set()) - {new_token}:
+            continue
+        kept.append(address)
+    return kept
+
+
 def _outlook_refresh_reset_addresses(credentials: list[dict]) -> list[str]:
-    """更新凭据时同时解除主号上的停用。加号行本身不是停用记录。"""
+    """只解除这次凭据自己的地址。加号行不解除主号停用。"""
     addresses: list[str] = []
     seen: set[str] = set()
     for credential in credentials:
         email = str(credential.get("email") or "").strip()
-        parent = mail_provider.outlook_alias_parent_email(
-            str(credential.get("login_email") or credential.get("alias_of") or email)
-        )
-        for item in (email, parent):
-            key = item.strip().lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            addresses.append(item.strip())
+        key = email.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        addresses.append(email)
     return addresses
 
 
@@ -447,6 +851,7 @@ class RegisterService:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = threading.RLock()
+        self._outlook_reauth_active = False
         self._runner: threading.Thread | None = None
         self._auto_scheduler: threading.Thread | None = None
         self._shutdown_event = threading.Event()
@@ -587,10 +992,13 @@ class RegisterService:
                     snapshot = self.get()
                     enabled = bool(snapshot.get("enabled"))
                     running = bool(self._runner and self._runner.is_alive())
-                    if enabled and not running:
+                    if enabled and not running and not self._outlook_reauth_active:
                         self.resume_if_enabled()
                     elif not enabled and running:
                         self.stop()
+                except ValueError as exc:
+                    if "重授权仍在进行" not in str(exc):
+                        self._append_log(f"注册自动调度出错：{exc}", "error")
                 except Exception as exc:
                     self._append_log(f"注册自动调度出错：{exc}", "error")
                 if stop_event.wait(interval):
@@ -833,6 +1241,7 @@ class RegisterService:
             if reload:
                 self._reload_locked()
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+            snapshot.pop(_OUTLOOK_REAUTH_ROLLBACK_KEY, None)
             snapshot["state"] = self._state_locked()
         if redact:
             self._redact_outlook_pools(snapshot)
@@ -959,16 +1368,24 @@ class RegisterService:
         providers = updates.get("mail", {}).get("providers", [])
         return dict(providers[0]) if providers and isinstance(providers[0], dict) else dict(provider)
 
-    def _merge_outlook_pools(self, updates: dict) -> None:
+    def _merge_outlook_pools(self, updates: dict) -> list[str]:
         """对 outlook_token provider：前端提交的 mailboxes 视为完整列表。
 
-        留空表示不改动；非空则按提交内容覆盖整个池（删除行即移除）。
+        留空且没有 outlook_pool_clear 表示不改动。页面清空已保存的池时带上该标记，写成空池。
+        非空则先检查这次提交的全部 Outlook 池；任一无法识别行或重复凭据冲突都整次拒绝，然后再覆盖。
+        同一邮箱多行会合并，辅助邮箱保留；密码、应用编号、主令牌或辅助邮箱不一致则拒绝。
+        返回需要在配置成功落库后清理停用或失效状态的邮箱。这里不写状态文件。
+        只改密码、应用编号、辅助邮箱或辅助令牌不在返回值里，失效和停用状态继续留给重授权。
+        邮箱已经离开池后，只有再次导入了不同主令牌才进入返回值；同一枚已记住的主令牌不进入。
+        加号行进入、离开或更换令牌时，主号不进入返回值。
+        不同池里同一邮箱的主令牌不一致则整次拒绝，不进入返回值。
         同邮箱若密码留空，沿用已保存密码。
         只按稳定 provider ID 合并；无 ID 仅允许池中唯一的同类型 provider 兼容旧配置。
         """
         mail = updates.get("mail")
         if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
-            return
+            return []
+        refreshed_addresses: list[str] = []
         old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
         old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
         old_outlook_by_id = {
@@ -981,6 +1398,7 @@ class RegisterService:
             for provider in old_providers
             if isinstance(provider, dict) and provider.get("type") == "outlook_token"
         ]
+        prepared: list[tuple[dict, str, str, bool]] = []
         for provider in mail["providers"]:
             if not isinstance(provider, dict):
                 continue
@@ -993,7 +1411,22 @@ class RegisterService:
             if not old and not incoming_had_id and len(old_outlook_by_order) == 1:
                 old = old_outlook_by_order[0]
             old_text = str(old.get("mailboxes") or "") if old.get("type") == "outlook_token" else ""
+            clear_requested = provider.pop("outlook_pool_clear", None) is True
             new_text = str(provider.get("mailboxes") or "")
+            prepared.append((provider, old_text, new_text, clear_requested))
+        for _provider, _old_text, new_text, _clear_requested in prepared:
+            if new_text.strip():
+                _reject_unrecognized_outlook_pool(new_text)
+        for _provider, _old_text, new_text, _clear_requested in prepared:
+            if new_text.strip():
+                _reject_conflicting_outlook_pool(new_text)
+        _reject_cross_pool_outlook_token_conflicts([
+            _projected_outlook_pool_text(old_text, new_text, clear_requested)
+            for _provider, old_text, new_text, clear_requested in prepared
+        ])
+        global_old_credentials = _outlook_pool_credentials(self._config)
+        state_store = mail_provider._load_outlook_token_state()
+        for provider, old_text, new_text, clear_requested in prepared:
             old_credentials = {
                 credential["email"].strip().lower(): credential
                 for credential in mail_provider.parse_outlook_credentials(old_text or "")
@@ -1001,23 +1434,40 @@ class RegisterService:
             if new_text.strip():
                 provider["mailboxes"] = _merge_outlook_pool(old_text, new_text)
                 merged_credentials = mail_provider.parse_outlook_credentials(provider["mailboxes"])
+                restored_reauth_token = _restore_pending_reauth_tokens(self._config, old_credentials, merged_credentials)
+                restored_reauth_token = _restore_reauth_rollbacks(self._config, old_credentials, merged_credentials) or restored_reauth_token
+                if restored_reauth_token:
+                    provider["mailboxes"] = _serialize_outlook_pool_preserving(merged_credentials, str(provider.get("mailboxes") or ""))
                 refreshed_credentials = [
                     credential
                     for credential in merged_credentials
-                    if _outlook_credential_changed(old_credentials.get(credential["email"].strip().lower()), credential)
+                    if _outlook_state_reset_requested(
+                        old_credentials.get(credential["email"].strip().lower())
+                        or global_old_credentials.get(credential["email"].strip().lower()),
+                        credential,
+                        state_store,
+                    )
                 ]
                 if refreshed_credentials:
-                    refreshed_addresses = _outlook_refresh_reset_addresses(refreshed_credentials)
-                    mail_provider.clear_outlook_token_states(
-                        refreshed_addresses,
-                        states=mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES,
-                    )
+                    refreshed_addresses.extend(_outlook_refresh_reset_addresses(refreshed_credentials))
+            elif clear_requested:
+                provider["mailboxes"] = ""
             elif old_text:
                 provider["mailboxes"] = _merge_outlook_pool(old_text, "")
             else:
                 provider["mailboxes"] = ""
             for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats"):
                 provider.pop(key, None)
+        new_credentials = [
+            credential
+            for provider, _old_text, _new_text, _clear_requested in prepared
+            for credential in mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+        ]
+        return _drop_reset_addresses_whose_token_remains(
+            refreshed_addresses,
+            global_old_credentials,
+            new_credentials,
+        )
 
     def _prune_unused_outlook_pools(self) -> int:
         mail = self._config.get("mail")
@@ -1030,22 +1480,32 @@ class RegisterService:
         for provider in providers:
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
-            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+            original_text = str(provider.get("mailboxes") or "")
+            credentials = mail_provider.parse_outlook_credentials(original_text)
             kept, removed = mail_provider.prune_outlook_unused_credentials(credentials, provider)
             if removed:
-                provider["mailboxes"] = _serialize_outlook_pool(kept)
+                provider["mailboxes"] = _serialize_outlook_pool_preserving(kept, original_text)
                 total_removed += removed
             for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats"):
                 provider.pop(key, None)
         return total_removed
 
+    def _reject_if_outlook_reauth_active_locked(self, action: str) -> None:
+        if getattr(self, "_outlook_reauth_active", False):
+            raise ValueError(f"辅助邮箱重授权仍在进行，请稍后再{action}")
+
     def update(self, updates: dict) -> dict:
+        if isinstance(updates, dict):
+            updates.pop(_OUTLOOK_REAUTH_ROLLBACK_KEY, None)
+            updates.pop(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY, None)
         with self._lock:
+            self._reject_if_outlook_reauth_active_locked("保存")
             with file_lock(self._lock_path()):
                 self._config = self._load_unlocked()
+                previous_config = self._config
                 _restore_masked_proxy(updates, self._config.get("proxy"))
                 self._merge_provider_secrets(updates)
-                self._merge_outlook_pools(updates)
+                refreshed_addresses = self._merge_outlook_pools(updates)
                 self._config = _normalize({**self._config, **updates})
                 self._drop_mail_proxy()
                 if not (self._runner and self._runner.is_alive()) and not self._runtime_lease_active_locked():
@@ -1053,12 +1513,26 @@ class RegisterService:
                 openai_register.config.pop("max_inflight_per_proxy", None)
                 openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "total", "threads")})
                 self._save_unlocked()
+                removed_tokens = {
+                    email: str(credential.get("refresh_token") or "")
+                    for email, credential in _outlook_pool_credentials(previous_config).items()
+                    if email not in _outlook_pool_credentials(self._config)
+                    and str(credential.get("refresh_token") or "").strip()
+                }
+                if removed_tokens:
+                    mail_provider.remember_outlook_removed_tokens(removed_tokens)
+                if refreshed_addresses:
+                    mail_provider.clear_outlook_token_states(
+                        refreshed_addresses,
+                        states=mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES,
+                    )
             return self.get()
 
     def start(self) -> dict:
         start_runner = False
         start_log = ""
         with self._lock:
+            self._reject_if_outlook_reauth_active_locked("启动注册")
             with file_lock(self._lock_path()):
                 self._config = self._load_unlocked()
                 if self._runner and self._runner.is_alive():
@@ -1210,9 +1684,303 @@ class RegisterService:
                 self._save_unlocked()
             return self.get()
 
+    def _registration_running_locked(self) -> bool:
+        return bool(self._runner and self._runner.is_alive()) or self._runtime_lease_active_locked()
+
+    def reauthorize_outlook_pool(self, session=None) -> dict:
+        """用辅助邮箱重取主令牌。整个动作持有同一把锁，注册还在跑时直接拒绝。"""
+        from services.register.outlook_reauth import (
+            OUTLOOK_REAUTH_LOCK,
+            OutlookReauthError,
+            default_outlook_reauth_session,
+            outlook_reauth_skip_reason,
+            public_reauth_reason,
+        )
+
+        if not OUTLOOK_REAUTH_LOCK.acquire(blocking=False):
+            raise ValueError("辅助邮箱重授权仍在进行，请稍后再试")
+        authorizer = session or default_outlook_reauth_session()
+        try:
+            with self._lock:
+                self._reload_locked()
+                if self._registration_running_locked():
+                    raise ValueError("注册任务仍在运行，请先停止再用辅助邮箱重授权")
+                self._outlook_reauth_active = True
+            try:
+                prepare = getattr(authorizer, "ensure_ready", None)
+                if callable(prepare):
+                    try:
+                        prepare()
+                    except OutlookReauthError as exc:
+                        raise ValueError(str(exc)) from exc
+                with self._lock:
+                    self._reload_locked()
+                    healed = self._finish_outlook_reauth_pending_clears()
+                    proxy = str(self._config.get("proxy") or "")
+                    queued = self._outlook_reauth_queue()
+                results: list[dict] = [{"email": email, "status": "replaced", "reason": ""} for email in healed]
+                healed_keys = {email.lower() for email in healed}
+                pending: list[dict] = []
+                chosen: dict[str, dict] = {}
+                deferred: list[tuple[dict, str]] = []
+                for item in queued:
+                    credential = item["credential"]
+                    email = str(credential.get("email") or "")
+                    email_key = email.strip().lower()
+                    if not email_key or email_key in healed_keys:
+                        continue
+                    reason = outlook_reauth_skip_reason(item["store"], credential)
+                    if reason:
+                        deferred.append((item, reason))
+                        continue
+                    if email_key not in chosen:
+                        chosen[email_key] = item
+                authorized: set[str] = set()
+                for email_key, item in chosen.items():
+                    credential = item["credential"]
+                    email = str(credential.get("email") or "")
+                    try:
+                        new_token = str(authorizer.authorize(credential, proxy=proxy) or "").strip()
+                    except Exception as exc:
+                        results.append({
+                            "email": email,
+                            "status": "failed",
+                            "reason": public_reauth_reason(exc, credential),
+                        })
+                        continue
+                    if not _acceptable_outlook_refresh_token(new_token, str(credential.get("refresh_token") or "")):
+                        results.append({"email": email, "status": "failed", "reason": "没有换到新的主令牌"})
+                        continue
+                    pending.append({**item, "new_token": new_token})
+                    authorized.add(email_key)
+                for item, reason in deferred:
+                    credential = item["credential"]
+                    email = str(credential.get("email") or "")
+                    email_key = email.strip().lower()
+                    chosen_item = chosen.get(email_key)
+                    if (
+                        email_key in authorized
+                        and chosen_item is not None
+                        and str(chosen_item.get("old_token") or "") == str(item.get("old_token") or "")
+                    ):
+                        continue
+                    results.append({"email": email, "status": "skipped", "reason": reason})
+                with self._lock:
+                    applied = self._commit_outlook_reauth(
+                        pending,
+                        results,
+                        clear_state=not self._registration_running_locked(),
+                    )
+                    del applied
+                    summary = _reauth_summary(results)
+                    self._append_log(
+                        "Outlook 辅助邮箱重授权：更换 "
+                        f"{summary['replaced']}，失败 {summary['failed']}，跳过 {summary['skipped']}",
+                        "yellow" if summary["failed"] else "green",
+                    )
+                    return {"register": self.get(), "reauth": summary}
+            finally:
+                with self._lock:
+                    self._outlook_reauth_active = False
+        finally:
+            OUTLOOK_REAUTH_LOCK.release()
+
+    def _outlook_reauth_queue(self) -> list[dict]:
+        store = mail_provider._load_outlook_token_state()
+        mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+        queued = []
+        for index, provider in enumerate(providers):
+            if not isinstance(provider, dict) or str(provider.get("type") or "") != "outlook_token":
+                continue
+            for credential in mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or "")):
+                queued.append({
+                    "provider_index": index,
+                    "provider_id": str(provider.get("id") or ""),
+                    "credential": dict(credential),
+                    "old_token": str(credential.get("refresh_token") or ""),
+                    "store": store,
+                })
+        return queued
+
+    def _publish_register_runtime_config_locked(self) -> None:
+        openai_register.config.pop("max_inflight_per_proxy", None)
+        openai_register.config.update({
+            "mail": deepcopy(self._config.get("mail")),
+            "proxy": self._config.get("proxy"),
+            "proxy_required": self._config.get("proxy_required"),
+            "total": self._config.get("total"),
+            "threads": self._config.get("threads"),
+        })
+
+    def _commit_outlook_reauth(self, pending: list[dict], results: list[dict], *, clear_state: bool = True) -> list[dict]:
+        from services.register.outlook_reauth import _outlook_reauth_busy
+
+        applied: list[dict] = []
+        previous_by_email: dict[str, str] = {}
+        with file_lock(self._lock_path()):
+            self._config = self._load_unlocked()
+            if not pending:
+                return applied
+            store = mail_provider._load_outlook_token_state()
+            old_credentials = _outlook_pool_credentials(self._config)
+            pending_by_email: dict[str, dict] = {}
+            for item in pending:
+                email_key = str(item.get("credential", {}).get("email") or "").strip().lower()
+                if email_key and email_key not in pending_by_email:
+                    pending_by_email[email_key] = item
+            mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+            providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+            changed_emails: set[str] = set()
+            busy_emails: set[str] = set()
+            for provider in providers:
+                if not isinstance(provider, dict) or str(provider.get("type") or "") != "outlook_token":
+                    continue
+                original_text = str(provider.get("mailboxes") or "")
+                current = mail_provider.parse_outlook_credentials(original_text)
+                updated: list[dict] = []
+                changed = False
+                for credential in current:
+                    email_key = str(credential.get("email") or "").strip().lower()
+                    item = pending_by_email.get(email_key)
+                    if not item or email_key in busy_emails:
+                        updated.append(credential)
+                        continue
+                    if str(credential.get("refresh_token") or "") != str(item.get("old_token") or ""):
+                        updated.append(credential)
+                        continue
+                    if _outlook_reauth_busy(store, credential):
+                        busy_emails.add(email_key)
+                        updated.append(credential)
+                        continue
+                    previous_by_email.setdefault(email_key, str(credential.get("refresh_token") or ""))
+                    replaced = dict(credential)
+                    replaced["refresh_token"] = str(item.get("new_token") or "")
+                    updated.append(replaced)
+                    applied.append(replaced)
+                    changed_emails.add(email_key)
+                    changed = True
+                if changed:
+                    provider["mailboxes"] = _serialize_outlook_pool_preserving(updated, original_text)
+            for email_key, item in pending_by_email.items():
+                if email_key in changed_emails:
+                    continue
+                results.append({
+                    "email": str(item.get("credential", {}).get("email") or ""),
+                    "status": "skipped",
+                    "reason": "主号仍在使用" if email_key in busy_emails else "邮箱池已变化",
+                })
+            if not applied:
+                return applied
+            new_credentials: list[dict] = []
+            for provider in providers:
+                if isinstance(provider, dict) and str(provider.get("type") or "") == "outlook_token":
+                    new_credentials.extend(
+                        mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+                    )
+            addresses = _reauth_clear_addresses(applied, old_credentials, new_credentials)
+            emails = _unique_text_list([str(item.get("email") or "") for item in applied])
+            tokens: dict[str, dict] = {}
+            for item in applied:
+                email_key = str(item.get("email") or "").strip().lower()
+                if not email_key or email_key in tokens:
+                    continue
+                tokens[email_key] = {
+                    "saved": _outlook_token_fingerprint(item.get("refresh_token")),
+                    "previous": _outlook_token_fingerprint(previous_by_email.get(email_key, "")),
+                    "addresses": _reauth_clear_addresses([item], old_credentials, new_credentials),
+                }
+            self._config[_OUTLOOK_REAUTH_PENDING_CLEAR_KEY] = {
+                "emails": emails,
+                "addresses": addresses,
+                "tokens": tokens,
+            }
+            _remember_reauth_rollbacks(self._config, applied, previous_by_email)
+            try:
+                self._save_unlocked()
+            except Exception:
+                self._config = self._load_unlocked()
+                applied.clear()
+                raise
+            self._publish_register_runtime_config_locked()
+            if not clear_state:
+                seen_failed: set[str] = set()
+                for credential in applied:
+                    email = str(credential.get("email") or "")
+                    email_key = email.strip().lower()
+                    if not email_key or email_key in seen_failed:
+                        continue
+                    seen_failed.add(email_key)
+                    results.append({
+                        "email": email,
+                        "status": "failed",
+                        "reason": "主令牌已更换，但注册任务仍在运行，未解除失效标记",
+                    })
+                return applied
+            try:
+                mail_provider.clear_outlook_token_states(
+                    addresses,
+                    states=mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES,
+                )
+            except Exception:
+                raise
+            self._config.pop(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY, None)
+            self._save_unlocked()
+        seen_replaced: set[str] = set()
+        for credential in applied:
+            email = str(credential.get("email") or "")
+            email_key = email.strip().lower()
+            if not email_key or email_key in seen_replaced:
+                continue
+            seen_replaced.add(email_key)
+            results.append({"email": email, "status": "replaced", "reason": ""})
+        return applied
+
+    def _finish_outlook_reauth_pending_clears(self) -> list[str]:
+        emails, _addresses = _outlook_reauth_pending_clear(self._config)
+        if not emails and not _addresses:
+            return []
+        with file_lock(self._lock_path()):
+            self._config = self._load_unlocked()
+            emails, addresses = _outlook_reauth_pending_clear(self._config)
+            if not emails and not addresses:
+                return []
+            raw = self._config.get(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY)
+            if isinstance(raw, dict) and "tokens" in raw:
+                matched_emails, matched_addresses = self._matched_pending_reauth_clears(emails)
+                if not matched_emails:
+                    self._config.pop(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY, None)
+                    self._save_unlocked()
+                    return []
+                emails, addresses = matched_emails, matched_addresses
+            mail_provider.clear_outlook_token_states(
+                addresses or emails,
+                states=mail_provider.OUTLOOK_REFRESHED_CREDENTIAL_RESET_STATES,
+            )
+            self._config.pop(_OUTLOOK_REAUTH_PENDING_CLEAR_KEY, None)
+            self._save_unlocked()
+        return emails or addresses
+
+    def _matched_pending_reauth_clears(self, emails: list[str]) -> tuple[list[str], list[str]]:
+        records = _outlook_reauth_pending_token_records(self._config)
+        current = _outlook_pool_credentials(self._config)
+        matched_emails: list[str] = []
+        matched_addresses: list[str] = []
+        for email in emails:
+            key = email.strip().lower()
+            record = records.get(key) or {}
+            saved = str(record.get("saved") or "")
+            credential = current.get(key) or {}
+            if not saved or _outlook_token_fingerprint(credential.get("refresh_token")) != saved:
+                continue
+            matched_emails.append(email)
+            matched_addresses.extend(_unique_text_list(record.get("addresses")) or [email])
+        return matched_emails, _unique_text_list(matched_addresses)
+
     def reset_outlook_pool(self, scope: str = "all") -> dict:
         scope = str(scope or "all").strip().lower()
         with self._lock:
+            self._reject_if_outlook_reauth_active_locked("重置 Outlook 邮箱池")
             self._reload_locked()
             if (
                 (self._runner and self._runner.is_alive())

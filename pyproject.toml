@@ -1,6 +1,6 @@
 [project]
 name = "chatgpt-2api"
-version = "0.1.4"
+version = "0.1.5"
 description = "ChatGPT web relay with Chrome 146 identity, image account scheduling, and account registration."
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn>=0.44.0",
     "sqlalchemy>=2.0.0",
     "psycopg2-binary>=2.9.0",
+    "patchright>=1.63.0",
 ]
 
 [dependency-groups]

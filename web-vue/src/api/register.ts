@@ -35,6 +35,7 @@ export type RegisterProvider = {
   wildcard?: boolean
   /** Outlook credentials are write-only and are never returned by the API. */
   mailboxes?: string
+  outlook_pool_clear?: boolean
   mailboxes_configured?: boolean
   mailboxes_count?: number
   mailboxes_base_count?: number
@@ -137,5 +138,16 @@ export const registerApi = {
   },
   resetOutlookPool(scope: 'all' | 'retryable' | 'invalid' | 'unused' | 'failed' = 'all') {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/outlook-pool/reset', { scope })
+  },
+  reauthorizeOutlookPool() {
+    return apiClient.post<any, {
+      register: LegacyRegisterConfig
+      reauth: {
+        replaced: number
+        failed: number
+        skipped: number
+        results: Array<{ email: string, status: string, reason: string }>
+      }
+    }>('/api/register/outlook-pool/reauthorize')
   },
 }

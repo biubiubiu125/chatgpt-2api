@@ -102,6 +102,8 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         try:
             return {"register": await run_in_threadpool(register_service.start)}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except _REGISTER_STORAGE_ERRORS as exc:
             raise _register_storage_http_exception(exc) from exc
 
@@ -133,6 +135,16 @@ def create_router() -> APIRouter:
                     body.scope or "all",
                 )
             }
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except _REGISTER_STORAGE_ERRORS as exc:
+            raise _register_storage_http_exception(exc) from exc
+
+    @router.post("/api/register/outlook-pool/reauthorize")
+    async def reauthorize_outlook_pool(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(register_service.reauthorize_outlook_pool)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except _REGISTER_STORAGE_ERRORS as exc:

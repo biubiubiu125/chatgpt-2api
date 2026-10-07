@@ -74,7 +74,7 @@ export const providerTypeKeys: Record<string, string[]> = {
 }
 
 export const providerLocalOnlyKeys: Record<string, string[]> = {
-  outlook_token: ['mailboxes_configured', 'mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats'],
+  outlook_token: ['mailboxes_configured', 'mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats', 'mailboxes_saved_text'],
 }
 
 export const defaultRegisterConfig: LegacyRegisterConfig = {
@@ -181,6 +181,9 @@ export function normalizeProvider(provider: RegisterProvider): RegisterProvider 
     id: String(provider.id || provider.provider_id || '').trim() || createProviderId(type),
     type,
     enable: provider.enable !== false,
+    ...(type === 'outlook_token'
+      ? { mailboxes_saved_text: String(provider.mailboxes ?? '') }
+      : {}),
   }
 }
 
@@ -364,8 +367,17 @@ export function sanitizedProviderPayload(provider: RegisterProvider): RegisterPr
   delete output.mailboxes_preview
   delete output.mailboxes_stats
   delete output.mailboxes_parse_stats
+  delete output.mailboxes_saved_text
   delete output.provider_ref
+  delete output.outlook_pool_clear
+  if (outlookPoolClearRequested(provider)) output.outlook_pool_clear = true
   return output
+}
+
+function outlookPoolClearRequested(provider: RegisterProvider) {
+  return providerType(provider) === 'outlook_token'
+    && !String(provider.mailboxes || '').trim()
+    && Boolean(String(provider.mailboxes_saved_text || '').trim())
 }
 
 export function legacyRegisterPayload(config: LegacyRegisterConfig): Partial<LegacyRegisterConfig> {
@@ -398,12 +410,100 @@ export function legacyRegisterPayload(config: LegacyRegisterConfig): Partial<Leg
   }
 }
 
-export function pendingOutlookCount(provider: RegisterProvider) {
-  return String(provider.mailboxes || '')
+function cleanOutlookPart(value: string) {
+  return value.replace(/\uFEFF/g, '').replace(/\u00A0/g, ' ').trim()
+}
+
+function isOutlookCredentialLine(line: string) {
+  const cleaned = cleanOutlookPart(line)
+  if (!cleaned.includes('----')) return false
+  const parts = cleaned.split('----').map(cleanOutlookPart)
+  if (parts.length !== 4 && parts.length !== 6) return false
+  if (!parts[0].includes('@') || !parts[2] || !parts[3]) return false
+  if (parts.length === 6 && (!parts[4].includes('@') || !parts[5])) return false
+  return true
+}
+
+function outlookCredentialLines(value: unknown) {
+  return String(value || '')
     .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(line => line && line.split('----').length >= 4)
-    .length
+    .filter(isOutlookCredentialLine)
+}
+
+function outlookUnrecognizedLines(value: unknown) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map(cleanOutlookPart)
+    .filter(line => line && !isOutlookCredentialLine(line))
+}
+
+function outlookRecoveryPair(parts: string[]) {
+  if (parts.length !== 6) return ['', ''] as const
+  const email = parts[4] || ''
+  const token = parts[5] || ''
+  if (!email.includes('@') || !token) return ['', ''] as const
+  return [email, token] as const
+}
+
+function outlookDuplicateConflict(previous: string[], next: string[]) {
+  const previousPassword = previous[1] || ''
+  const nextPassword = next[1] || ''
+  if (previousPassword && nextPassword && previousPassword !== nextPassword) return true
+  if ((previous[2] || '') !== (next[2] || '')) return true
+  if ((previous[3] || '') !== (next[3] || '')) return true
+  const previousRecovery = outlookRecoveryPair(previous)
+  const nextRecovery = outlookRecoveryPair(next)
+  if (previousRecovery[0] && nextRecovery[0] && (previousRecovery[0] !== nextRecovery[0] || previousRecovery[1] !== nextRecovery[1])) return true
+  return false
+}
+
+function applyOutlookDuplicateMerge(previous: string[], next: string[]) {
+  if (!previous[1] && next[1]) previous[1] = next[1]
+  const nextRecovery = outlookRecoveryPair(next)
+  if (!outlookRecoveryPair(previous)[0] && nextRecovery[0] && nextRecovery[1]) {
+    previous[4] = nextRecovery[0]
+    previous[5] = nextRecovery[1]
+  }
+}
+
+function outlookDuplicateSummary(value: unknown) {
+  const seen = new Map<string, string[]>()
+  let conflicts = 0
+  let merges = 0
+  for (const line of outlookCredentialLines(value)) {
+    const parts = line.split('----').map(cleanOutlookPart)
+    const email = (parts[0] || '').toLowerCase()
+    const previous = seen.get(email)
+    if (!previous) {
+      seen.set(email, parts.slice())
+      continue
+    }
+    if (outlookDuplicateConflict(previous, parts)) conflicts += 1
+    else {
+      merges += 1
+      applyOutlookDuplicateMerge(previous, parts)
+    }
+  }
+  return { conflicts, merges }
+}
+
+export function pendingOutlookCount(provider: RegisterProvider) {
+  const raw = String(provider.mailboxes || '').trim()
+  if (!raw) return 0
+  const current = outlookCredentialLines(provider.mailboxes)
+  if (provider.mailboxes_saved_text == null) return current.length
+  const remaining = new Map<string, number>()
+  for (const line of outlookCredentialLines(provider.mailboxes_saved_text)) {
+    remaining.set(line, (remaining.get(line) || 0) + 1)
+  }
+  let pending = 0
+  for (const line of current) {
+    const count = remaining.get(line) || 0
+    if (count > 0) remaining.set(line, count - 1)
+    else pending += 1
+  }
+  for (const count of remaining.values()) pending += count
+  return pending
 }
 
 export function providerRequirementMessages(provider: RegisterProvider) {
@@ -507,6 +607,10 @@ export function outlookPoolSummary(provider: RegisterProvider) {
     retired,
     submittedAlias: numeric(stats.submitted_alias) || numeric(provider.mailboxes_alias_count),
     abnormal: numeric(stats.abnormal) || retryable + invalid + retired,
+    unrecognized: outlookUnrecognizedLines(provider.mailboxes).length,
+    duplicateConflicts: outlookDuplicateSummary(provider.mailboxes).conflicts,
+    duplicateMerges: outlookDuplicateSummary(provider.mailboxes).merges,
+    willClear: outlookPoolClearRequested(provider),
   }
 }
 
@@ -529,11 +633,56 @@ export function outlookAliasHint(provider: RegisterProvider) {
   return `启用后领用时生成至少 2 位随机标签，@ 左边不超过 64 字节，不预生成。同一主号同时只领 1 个；登录和收信仍使用原邮箱凭据。${submitted}`
 }
 
-export function outlookPoolHint(provider: RegisterProvider) {
+function outlookInvalidHint(provider: RegisterProvider, invalid: number) {
+  const stats = provider.mailboxes_stats || {}
+  const ready = numeric(stats.reauth_ready)
+  const missing = numeric(stats.reauth_missing)
+  if (ready > 0 && missing > 0) {
+    return `有 ${ready} 个异常邮箱可用辅助邮箱重授权，只更换主令牌。另有 ${missing} 个没有辅助邮箱，需要重新导入。`
+  }
+  if (ready > 0) return `有 ${ready} 个异常邮箱。可在维护里用辅助邮箱重授权，只更换主令牌。`
+  if (missing > 0) return `有 ${missing} 个异常邮箱没有辅助邮箱，需要重新导入。`
+  return `有 ${invalid} 个异常邮箱，需要重新获取主 refresh_token 或重新导入材料。`
+}
+
+function outlookPoolTextForConflict(provider: RegisterProvider) {
+  if (String(provider.mailboxes || '').trim()) return String(provider.mailboxes || '')
+  if (outlookPoolClearRequested(provider)) return ''
+  return String(provider.mailboxes_saved_text || '')
+}
+
+export function outlookCrossPoolTokenConflicts(providers: readonly RegisterProvider[] | undefined) {
+  const seen = new Map<string, string>()
+  const conflicts = new Set<string>()
+  for (const provider of providers || []) {
+    if (providerType(provider) !== 'outlook_token') continue
+    for (const line of outlookCredentialLines(outlookPoolTextForConflict(provider))) {
+      const parts = line.split('----').map(cleanOutlookPart)
+      const email = (parts[0] || '').toLowerCase()
+      const token = parts[3] || ''
+      if (!email || !token) continue
+      const previous = seen.get(email)
+      if (previous == null) {
+        seen.set(email, token)
+        continue
+      }
+      if (previous !== token) conflicts.add(email)
+    }
+  }
+  return conflicts.size
+}
+
+export function outlookPoolHint(provider: RegisterProvider, providers?: readonly RegisterProvider[]) {
   const summary = outlookPoolSummary(provider)
+  const crossPoolConflicts = outlookCrossPoolTokenConflicts(providers)
+  if (summary.willClear) return '清空后保存会移除整池。'
+  if (summary.unrecognized > 0) return `有 ${summary.unrecognized} 行无法识别，保存会被拒绝。`
+  if (summary.duplicateConflicts > 0) return `有 ${summary.duplicateConflicts} 行重复邮箱凭据不一致，保存会被拒绝。`
+  if (crossPoolConflicts > 0) return `有 ${crossPoolConflicts} 个邮箱在不同池里的主令牌不一致，保存会被拒绝。`
+  if (summary.duplicateMerges > 0) return `有 ${summary.duplicateMerges} 行重复邮箱会合并，辅助邮箱会保留。`
   if (summary.pending > 0) return `有 ${summary.pending} 个待保存，保存配置后进入 Microsoft 邮箱池。`
   if (summary.saved <= 0) return '还没有保存 Microsoft 邮箱材料。'
-  if (summary.invalid > 0) return `有 ${summary.invalid} 个异常邮箱，需要重新获取 refresh_token 或重新导入材料。`
+  if (summary.invalid > 0) return outlookInvalidHint(provider, summary.invalid)
   if (summary.retryable > 0 || summary.inUse > 0) return `有 ${summary.retryable} 个临时失败、${summary.inUse} 个占用，可在更多维护里释放后重试。`
   if (summary.retired > 0 && summary.available <= 0) return `有 ${summary.retired} 个主号因连续收不到验证码已停用。`
   if (summary.retired > 0) return `有 ${summary.retired} 个主号已停用，其余可继续领用。`
